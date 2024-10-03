@@ -1,0 +1,65 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug Percona MySQL",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/runtime_output_directory/mysqld",
+            "args": [
+                "--defaults-file=/data/my.cnf",
+                "--datadir=/data/mysql",
+                "--log-error=/data/mysql_error.log",
+                "--debug=d:t:i:o,/data/mysqld.trace"
+
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Print working directory",
+                    "text": "pwd",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Show source paths",
+                    "text": "show directories",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set breakpoint in EXAMPLE engine",
+                    "text": "set breakpoint pending on",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Break on ha_example.cc",
+                    "text": "break ha_example.cc:296",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Break on ha_example.cc",
+                    "text": "break ha_example.cc:369",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Break on ha_innodb.cc",
+                    "text": "break ha_innodb.cc:9554",
+                    "ignoreFailures": true
+                }                
+            ],
+            "sourceFileMap":{
+                "./obj/sql/../../": "${workspaceFolder}",
+                "./obj/storage/example/../../../" : "${workspaceFolder}",
+            },
+            "logging": {
+                "engineLogging": true,
+                "trace": true,
+                "traceResponse": true,
+                "moduleLoad": true
+            }
+        }
+    ]
+}

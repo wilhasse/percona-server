@@ -98,8 +98,11 @@
 #include "my_dbug.h"
 #include "mysql/plugin.h"
 #include "sql/sql_class.h"
+#include "sql/field.h"
 #include "sql/sql_plugin.h"
 #include "typelib.h"
+#include "sql/table.h"
+#include "my_base.h"
 
 static handler *example_create_handler(handlerton *hton, TABLE_SHARE *table,
                                        bool partitioned, MEM_ROOT *mem_root);
@@ -284,6 +287,7 @@ int ha_example::close(void) {
 */
 
 int ha_example::write_row(uchar *) {
+
   DBUG_TRACE;
   /*
     Example of a successful write_row. We don't store the data
@@ -291,8 +295,29 @@ int ha_example::write_row(uchar *) {
     probably need to do something with 'buf'. We report a success
     here, to pretend that the insert was successful.
   */
+  DBUG_PRINT("info", ("Writing row to ha_example table"));
+
+  // Get the number of fields in the table
+  uint num_fields = table->s->fields;
+  
+  // Loop through each field and print its contents
+  for (uint i = 0; i < num_fields; i++) {
+    Field *field = table->field[i];
+    
+    // Create a buffer to hold the field value as a string
+    char field_value[256];
+    String str(field_value, sizeof(field_value), &my_charset_bin);
+    
+    // Get the field value as a string
+    field->val_str(&str);
+    
+    // Print the field name and value
+    DBUG_PRINT("info", ("CSLOG INSERT Field %s: %s", field->field_name, str.c_ptr_safe()));
+  }
+
   return 0;
 }
+
 
 /**
   @brief
@@ -344,7 +369,26 @@ int ha_example::update_row(const uchar *, uchar *) {
 
 int ha_example::delete_row(const uchar *) {
   DBUG_TRACE;
-  return HA_ERR_WRONG_COMMAND;
+  DBUG_PRINT("info", ("Writing row to ha_example table"));
+
+  // Get the number of fields in the table
+  uint num_fields = table->s->fields;
+  
+  // Loop through each field and print its contents
+  for (uint i = 0; i < num_fields; i++) {
+    Field *field = table->field[i];
+    
+    // Create a buffer to hold the field value as a string
+    char field_value[256];
+    String str(field_value, sizeof(field_value), &my_charset_bin);
+    
+    // Get the field value as a string
+    field->val_str(&str);
+    
+    // Print the field name and value
+    DBUG_PRINT("info", ("CSLOG DELETE Field %s: %s", field->field_name, str.c_ptr_safe()));
+  }  
+  return 0;
 }
 
 /**
@@ -460,10 +504,10 @@ int ha_example::rnd_end() {
   sql_update.cc
 */
 int ha_example::rnd_next(uchar *) {
-  int rc;
+  //int rc;
   DBUG_TRACE;
-  rc = HA_ERR_END_OF_FILE;
-  return rc;
+  //rc = HA_ERR_END_OF_FILE;
+  return 0;
 }
 
 /**

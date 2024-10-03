@@ -21,19 +21,32 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
 
+# Add LMDB source files
+SET(EXAMPLE_SOURCES
+  ha_example.cc
+#  mdb.c
+#  midl.c
+)
+
 DISABLE_MISSING_PROFILE_WARNING()
 ADD_DEFINITIONS(-DMYSQL_SERVER)
 
+# Add include directory for LMDB headers
+INCLUDE_DIRECTORIES(${CMAKE_CURRENT_SOURCE_DIR})
+
 IF(WITH_EXAMPLE_STORAGE_ENGINE AND NOT WITHOUT_EXAMPLE_STORAGE_ENGINE)
-  MYSQL_ADD_PLUGIN(example ha_example.cc
+  MYSQL_ADD_PLUGIN(example ${EXAMPLE_SOURCES}
     STORAGE_ENGINE
     DEFAULT
     LINK_LIBRARIES ext::zlib
     )
 ELSEIF(NOT WITHOUT_EXAMPLE_STORAGE_ENGINE)
-  MYSQL_ADD_PLUGIN(example ha_example.cc
+  MYSQL_ADD_PLUGIN(example ${EXAMPLE_SOURCES}
     STORAGE_ENGINE
     MODULE_ONLY
     LINK_LIBRARIES ext::zlib
     )
 ENDIF()
+
+# Add LMDB compilation flags if necessary
+TARGET_COMPILE_DEFINITIONS(example PRIVATE -DMDB_USE_POSIX_SEM)
