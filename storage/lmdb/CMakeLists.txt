@@ -21,19 +21,45 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
 
+# Add LMDB source files
+SET(LMDB_SOURCES
+  ha_lmdb.cc
+  mdb.c
+  midl.c
+)
+
 DISABLE_MISSING_PROFILE_WARNING()
 ADD_DEFINITIONS(-DMYSQL_SERVER)
 
-IF(WITH_EXAMPLE_STORAGE_ENGINE AND NOT WITHOUT_EXAMPLE_STORAGE_ENGINE)
-  MYSQL_ADD_PLUGIN(example ha_example.cc
+# Add include directory for LMDB headers
+INCLUDE_DIRECTORIES(${CMAKE_CURRENT_SOURCE_DIR})
+
+IF(WITH_LMDB_STORAGE_ENGINE AND NOT WITHOUT_LMDB_STORAGE_ENGINE)
+  MYSQL_ADD_PLUGIN(lmdb ${LMDB_SOURCES}
     STORAGE_ENGINE
     DEFAULT
     LINK_LIBRARIES ext::zlib
     )
-ELSEIF(NOT WITHOUT_EXAMPLE_STORAGE_ENGINE)
-  MYSQL_ADD_PLUGIN(example ha_example.cc
+ELSEIF(NOT WITHOUT_LMDB_STORAGE_ENGINE)
+  MYSQL_ADD_PLUGIN(lmdb ${LMDB_SOURCES}
     STORAGE_ENGINE
     MODULE_ONLY
     LINK_LIBRARIES ext::zlib
     )
 ENDIF()
+
+# Add LMDB compilation flags if necessary
+TARGET_COMPILE_DEFINITIONS(lmdb PRIVATE -DMDB_USE_POSIX_SEM)
+
+# Add these lines to your existing CMakeLists.txt
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-discarded-qualifiers -Wno-unused-parameter -Wno-jump-misses-init")
+
+# For C++ files, we need different flags
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-parameter")
+
+# If you're using target_compile_options, modify it like this:
+target_compile_options(lmdb PRIVATE
+  $<$<COMPILE_LANGUAGE:C>:-Wno-discarded-qualifiers -Wno-unused-parameter -Wno-jump-misses-init>
+  $<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-parameter>
+)
+
