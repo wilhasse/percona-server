@@ -1,5 +1,7 @@
 /* 
   LMDB Interface for MySQL
+
+  Using lmdb master last commit Aug 10, 2024
 */
 
 #include "storage/lmdb/ha_lmdb.h"
@@ -25,8 +27,8 @@ handlerton *lmdb_hton;
 
 /* Interface to mysqld, to check system tables supported by SE */
 static bool lmdb_is_supported_system_table(const char *db,
-                                              const char *table_name,
-                                              bool is_sql_layer_system_table);
+                                           const char *table_name,
+                                           bool is_sql_layer_system_table);
 
 Lmdb_share::Lmdb_share() { thr_lock_init(&lock); }
 
@@ -71,7 +73,7 @@ int ha_lmdb::init_lmdb() {
     return rc;
   }
 
-  rc = mdb_env_set_mapsize(env, 10485760); // 10MiB
+  rc = mdb_env_set_mapsize(env, 53687091200); // 10MiB
   if (rc != 0) {
     fprintf(stderr, "mdb_env_set_mapsize failed, error %d %s\n", rc, mdb_strerror(rc));
     mdb_env_close(env);
@@ -163,7 +165,7 @@ static handler *lmdb_create_handler(handlerton *hton, TABLE_SHARE *table,
 }
 
 ha_lmdb::ha_lmdb(handlerton *hton, TABLE_SHARE *table_arg)
-    : handler(hton, table_arg) {}
+    : handler(hton, table_arg), batch_count(0), batch_txn(nullptr) {}
 
 /*
   List of all system tables specific to the SE.
@@ -215,9 +217,18 @@ int ha_lmdb::open(const char *name, int mode, uint test_if_locked, const dd::Tab
 /**
   Closes a table.
 */
-int ha_lmdb::close(void) {
-  DBUG_TRACE;
-  return close_lmdb();
+// Make sure to commit any pending transactions when closing the table
+int ha_lmdb::close() {
+  if (batch_txn != nullptr) {
+    int rc = mdb_txn_commit(batch_txn);
+    if (rc != 0) {
+      fprintf(stderr, "mdb_txn_commit failed in close, error %d %s\n", rc, mdb_strerror(rc));
+      return HA_ERR_INTERNAL_ERROR;
+    }
+    batch_txn = nullptr;
+    batch_count = 0;
+  }
+  return 0; // Replace handler::close() with 0 to indicate success
 }
 
 /**
@@ -232,11 +243,13 @@ int ha_lmdb::write_row(uchar *buf) {
   }
 
   int rc;
-  MDB_txn *write_txn = nullptr;
-  rc = mdb_txn_begin(env, NULL, 0, &write_txn);
-  if (rc != 0) {
-    fprintf(stderr, "mdb_txn_begin failed in write_row, error %d %s\n", rc, mdb_strerror(rc));
-    return HA_ERR_INTERNAL_ERROR;
+
+  if (batch_txn == nullptr) {
+    rc = mdb_txn_begin(env, NULL, 0, &batch_txn);
+    if (rc != 0) {
+      fprintf(stderr, "mdb_txn_begin failed in write_row, error %d %s\n", rc, mdb_strerror(rc));
+      return HA_ERR_INTERNAL_ERROR;
+    }
   }
 
   // Use the first field (assumed to be the primary key) as the LMDB key
@@ -251,19 +264,28 @@ int ha_lmdb::write_row(uchar *buf) {
   value.mv_data = buf;
   value.mv_size = table->s->reclength;
 
-  rc = mdb_put(write_txn, dbi, &key, &value, 0);
+  rc = mdb_put(batch_txn, dbi, &key, &value, 0);
   if (rc != 0) {
     fprintf(stderr, "mdb_put failed in write_row, error %d %s\n", rc, mdb_strerror(rc));
-    mdb_txn_abort(write_txn);
+    mdb_txn_abort(batch_txn);
+    batch_txn = nullptr;
+    batch_count = 0;
     return HA_ERR_INTERNAL_ERROR;
   }
   
-  rc = mdb_txn_commit(write_txn);
-  if (rc != 0) {
-    fprintf(stderr, "mdb_txn_commit failed in write_row, error %d %s\n", rc, mdb_strerror(rc));
-    return HA_ERR_INTERNAL_ERROR;
+  batch_count++;
+
+  // Commit the transaction if we've reached the batch size
+  if (batch_count >= BATCH_SIZE) {
+    rc = mdb_txn_commit(batch_txn);
+    if (rc != 0) {
+      fprintf(stderr, "mdb_txn_commit failed in write_row, error %d %s\n", rc, mdb_strerror(rc));
+      return HA_ERR_INTERNAL_ERROR;
+    }
+    batch_txn = nullptr;
+    batch_count = 0;
   }
-  
+
   return 0;
 }
 
