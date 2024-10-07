@@ -28,7 +28,7 @@ class ha_wt : public handler {
 
  private:
 
-  WT_CONNECTION *conn;
+  WT_CONNECTION *conn = nullptr;
   WT_SESSION *session;
   WT_CURSOR *cursor;
   std::string uri;

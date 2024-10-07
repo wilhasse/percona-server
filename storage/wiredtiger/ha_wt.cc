@@ -11,6 +11,7 @@
 #include "typelib.h"
 #include "sql/table.h"
 #include "my_base.h"
+#include "wt_man.cc"
 
 #include <wiredtiger.h>
 #include <sys/stat.h>
@@ -42,37 +43,34 @@ static int wt_init_func(void *p) {
   wt_hton->flags = HTON_CAN_RECREATE;
   wt_hton->is_supported_system_table = wt_is_supported_system_table;
 
+  // Initialize the WiredTiger connection
+  if (WTConnectionManager::getConnection() == nullptr) {
+      return 1;  // Initialization failed
+  }
+
   return 0;
+}
+
+/**
+  wt deinit
+*/
+static int wt_deinit_func(void* p [[maybe_unused]]) {
+    DBUG_TRACE;
+
+    assert(p);
+    
+    // Close the WiredTiger connection
+    WTConnectionManager::closeConnection();
+
+    return 0;
 }
 
 /**
   wt create class
 */
 ha_wt::ha_wt(handlerton *hton, TABLE_SHARE *table_arg)
-    : handler(hton, table_arg), conn(nullptr), session(nullptr), cursor(nullptr) {
+  : handler(hton, table_arg), conn(nullptr), session(nullptr), cursor(nullptr) {
 
-    init_wt();
-}
-
-/**
-  wt initialize database
-*/
-int ha_wt::init_wt() {
-
-    int ret = wiredtiger_open(".", NULL, "create", &conn);
-    if (ret != 0) {
-        my_printf_error(ER_UNKNOWN_ERROR, "WiredTiger connection failed: %s", MYF(0), wiredtiger_strerror(ret));
-        return ER_UNKNOWN_ERROR;
-    }
-    ret = conn->open_session(conn, NULL, NULL, &session);
-    if (ret != 0) {
-        my_printf_error(ER_UNKNOWN_ERROR, "WiredTiger session failed: %s", MYF(0), wiredtiger_strerror(ret));
-        conn->close(conn, NULL);
-        conn = nullptr;
-        return ER_UNKNOWN_ERROR;
-    }
-
-    return 0;
 }
 
 /**
@@ -84,31 +82,44 @@ ha_wt::~ha_wt() {
 }
 
 int ha_wt::close() {
-    if (cursor) {
-        cursor->close(cursor);
-        cursor = nullptr;
-    }
-    if (session) {
-        session->close(session, NULL);
-        session = nullptr;
-    }
-    if (conn) {
-        conn->close(conn, NULL);
-        conn = nullptr;
-    }
-    return 0;
+
+  if (cursor) {
+      cursor->close(cursor);
+      cursor = nullptr;
+  }
+  if (session) {
+      session->close(session, NULL);
+      session = nullptr;
+  }
+  if (conn) {
+      conn->close(conn, NULL);
+      conn = nullptr;
+  }
+  return 0;
 }
 
 /**
   Open a table
 */
 int ha_wt::open(const char *name, int mode, uint test_if_locked, const dd::Table *tab_def) {
+  
   DBUG_TRACE;
   
+  WT_CONNECTION* conn = WTConnectionManager::getConnection();
+  if (conn == nullptr) {
+      return HA_ERR_INTERNAL_ERROR;
+  }
+
+  int ret = conn->open_session(conn, NULL, NULL, &session);
+  if (ret != 0) {
+      // Handle error
+      return HA_ERR_INTERNAL_ERROR;
+  }
+        
   uri = "table:" + std::string(name);
 
   // Create the table if it doesn't exist
-  int ret = session->create(session, uri.c_str(), "key_format=S,value_format=S");
+  ret = session->create(session, uri.c_str(), "key_format=i,value_format=u");
   if (ret != 0 && ret != EEXIST) {
       my_printf_error(ER_UNKNOWN_ERROR, "WiredTiger table creation failed: %s", MYF(0), wiredtiger_strerror(ret));
       return HA_ERR_INTERNAL_ERROR;
@@ -124,57 +135,58 @@ int ha_wt::open(const char *name, int mode, uint test_if_locked, const dd::Table
   if (!(share = get_share())) return 1;
   thr_lock_data_init(&share->lock, &lock, NULL);
 
-  int rc = init_wt();
-  if (rc != 0) {
-    // Handle error
-    fprintf(stderr, "Failed to initialize wt, error code: %d\n", rc);
-    return HA_ERR_INTERNAL_ERROR;
-  }   
-  
   return 0;
 }
 
 /**
- Inserts a row.
+  Insert a Row
 */
 int ha_wt::write_row(uchar *buf) {
     DBUG_TRACE;
- 
     DBUG_ENTER("ha_wt::write_row");
 
     int ret;
-    WT_ITEM key_item, value_item;
 
-    // Assuming first field is primary key and second field is value
+    // Set the record buffer to point to the row data
+    table->record[0] = buf;
+
+    // Mark all columns as needed for reading
+    bitmap_set_all(table->read_set);
+
+    // Get the primary key field (assuming it's an integer)
     Field *key_field = table->field[0];
-    Field *value_field = table->field[1];
+    int32_t key_value = (int32_t) key_field->val_int();
 
-    // Get key
-    String key_str;
-    key_field->val_str(&key_str);
+    // Serialize the rest of the fields into a value buffer
+    std::vector<char> value_buffer;
+    for (uint i = 1; i < table->s->fields; i++) {
+        Field *field = table->field[i];
+        String field_value;
+        field->val_str(&field_value);
 
-    // Get value
-    String value_str;
-    value_field->val_str(&value_str);
+        // Append field length and data to value_buffer
+        uint32_t len = field_value.length();
+        value_buffer.insert(value_buffer.end(), (char*)&len, (char*)&len + sizeof(len));
+        value_buffer.insert(value_buffer.end(), field_value.ptr(), field_value.ptr() + len);
+    }
 
-    // Set key and value
-    key_item.data = key_str.ptr();
-    key_item.size = key_str.length();
+    // Set the key and value for the WiredTiger cursor
+    cursor->set_key(cursor, key_value);
 
-    value_item.data = value_str.ptr();
-    value_item.size = value_str.length();
-
-    cursor->set_key(cursor, &key_item);
+    WT_ITEM value_item;
+    value_item.data = value_buffer.data();
+    value_item.size = value_buffer.size();
     cursor->set_value(cursor, &value_item);
 
     // Insert the record
     ret = cursor->insert(cursor);
     if (ret != 0) {
-        my_printf_error(ER_UNKNOWN_ERROR, "WiredTiger insert failed: %s", MYF(0), wiredtiger_strerror(ret));
+        my_printf_error(ER_UNKNOWN_ERROR, "WiredTiger insert failed: %s", MYF(0),
+                        wiredtiger_strerror(ret));
         DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
     }
 
-    return 0;
+    DBUG_RETURN(0);
 }
 
 /**
@@ -410,17 +422,6 @@ int ha_wt::create(const char *name, TABLE *, HA_CREATE_INFO *,
   uint count = THDVAR(thd, create_count_thdvar) + 1;
   THDVAR_SET(thd, create_count_thdvar, &count);
 
-  return 0;
-}
-
-/**
-  wt deinit
-*/
-static int wt_deinit_func(void *p [[maybe_unused]]) {
-
-  DBUG_TRACE;
-
-  assert(p);
   return 0;
 }
 
