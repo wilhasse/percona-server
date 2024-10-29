@@ -1332,13 +1332,7 @@ void NdbImportUtil::free_rows(RowList &src) {
 NdbImportUtil::Blob::Blob() {
   m_blobsize = 0;
   m_allocsize = 0;
-<<<<<<< HEAD
-  m_data = new uchar[1];
-||||||| d69a12a9453
-  m_data = new uchar[0];
-=======
   m_data = nullptr;
->>>>>>> mysql-8.0.40
 }
 
 NdbImportUtil::Blob::~Blob() { delete[] m_data; }

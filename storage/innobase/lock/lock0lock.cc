@@ -451,20 +451,8 @@ void lock_sys_close(void) {
     lock_latest_err_file = nullptr;
   }
 
-<<<<<<< HEAD
   if (!lock_sys) return;
 
-  ut::delete_(lock_sys->rec_hash);
-  ut::delete_(lock_sys->prdt_hash);
-  ut::delete_(lock_sys->prdt_page_hash);
-
-||||||| d69a12a9453
-  ut::delete_(lock_sys->rec_hash);
-  ut::delete_(lock_sys->prdt_hash);
-  ut::delete_(lock_sys->prdt_page_hash);
-
-=======
->>>>>>> mysql-8.0.40
   os_event_destroy(lock_sys->timeout_event);
 
   mutex_destroy(&lock_sys->wait_mutex);

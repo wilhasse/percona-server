@@ -1309,7 +1309,6 @@ void Certifier::garbage_collect() {
     code blocked the transaction processing for about 1s.
   */
   while (it != certification_info.end()) {
-<<<<<<< HEAD
     stable_gtid_set_lock->wrlock();
 
     /* Needs to increase the rate if it takes too long, add a chunk every 5s */
@@ -1326,6 +1325,12 @@ void Certifier::garbage_collect() {
       }
       if (it->second->is_subset_not_equals(stable_gtid_set)) {
         if (it->second->unlink() == 0) {
+          /*
+            Claim Gtid_set_ref used memory to
+            `thread/group_rpl/THD_certifier_broadcast` thread, since this is
+            thread that does release the memory.
+          */
+          it->second->claim_memory_ownership(true);
           delete it->second;
         }
         certification_info.erase(it++);
@@ -1357,31 +1362,6 @@ void Certifier::garbage_collect() {
       }
     }
   } /* while loop */
-||||||| d69a12a9453
-    if (it->second->is_subset_not_equals(stable_gtid_set)) {
-      if (it->second->unlink() == 0) delete it->second;
-      certification_info.erase(it++);
-    } else
-      ++it;
-  }
-  stable_gtid_set_lock->unlock();
-=======
-    if (it->second->is_subset_not_equals(stable_gtid_set)) {
-      if (it->second->unlink() == 0) {
-        /*
-          Claim Gtid_set_ref used memory to
-          `thread/group_rpl/THD_certifier_broadcast` thread, since this is
-          thread that does release the memory.
-        */
-        it->second->claim_memory_ownership(true);
-        delete it->second;
-      }
-      certification_info.erase(it++);
-    } else
-      ++it;
-  }
-  stable_gtid_set_lock->unlock();
->>>>>>> mysql-8.0.40
 
   /*
     We need to update parallel applier indexes since we do not know
