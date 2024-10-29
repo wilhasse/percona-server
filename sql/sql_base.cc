@@ -5865,6 +5865,9 @@ bool open_tables(THD *thd, Table_ref **start, uint *counter, uint flags,
   DBUG_TRACE;
   bool audit_notified = false;
 
+  // Property of having external tables is always set in this function:
+  thd->lex->reset_has_external_tables();
+
 restart:
   /*
     Close HANDLER tables which are marked for flush or against which there
@@ -6100,6 +6103,13 @@ restart:
         error = true;
         goto err;
       }
+    }
+
+    // Remember if an external table has been opened in this statement.
+    if (tbl != nullptr && tbl->s->has_secondary_engine() &&
+        ha_check_storage_engine_flag(tbl->s->db_type(),
+                                     HTON_SUPPORTS_EXTERNAL_SOURCE)) {
+      thd->lex->set_has_external_tables();
     }
 
     /*
