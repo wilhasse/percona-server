@@ -1,3 +1,4 @@
+// ha_cslog.cc
 #include "ha_cslog.h"
 #include "my_dbug.h"
 #include "mysql/plugin.h"
@@ -7,16 +8,12 @@
 #include "typelib.h"
 #include "sql/table.h"
 #include "my_base.h"
-#include "sql/handler.h"
 #include <dlfcn.h>
-
- // For logging services
 #include <mysql/components/services/log_builtins.h>
 
-#ifdef NDEBUG
-#undef NDEBUG
-#endif
-#define DBUG_ON 1
+#define CSLOG_MAX_KEY 64  // Maximum number of keys allowed
+#define CSLOG_MAX_KEY_LENGTH 1024  // Maximum key length
+#define CSLOG_MAX_KEY_PARTS 16     // Maximum parts in a composite key
 
 static handlerton *cslog_hton = nullptr;
 
@@ -25,10 +22,45 @@ static handler* cslog_create_handler(handlerton *hton, TABLE_SHARE *table,
     return new (mem_root) ha_cslog(hton, table);
 }
 
+// Fix Table_flags resolution by using the correct return type
+handler::Table_flags ha_cslog::table_flags() const {
+    return (HA_PRIMARY_KEY_REQUIRED_FOR_POSITION |  // Support primary keys
+            HA_PRIMARY_KEY_IN_READ_INDEX |         // Can read by primary key
+            HA_BINLOG_ROW_CAPABLE |               // Support row-based binlog
+            HA_CAN_INDEX_BLOBS |                  // Can index BLOB/TEXT
+            HA_REQUIRE_PRIMARY_KEY |              // Require primary key
+            HA_STATS_RECORDS_IS_EXACT |           // Stats are exact
+            HA_NO_AUTO_INCREMENT);                // No auto_increment support yet
+}
+
 ha_cslog::ha_cslog(handlerton *hton, TABLE_SHARE *table_arg)
-    : handler(hton, table_arg), 
+    : handler(hton, table_arg),
       share(nullptr),
       rocksdb_handler(nullptr) {
+}
+
+uint ha_cslog::max_supported_keys() const {
+    return CSLOG_MAX_KEY;
+}
+
+uint ha_cslog::max_supported_key_length() const {
+    return CSLOG_MAX_KEY_LENGTH;
+}
+
+uint ha_cslog::max_supported_key_parts() const {
+    return CSLOG_MAX_KEY_PARTS;
+}
+
+// Keep only one implementation of index_flags
+ulong ha_cslog::index_flags(uint idx, uint part, bool all_parts) const {
+    if (rocksdb_handler) {
+        return rocksdb_handler->index_flags(idx, part, all_parts);
+    }
+    return (HA_READ_NEXT |        // Support forward index scan
+            HA_READ_PREV |        // Support backward index scan
+            HA_READ_ORDER |       // Results come in order
+            HA_READ_RANGE |       // Can handle ranges
+            HA_KEYREAD_ONLY);     // Index-only scanning supported
 }
 
 int ha_cslog::open(const char *name, int mode, uint test_if_locked, const dd::Table *tab_def) {
@@ -183,13 +215,6 @@ void ha_cslog::position(const uchar *record) {
     }
 }
 
-ulong ha_cslog::index_flags(uint idx, uint part, bool all_parts) const {
-    if (!rocksdb_handler) {
-        return 0;
-    }
-    return rocksdb_handler->index_flags(idx, part, all_parts);
-}
-
 // Also modify the get_share() function to use proper casting:
 cslog_share* ha_cslog::get_share() {
     cslog_share *tmp_share;
@@ -260,11 +285,32 @@ int ha_cslog::index_last(uchar *buf) {
     return rocksdb_handler->index_last(buf);
 }
 
+// Update key statistics
 int ha_cslog::info(uint flag) {
     if (!rocksdb_handler) {
         return HA_ERR_INITIALIZATION;
     }
-    return rocksdb_handler->info(flag);
+    
+    int rc = rocksdb_handler->info(flag);
+    if (rc) return rc;
+
+    // If statistics are requested, fill them in
+    if (flag & HA_STATUS_TIME) {
+        stats.update_time = 0;
+    }
+    if (flag & HA_STATUS_CONST) {
+        stats.max_data_file_length = rocksdb_handler->stats.max_data_file_length;
+        stats.create_time = 0;
+        stats.block_size = rocksdb_handler->stats.block_size;
+    }
+    if (flag & HA_STATUS_VARIABLE) {
+        stats.data_file_length = rocksdb_handler->stats.data_file_length;
+        stats.records = rocksdb_handler->stats.records;
+        stats.deleted = rocksdb_handler->stats.deleted;
+        stats.mean_rec_length = rocksdb_handler->stats.mean_rec_length;
+    }
+
+    return 0;
 }
 
 THR_LOCK_DATA **ha_cslog::store_lock(THD *thd, THR_LOCK_DATA **to,

@@ -1,3 +1,4 @@
+// ha_cslog.h
 #ifndef HA_CSLOG_INCLUDED
 #define HA_CSLOG_INCLUDED
 
@@ -10,7 +11,6 @@
 #include "thr_lock.h"        /* THR_LOCK, THR_LOCK_DATA */
 #include "ha_rocksdb.h"
 
-// Make cslog_share inherit from Handler_share
 class cslog_share : public Handler_share {
 public:
     THR_LOCK lock;
@@ -24,19 +24,27 @@ private:
     cslog_share *share;    
     myrocks::ha_rocksdb* rocksdb_handler;
 
+    cslog_share* get_share();
+    int init_cslog();
+    int close_cslog();
+
 public:
     ha_cslog(handlerton *hton, TABLE_SHARE *table_arg);
     ~ha_cslog();
 
+    // Required abstract method implementations
+    Table_flags table_flags() const override;
     const char *table_type() const override { return "CSLOG"; }
-    ulonglong table_flags() const override { return HA_NO_TRANSACTIONS; }
-
-    // Required pure virtual functions
-    int rnd_pos(uchar *buf, uchar *pos) override;
-    void position(const uchar *record) override;
+    
+    // Key related methods
+    uint max_supported_keys() const override;
+    uint max_supported_key_length() const override;
+    uint max_supported_key_parts() const override;
     ulong index_flags(uint idx, uint part, bool all_parts) const override;
 
-    // Table scan methods
+    // Table scanning methods
+    int rnd_pos(uchar *buf, uchar *pos) override;
+    void position(const uchar *record) override;
     int open(const char *name, int mode, uint test_if_locked, const dd::Table *tab_def) override;
     int close() override;
     int rnd_init(bool scan) override;
@@ -71,11 +79,6 @@ public:
     // Information methods
     int info(uint flag) override;
     ha_rows records_in_range(uint inx, key_range *min_key, key_range *max_key) override;
-
-private:
-    cslog_share* get_share();
-    int init_cslog();
-    int close_cslog();
 };
 
 #endif
