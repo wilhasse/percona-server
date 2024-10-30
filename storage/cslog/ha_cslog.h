@@ -23,6 +23,7 @@ private:
     THR_LOCK_DATA lock;      
     cslog_share *share;    
     myrocks::ha_rocksdb* rocksdb_handler;
+    bool m_pk_can_be_decoded;
 
     cslog_share* get_share();
     int init_cslog();
@@ -33,7 +34,7 @@ public:
     ~ha_cslog();
 
     // Required abstract method implementations
-    Table_flags table_flags() const override;
+    ulonglong table_flags() const override;
     const char *table_type() const override { return "CSLOG"; }
     
     // Key related methods

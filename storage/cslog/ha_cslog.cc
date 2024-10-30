@@ -11,7 +11,7 @@
 #include <dlfcn.h>
 #include <mysql/components/services/log_builtins.h>
 
-#define CSLOG_MAX_KEY 64  // Maximum number of keys allowed
+#define CSLOG_MAX_KEY 64           // Maximum number of keys allowed
 #define CSLOG_MAX_KEY_LENGTH 1024  // Maximum key length
 #define CSLOG_MAX_KEY_PARTS 16     // Maximum parts in a composite key
 
@@ -22,21 +22,41 @@ static handler* cslog_create_handler(handlerton *hton, TABLE_SHARE *table,
     return new (mem_root) ha_cslog(hton, table);
 }
 
-// Fix Table_flags resolution by using the correct return type
-handler::Table_flags ha_cslog::table_flags() const {
-    return (HA_PRIMARY_KEY_REQUIRED_FOR_POSITION |  // Support primary keys
-            HA_PRIMARY_KEY_IN_READ_INDEX |         // Can read by primary key
-            HA_BINLOG_ROW_CAPABLE |               // Support row-based binlog
-            HA_CAN_INDEX_BLOBS |                  // Can index BLOB/TEXT
-            HA_REQUIRE_PRIMARY_KEY |              // Require primary key
-            HA_STATS_RECORDS_IS_EXACT |           // Stats are exact
-            HA_NO_AUTO_INCREMENT);                // No auto_increment support yet
+// And update table_flags() to match RocksDB's capabilities:
+ulonglong ha_cslog::table_flags() const {
+    DBUG_ENTER_FUNC();
+
+    ulonglong flags = (HA_BINLOG_ROW_CAPABLE | 
+                      HA_BINLOG_STMT_CAPABLE |
+                      HA_CAN_INDEX_BLOBS |
+                      HA_PRIMARY_KEY_REQUIRED_FOR_POSITION | 
+                      HA_NULL_IN_KEY |
+                      HA_PARTIAL_COLUMN_READ);
+
+    // Add HA_PRIMARY_KEY_IN_READ_INDEX if RocksDB can decode the key
+    if (rocksdb_handler && m_pk_can_be_decoded) {
+        flags |= HA_PRIMARY_KEY_IN_READ_INDEX;
+    }
+
+    // Get additional flags from RocksDB if available
+    if (rocksdb_handler) {
+        flags |= rocksdb_handler->table_flags();
+    }
+
+    DBUG_RETURN(flags);
 }
 
 ha_cslog::ha_cslog(handlerton *hton, TABLE_SHARE *table_arg)
     : handler(hton, table_arg),
       share(nullptr),
-      rocksdb_handler(nullptr) {
+      m_pk_can_be_decoded(true) {
+    try {
+        rocksdb_handler = new myrocks::ha_rocksdb(hton, table_arg);
+
+    } catch (const std::exception& e) {
+        // Handle exception, possibly by setting rocksdb_handler to nullptr
+        rocksdb_handler = nullptr;
+    }
 }
 
 uint ha_cslog::max_supported_keys() const {
@@ -51,74 +71,52 @@ uint ha_cslog::max_supported_key_parts() const {
     return CSLOG_MAX_KEY_PARTS;
 }
 
-// Keep only one implementation of index_flags
 ulong ha_cslog::index_flags(uint idx, uint part, bool all_parts) const {
-    if (rocksdb_handler) {
-        return rocksdb_handler->index_flags(idx, part, all_parts);
+
+  if (!table_share) {
+    return 0;
+  }
+
+  // Basic flags all indexes support
+  ulong flags = HA_READ_NEXT | HA_READ_PREV | HA_READ_ORDER | HA_READ_RANGE;
+
+  // For primary key
+  if (idx == table_share->primary_key) {
+    if (m_pk_can_be_decoded) {
+      flags |= HA_KEYREAD_ONLY;
     }
-    return (HA_READ_NEXT |        // Support forward index scan
-            HA_READ_PREV |        // Support backward index scan
-            HA_READ_ORDER |       // Results come in order
-            HA_READ_RANGE |       // Can handle ranges
-            HA_KEYREAD_ONLY);     // Index-only scanning supported
+    return flags;
+  }
+
+  // For other indexes, delegate to RocksDB if available
+  if (rocksdb_handler) {
+    return rocksdb_handler->index_flags(idx, part, all_parts);
+  }
+
+  return flags;  
 }
 
+// Update open method to properly handle table opening
 int ha_cslog::open(const char *name, int mode, uint test_if_locked, const dd::Table *tab_def) {
     DBUG_ENTER("ha_cslog::open");
     DBUG_PRINT("info", ("Opening table %s", name));
     
     if (!(share = get_share())) {
-        LogErr(ERROR_LEVEL, ER_UNKNOWN_ERROR, "Failed to get share");
-        DBUG_RETURN(1);
+        DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
     }
     
+    // Set the table pointer in RocksDB handler
+    rocksdb_handler->change_table_ptr(table, table_share);
+                
     thr_lock_data_init(&share->lock, &lock, NULL);
-
-    if (!rocksdb_handler) {
-        DBUG_PRINT("info", ("Creating RocksDB handler"));
-        
-        LEX_CSTRING rocks_name;
-        rocks_name.str = "rocksdb";
-        rocks_name.length = 7;
-        
-        plugin_ref plugin = ha_resolve_by_name(nullptr, &rocks_name, false);
-        if (!plugin) {
-            LogErr(ERROR_LEVEL, ER_UNKNOWN_ERROR, "Failed to resolve RocksDB plugin");
-            DBUG_RETURN(HA_ERR_INITIALIZATION);
-        }
-        
-        handlerton *rocks_hton = plugin_data<handlerton*>(plugin);
-        if (!rocks_hton) {
-            LogErr(ERROR_LEVEL, ER_UNKNOWN_ERROR, "Failed to get RocksDB handlerton");
-            DBUG_RETURN(HA_ERR_INITIALIZATION);
-        }
-
-        try {
-            rocksdb_handler = new myrocks::ha_rocksdb(rocks_hton, table_share);
-            if (!rocksdb_handler) {
-                LogErr(ERROR_LEVEL, ER_UNKNOWN_ERROR, "Failed to allocate RocksDB handler");
-                DBUG_RETURN(HA_ERR_OUT_OF_MEM);
-            }
-        } catch (const std::exception& e) {
-            LogErr(ERROR_LEVEL, ER_UNKNOWN_ERROR, 
-                   "Exception while creating RocksDB handler: %s", e.what());
-            DBUG_RETURN(HA_ERR_OUT_OF_MEM);
-        }
-    }
 
     int rc = rocksdb_handler->open(name, mode, test_if_locked, tab_def);
     if (rc) {
-        LogErr(ERROR_LEVEL, ER_UNKNOWN_ERROR, 
-               "Failed to open RocksDB handler, error code: %d", rc);
         DBUG_RETURN(rc);
     }
-
-    rc = init_cslog();
-    DBUG_PRINT("info", ("init_cslog returned: %d", rc));
-    DBUG_RETURN(rc);
+   
+    DBUG_RETURN(0);
 }
-
-// ... (keep other methods the same)
 
 static int cslog_init_func(void *p) {
     DBUG_TRACE;
@@ -217,7 +215,7 @@ void ha_cslog::position(const uchar *record) {
 
 // Also modify the get_share() function to use proper casting:
 cslog_share* ha_cslog::get_share() {
-    cslog_share *tmp_share;
+    cslog_share *tmp_share = nullptr;
     
     DBUG_TRACE;
     
@@ -348,36 +346,32 @@ int ha_cslog::create(const char *name, TABLE *table_arg,
     DBUG_PRINT("info", ("Creating table %s", name));
 
     if (!rocksdb_handler) {
-        // Create a temporary RocksDB handler for table creation
         LEX_CSTRING rocks_name;
         rocks_name.str = "rocksdb";
         rocks_name.length = 7;
         
         plugin_ref plugin = ha_resolve_by_name(nullptr, &rocks_name, false);
         if (!plugin) {
-            LogErr(ERROR_LEVEL, ER_UNKNOWN_ERROR, 
-                   "Failed to resolve RocksDB plugin during table creation");
             DBUG_RETURN(HA_ERR_INITIALIZATION);
         }
         
         handlerton *rocks_hton = plugin_data<handlerton*>(plugin);
         if (!rocks_hton) {
-            LogErr(ERROR_LEVEL, ER_UNKNOWN_ERROR, 
-                   "Failed to get RocksDB handlerton during table creation");
             DBUG_RETURN(HA_ERR_INITIALIZATION);
         }
 
         try {
-            rocksdb_handler = new myrocks::ha_rocksdb(rocks_hton, table_share);
+            // Create RocksDB handler with the same table share
+            rocksdb_handler = new myrocks::ha_rocksdb(rocks_hton, table_arg->s);
+            if (!rocksdb_handler) {
+                DBUG_RETURN(HA_ERR_OUT_OF_MEM);
+            }
         } catch (const std::exception& e) {
-            LogErr(ERROR_LEVEL, ER_UNKNOWN_ERROR, 
-                   "Exception while creating RocksDB handler for table creation: %s", e.what());
             DBUG_RETURN(HA_ERR_OUT_OF_MEM);
         }
     }
 
     int rc = rocksdb_handler->create(name, table_arg, create_info, table_def);
-    DBUG_PRINT("info", ("RocksDB create returned: %d", rc));
     DBUG_RETURN(rc);
 }
 
