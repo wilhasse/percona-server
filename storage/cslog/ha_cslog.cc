@@ -9,9 +9,10 @@
 #include "sql/table.h"
 #include "my_base.h"
 #include <dlfcn.h>
+#include "ha_heap.h"
 #include <mysql/components/services/log_builtins.h>
 
-#define CSLOG_MAX_KEY 64           // Maximum number of keys allowed
+#define CSLOG_MAX_KEY 64  // Maximum number of keys allowed
 #define CSLOG_MAX_KEY_LENGTH 1024  // Maximum key length
 #define CSLOG_MAX_KEY_PARTS 16     // Maximum parts in a composite key
 
@@ -51,7 +52,11 @@ ha_cslog::ha_cslog(handlerton *hton, TABLE_SHARE *table_arg)
       share(nullptr),
       m_pk_can_be_decoded(true) {
     try {
+        // rocksdb
         rocksdb_handler = new myrocks::ha_rocksdb(hton, table_arg);
+
+        // heap
+        memory_handler = new (std::nothrow) ha_heap(hton, table_share);
 
     } catch (const std::exception& e) {
         // Handle exception, possibly by setting rocksdb_handler to nullptr
@@ -107,6 +112,7 @@ int ha_cslog::open(const char *name, int mode, uint test_if_locked, const dd::Ta
     
     // Set the table pointer in RocksDB handler
     rocksdb_handler->change_table_ptr(table, table_share);
+    memory_handler->change_table_ptr(table, table_share);
                 
     thr_lock_data_init(&share->lock, &lock, NULL);
 
@@ -115,6 +121,11 @@ int ha_cslog::open(const char *name, int mode, uint test_if_locked, const dd::Ta
         DBUG_RETURN(rc);
     }
    
+    rc = memory_handler->open(name, mode, test_if_locked, tab_def);
+    if (rc) {
+        DBUG_RETURN(rc);
+    }
+
     DBUG_RETURN(0);
 }
 
@@ -147,6 +158,7 @@ static int cslog_init_func(void *p) {
 
 ha_cslog::~ha_cslog() {
     delete rocksdb_handler;
+    delete memory_handler;
 }
 
 int ha_cslog::init_cslog() {
@@ -174,6 +186,7 @@ int ha_cslog::write_row(uchar *buf) {
     if (!rocksdb_handler) {
         return HA_ERR_INITIALIZATION;
     }
+    memory_handler->write_row(buf);
     return rocksdb_handler->write_row(buf);
 }
 

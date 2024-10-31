@@ -11,6 +11,8 @@
 #include "thr_lock.h"        /* THR_LOCK, THR_LOCK_DATA */
 #include "ha_rocksdb.h"
 
+class ha_heap;
+
 class cslog_share : public Handler_share {
 public:
     THR_LOCK lock;
@@ -21,7 +23,8 @@ public:
 class ha_cslog: public handler {
 private:
     THR_LOCK_DATA lock;      
-    cslog_share *share;    
+    cslog_share *share = nullptr;
+    ha_heap* memory_handler;    
     myrocks::ha_rocksdb* rocksdb_handler;
     bool m_pk_can_be_decoded;
 

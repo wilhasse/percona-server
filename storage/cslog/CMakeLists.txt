@@ -29,6 +29,7 @@ ENDIF()
 # Add necessary include directories
 TARGET_INCLUDE_DIRECTORIES(cslog
   PRIVATE
+  ${CMAKE_SOURCE_DIR}/storage/heap
   ${CMAKE_SOURCE_DIR}/storage/rocksdb
   ${CMAKE_SOURCE_DIR}/storage/rocksdb/rocksdb
   ${CMAKE_SOURCE_DIR}/storage/rocksdb/rocksdb/include
