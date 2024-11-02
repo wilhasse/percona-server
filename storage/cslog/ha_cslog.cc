@@ -197,6 +197,43 @@ static int cslog_deinit_func(void *p) {
     return 0;
 }
 
+int ha_cslog::create(const char *name, TABLE *table_arg, 
+                    HA_CREATE_INFO *create_info, dd::Table *table_def) {
+    DBUG_ENTER("ha_cslog::create");
+    DBUG_PRINT("info", ("Creating table %s", name));
+
+    if (!rocksdb_handler) {
+        LEX_CSTRING rocks_name;
+        rocks_name.str = "rocksdb";
+        rocks_name.length = 7;
+        
+        plugin_ref plugin = ha_resolve_by_name(nullptr, &rocks_name, false);
+        if (!plugin) {
+            DBUG_RETURN(HA_ERR_INITIALIZATION);
+        }
+        
+        handlerton *rocks_hton = plugin_data<handlerton*>(plugin);
+        if (!rocks_hton) {
+            DBUG_RETURN(HA_ERR_INITIALIZATION);
+        }
+
+        try {
+            // Create RocksDB handler with the same table share
+            rocksdb_handler = new myrocks::ha_rocksdb(rocks_hton, table_arg->s);
+            if (!rocksdb_handler) {
+                DBUG_RETURN(HA_ERR_OUT_OF_MEM);
+            }
+        } catch (const std::exception& e) {
+            DBUG_RETURN(HA_ERR_OUT_OF_MEM);
+        }
+    }
+
+    int rc = rocksdb_handler->create(name, table_arg, create_info, table_def);
+ 
+    rc = memory_handler->create(name, table_arg, create_info, table_def);
+   DBUG_RETURN(rc);
+}
+
 int ha_cslog::close() {
     int rc = 0;
     if (memory_handler) {
@@ -208,7 +245,10 @@ int ha_cslog::close() {
     return rc;  
 }
 
-// Modified write_row to write to both stores
+// SQL DATA MODIFICATION
+//
+// The following methods are used to modify data in the table.
+//
 int ha_cslog::write_row(uchar *buf) {
     CSLOG_DEBUG("Writing row to both memory and RocksDB");
     
@@ -236,6 +276,62 @@ int ha_cslog::write_row(uchar *buf) {
     return 0;
 }
 
+int ha_cslog::delete_row(const uchar *buf) {
+    CSLOG_DEBUG("Attempting to delete row from both stores");
+    
+    if (!memory_handler || !rocksdb_handler) {
+        return HA_ERR_INITIALIZATION;
+    }
+
+    // Delete from memory first
+    int memory_rc = memory_handler->delete_row(buf);
+    if (memory_rc && memory_rc != HA_ERR_KEY_NOT_FOUND) {
+        CSLOG_DEBUG("Failed to delete from memory cache: %d", memory_rc);
+        return memory_rc;
+    }
+    CSLOG_DEBUG("Successfully deleted from memory cache (or not found)");
+
+    // Then delete from RocksDB
+    int rocks_rc = rocksdb_handler->delete_row(buf);
+    if (rocks_rc) {
+        CSLOG_DEBUG("Failed to delete from RocksDB: %d", rocks_rc);
+        return rocks_rc;
+    }
+    CSLOG_DEBUG("Successfully deleted from RocksDB");
+
+    return 0;
+}
+
+int ha_cslog::update_row(const uchar *old_data, uchar *new_data) {
+    CSLOG_DEBUG("Attempting to update row in both stores");
+    
+    if (!memory_handler || !rocksdb_handler) {
+        return HA_ERR_INITIALIZATION;
+    }
+
+    // Update memory first
+    int memory_rc = memory_handler->update_row(old_data, new_data);
+    if (memory_rc && memory_rc != HA_ERR_KEY_NOT_FOUND) {
+        CSLOG_DEBUG("Failed to update memory cache: %d", memory_rc);
+        return memory_rc;
+    }
+    CSLOG_DEBUG("Successfully updated memory cache (or not found)");
+
+    // Then update RocksDB
+    int rocks_rc = rocksdb_handler->update_row(old_data, new_data);
+    if (rocks_rc) {
+        CSLOG_DEBUG("Failed to update RocksDB: %d", rocks_rc);
+        return rocks_rc;
+    }
+    CSLOG_DEBUG("Successfully updated RocksDB");
+
+    return 0;
+}
+
+// SQL DATA RETRIEVAL
+//
+// The following methods are used to retrieve data from the table.
+//
 int ha_cslog::rnd_init(bool scan) {
     if (!rocksdb_handler) {
         return HA_ERR_INITIALIZATION;
@@ -244,7 +340,6 @@ int ha_cslog::rnd_init(bool scan) {
     return rocksdb_handler->rnd_init(scan);
 }
 
-// Modified rnd_next with cache-first reading
 int ha_cslog::rnd_next(uchar *buf) {
     CSLOG_DEBUG("Attempting to read next row");
     
@@ -279,8 +374,6 @@ int ha_cslog::rnd_end() {
     return rocksdb_handler->rnd_end();
 }
 
-// Add these new implementations to your ha_cslog.cc file:
-
 int ha_cslog::rnd_pos(uchar *buf, uchar *pos) {
     if (!rocksdb_handler) {
         return HA_ERR_INITIALIZATION;
@@ -294,7 +387,6 @@ void ha_cslog::position(const uchar *record) {
     }
 }
 
-// Also modify the get_share() function to use proper casting:
 cslog_share* ha_cslog::get_share() {
     cslog_share *tmp_share = nullptr;
     
@@ -314,6 +406,10 @@ cslog_share* ha_cslog::get_share() {
     return tmp_share;
 }
 
+// SQL INDEX OPERATIONS
+//
+// The following methods are used to interact with indexes in the table.
+// 
 int ha_cslog::index_init(uint idx, bool sorted) {
     if (!rocksdb_handler) {
         return HA_ERR_INITIALIZATION;
@@ -328,7 +424,6 @@ int ha_cslog::index_end() {
     return rocksdb_handler->index_end();
 }
 
-// Modified index_read_map with cache-first reading
 int ha_cslog::index_read_map(uchar *buf, const uchar *key,
                            key_part_map keypart_map,
                            enum ha_rkey_function find_flag) {
@@ -461,95 +556,6 @@ int ha_cslog::delete_table(const char *name, const dd::Table *table_def) {
         return HA_ERR_INITIALIZATION;
     }
     return rocksdb_handler->delete_table(name, table_def);
-}
-
-int ha_cslog::create(const char *name, TABLE *table_arg, 
-                    HA_CREATE_INFO *create_info, dd::Table *table_def) {
-    DBUG_ENTER("ha_cslog::create");
-    DBUG_PRINT("info", ("Creating table %s", name));
-
-    if (!rocksdb_handler) {
-        LEX_CSTRING rocks_name;
-        rocks_name.str = "rocksdb";
-        rocks_name.length = 7;
-        
-        plugin_ref plugin = ha_resolve_by_name(nullptr, &rocks_name, false);
-        if (!plugin) {
-            DBUG_RETURN(HA_ERR_INITIALIZATION);
-        }
-        
-        handlerton *rocks_hton = plugin_data<handlerton*>(plugin);
-        if (!rocks_hton) {
-            DBUG_RETURN(HA_ERR_INITIALIZATION);
-        }
-
-        try {
-            // Create RocksDB handler with the same table share
-            rocksdb_handler = new myrocks::ha_rocksdb(rocks_hton, table_arg->s);
-            if (!rocksdb_handler) {
-                DBUG_RETURN(HA_ERR_OUT_OF_MEM);
-            }
-        } catch (const std::exception& e) {
-            DBUG_RETURN(HA_ERR_OUT_OF_MEM);
-        }
-    }
-
-    int rc = rocksdb_handler->create(name, table_arg, create_info, table_def);
- 
-    rc = memory_handler->create(name, table_arg, create_info, table_def);
-   DBUG_RETURN(rc);
-}
-
-int ha_cslog::delete_row(const uchar *buf) {
-    CSLOG_DEBUG("Attempting to delete row from both stores");
-    
-    if (!memory_handler || !rocksdb_handler) {
-        return HA_ERR_INITIALIZATION;
-    }
-
-    // Delete from memory first
-    int memory_rc = memory_handler->delete_row(buf);
-    if (memory_rc && memory_rc != HA_ERR_KEY_NOT_FOUND) {
-        CSLOG_DEBUG("Failed to delete from memory cache: %d", memory_rc);
-        return memory_rc;
-    }
-    CSLOG_DEBUG("Successfully deleted from memory cache (or not found)");
-
-    // Then delete from RocksDB
-    int rocks_rc = rocksdb_handler->delete_row(buf);
-    if (rocks_rc) {
-        CSLOG_DEBUG("Failed to delete from RocksDB: %d", rocks_rc);
-        return rocks_rc;
-    }
-    CSLOG_DEBUG("Successfully deleted from RocksDB");
-
-    return 0;
-}
-
-int ha_cslog::update_row(const uchar *old_data, uchar *new_data) {
-    CSLOG_DEBUG("Attempting to update row in both stores");
-    
-    if (!memory_handler || !rocksdb_handler) {
-        return HA_ERR_INITIALIZATION;
-    }
-
-    // Update memory first
-    int memory_rc = memory_handler->update_row(old_data, new_data);
-    if (memory_rc && memory_rc != HA_ERR_KEY_NOT_FOUND) {
-        CSLOG_DEBUG("Failed to update memory cache: %d", memory_rc);
-        return memory_rc;
-    }
-    CSLOG_DEBUG("Successfully updated memory cache (or not found)");
-
-    // Then update RocksDB
-    int rocks_rc = rocksdb_handler->update_row(old_data, new_data);
-    if (rocks_rc) {
-        CSLOG_DEBUG("Failed to update RocksDB: %d", rocks_rc);
-        return rocks_rc;
-    }
-    CSLOG_DEBUG("Successfully updated RocksDB");
-
-    return 0;
 }
 
 // Add this structure before mysql_declare_plugin
