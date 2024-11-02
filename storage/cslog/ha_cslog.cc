@@ -23,6 +23,21 @@ static handler* cslog_create_handler(handlerton *hton, TABLE_SHARE *table,
     return new (mem_root) ha_cslog(hton, table);
 }
 
+// Use MySQL's built-in logging system
+#define CSLOG_DEBUG(format, ...) \
+    LogErr(INFORMATION_LEVEL, ER_PARSER_TRACE, \
+           my_format(format, ##__VA_ARGS__))
+
+// Helper function using MySQL's string formatting
+static const char* my_format(const char* format, ...) {
+    static char buffer[1024];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    return buffer;
+}
+
 // And update table_flags() to match RocksDB's capabilities:
 ulonglong ha_cslog::table_flags() const {
     DBUG_ENTER_FUNC();
@@ -51,16 +66,24 @@ ha_cslog::ha_cslog(handlerton *hton, TABLE_SHARE *table_arg)
     : handler(hton, table_arg),
       share(nullptr),
       m_pk_can_be_decoded(true) {
+
     try {
         // rocksdb
         rocksdb_handler = new myrocks::ha_rocksdb(hton, table_arg);
+
+    } catch (const std::exception& e) {
+        // Handle exception, possibly by setting rocksdb_handler to nullptr
+        rocksdb_handler = nullptr;
+    }
+
+    try {
 
         // heap
         memory_handler = new (std::nothrow) ha_heap(hton, table_share);
 
     } catch (const std::exception& e) {
         // Handle exception, possibly by setting rocksdb_handler to nullptr
-        rocksdb_handler = nullptr;
+        memory_handler = nullptr;
     }
 }
 
@@ -116,16 +139,16 @@ int ha_cslog::open(const char *name, int mode, uint test_if_locked, const dd::Ta
                 
     thr_lock_data_init(&share->lock, &lock, NULL);
 
-    int rc = rocksdb_handler->open(name, mode, test_if_locked, tab_def);
-    if (rc) {
-        DBUG_RETURN(rc);
-    }
-   
-    rc = memory_handler->open(name, mode, test_if_locked, tab_def);
+    int rc = memory_handler->open(name, mode, test_if_locked, tab_def);
     if (rc) {
         DBUG_RETURN(rc);
     }
 
+    rc = rocksdb_handler->open(name, mode, test_if_locked, tab_def);
+    if (rc) {
+        DBUG_RETURN(rc);
+    }
+   
     DBUG_RETURN(0);
 }
 
@@ -157,8 +180,8 @@ static int cslog_init_func(void *p) {
 }
 
 ha_cslog::~ha_cslog() {
-    delete rocksdb_handler;
     delete memory_handler;
+    delete rocksdb_handler;
 }
 
 int ha_cslog::init_cslog() {
@@ -176,32 +199,77 @@ static int cslog_deinit_func(void *p) {
 
 int ha_cslog::close() {
     int rc = 0;
+    if (memory_handler) {
+        rc = memory_handler->close();
+    }
     if (rocksdb_handler) {
         rc = rocksdb_handler->close();
     }
     return rc;  
 }
 
+// Modified write_row to write to both stores
 int ha_cslog::write_row(uchar *buf) {
-    if (!rocksdb_handler) {
+    CSLOG_DEBUG("Writing row to both memory and RocksDB");
+    
+    if (!memory_handler || !rocksdb_handler) {
         return HA_ERR_INITIALIZATION;
     }
-    memory_handler->write_row(buf);
-    return rocksdb_handler->write_row(buf);
+
+    // Write to memory first (hot cache)
+    int memory_rc = memory_handler->write_row(buf);
+    if (memory_rc) {
+        CSLOG_DEBUG("Failed to write to memory cache: %d", memory_rc);
+        return memory_rc;
+    }
+    CSLOG_DEBUG("Successfully wrote to memory cache");
+
+    // Then write to RocksDB
+    int rocks_rc = rocksdb_handler->write_row(buf);
+    if (rocks_rc) {
+        CSLOG_DEBUG("Failed to write to RocksDB: %d", rocks_rc);
+        // Consider rolling back memory write if RocksDB write fails
+        return rocks_rc;
+    }
+    CSLOG_DEBUG("Successfully wrote to RocksDB");
+
+    return 0;
 }
 
 int ha_cslog::rnd_init(bool scan) {
     if (!rocksdb_handler) {
         return HA_ERR_INITIALIZATION;
     }
+    memory_handler->rnd_init(scan);
     return rocksdb_handler->rnd_init(scan);
 }
 
+// Modified rnd_next with cache-first reading
 int ha_cslog::rnd_next(uchar *buf) {
-    if (!rocksdb_handler) {
+    CSLOG_DEBUG("Attempting to read next row");
+    
+    if (!memory_handler || !rocksdb_handler) {
         return HA_ERR_INITIALIZATION;
     }
-    return rocksdb_handler->rnd_next(buf);
+
+    // Try memory cache first
+    int memory_rc = memory_handler->rnd_next(buf);
+    if (memory_rc == 0) {
+        CSLOG_DEBUG("Found row in memory cache");
+        return 0;
+    }
+    
+    CSLOG_DEBUG("Row not found in memory cache, trying RocksDB");
+    
+    // If not found in memory, try RocksDB
+    int rocks_rc = rocksdb_handler->rnd_next(buf);
+    if (rocks_rc == 0) {
+        CSLOG_DEBUG("Found row in RocksDB");
+    } else {
+        CSLOG_DEBUG("Row not found in RocksDB: %d", rocks_rc);
+    }
+    
+    return rocks_rc;
 }
 
 int ha_cslog::rnd_end() {
@@ -260,19 +328,61 @@ int ha_cslog::index_end() {
     return rocksdb_handler->index_end();
 }
 
-int ha_cslog::index_read_map(uchar *buf, const uchar *key, key_part_map keypart_map,
+// Modified index_read_map with cache-first reading
+int ha_cslog::index_read_map(uchar *buf, const uchar *key,
+                           key_part_map keypart_map,
                            enum ha_rkey_function find_flag) {
-    if (!rocksdb_handler) {
+    CSLOG_DEBUG("Attempting index read with key");
+    
+    if (!memory_handler || !rocksdb_handler) {
         return HA_ERR_INITIALIZATION;
     }
-    return rocksdb_handler->index_read_map(buf, key, keypart_map, find_flag);
+
+    // Try memory cache first
+    int memory_rc = memory_handler->index_read_map(buf, key, keypart_map, find_flag);
+    if (memory_rc == 0) {
+        CSLOG_DEBUG("Found key in memory cache");
+        return 0;
+    }
+    
+    CSLOG_DEBUG("Key not found in memory cache, trying RocksDB");
+    
+    // If not found in memory, try RocksDB
+    int rocks_rc = rocksdb_handler->index_read_map(buf, key, keypart_map, find_flag);
+    if (rocks_rc == 0) {
+        CSLOG_DEBUG("Found key in RocksDB");
+    } else {
+        CSLOG_DEBUG("Key not found in RocksDB: %d", rocks_rc);
+    }
+    
+    return rocks_rc;
 }
 
 int ha_cslog::index_next(uchar *buf) {
-    if (!rocksdb_handler) {
+    CSLOG_DEBUG("Attempting to read next index entry");
+    
+    if (!memory_handler || !rocksdb_handler) {
         return HA_ERR_INITIALIZATION;
     }
-    return rocksdb_handler->index_next(buf);
+
+    // Try memory cache first
+    int memory_rc = memory_handler->index_next(buf);
+    if (memory_rc == 0) {
+        CSLOG_DEBUG("Found next index entry in memory cache");
+        return 0;
+    }
+    
+    CSLOG_DEBUG("Next index entry not found in memory cache, trying RocksDB");
+    
+    // If not found in memory, try RocksDB
+    int rocks_rc = rocksdb_handler->index_next(buf);
+    if (rocks_rc == 0) {
+        CSLOG_DEBUG("Found next index entry in RocksDB");
+    } else {
+        CSLOG_DEBUG("Next index entry not found in RocksDB: %d", rocks_rc);
+    }
+    
+    return rocks_rc;
 }
 
 int ha_cslog::index_prev(uchar *buf) {
@@ -385,21 +495,61 @@ int ha_cslog::create(const char *name, TABLE *table_arg,
     }
 
     int rc = rocksdb_handler->create(name, table_arg, create_info, table_def);
-    DBUG_RETURN(rc);
+ 
+    rc = memory_handler->create(name, table_arg, create_info, table_def);
+   DBUG_RETURN(rc);
 }
 
 int ha_cslog::delete_row(const uchar *buf) {
-    if (!rocksdb_handler) {
+    CSLOG_DEBUG("Attempting to delete row from both stores");
+    
+    if (!memory_handler || !rocksdb_handler) {
         return HA_ERR_INITIALIZATION;
     }
-    return rocksdb_handler->delete_row(buf);
+
+    // Delete from memory first
+    int memory_rc = memory_handler->delete_row(buf);
+    if (memory_rc && memory_rc != HA_ERR_KEY_NOT_FOUND) {
+        CSLOG_DEBUG("Failed to delete from memory cache: %d", memory_rc);
+        return memory_rc;
+    }
+    CSLOG_DEBUG("Successfully deleted from memory cache (or not found)");
+
+    // Then delete from RocksDB
+    int rocks_rc = rocksdb_handler->delete_row(buf);
+    if (rocks_rc) {
+        CSLOG_DEBUG("Failed to delete from RocksDB: %d", rocks_rc);
+        return rocks_rc;
+    }
+    CSLOG_DEBUG("Successfully deleted from RocksDB");
+
+    return 0;
 }
 
 int ha_cslog::update_row(const uchar *old_data, uchar *new_data) {
-    if (!rocksdb_handler) {
+    CSLOG_DEBUG("Attempting to update row in both stores");
+    
+    if (!memory_handler || !rocksdb_handler) {
         return HA_ERR_INITIALIZATION;
     }
-    return rocksdb_handler->update_row(old_data, new_data);
+
+    // Update memory first
+    int memory_rc = memory_handler->update_row(old_data, new_data);
+    if (memory_rc && memory_rc != HA_ERR_KEY_NOT_FOUND) {
+        CSLOG_DEBUG("Failed to update memory cache: %d", memory_rc);
+        return memory_rc;
+    }
+    CSLOG_DEBUG("Successfully updated memory cache (or not found)");
+
+    // Then update RocksDB
+    int rocks_rc = rocksdb_handler->update_row(old_data, new_data);
+    if (rocks_rc) {
+        CSLOG_DEBUG("Failed to update RocksDB: %d", rocks_rc);
+        return rocks_rc;
+    }
+    CSLOG_DEBUG("Successfully updated RocksDB");
+
+    return 0;
 }
 
 // Add this structure before mysql_declare_plugin

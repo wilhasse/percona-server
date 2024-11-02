@@ -10,6 +10,59 @@
 #include "handler.h"          /* handler */
 #include "thr_lock.h"        /* THR_LOCK, THR_LOCK_DATA */
 #include "ha_rocksdb.h"
+#include "mysql/components/services/log_builtins.h"
+
+// Define logging levels
+#define CSLOG_LEVEL_ERROR 3
+#define CSLOG_LEVEL_WARNING 2
+#define CSLOG_LEVEL_INFO 1
+#define CSLOG_LEVEL_DEBUG 0
+
+// Enable debug logging by default
+#ifndef CSLOG_LOG_LEVEL
+#define CSLOG_LOG_LEVEL CSLOG_LEVEL_DEBUG
+#endif
+
+// Logging macros
+#define CSLOG_DEBUG(format, ...) \
+    if (CSLOG_LOG_LEVEL <= CSLOG_LEVEL_DEBUG) { \
+        LogEvent().type(LOG_TYPE_ERROR) \
+                  .prio(WARNING_LEVEL) \
+                  .errcode(ER_PARSER_TRACE) \
+                  .subsys("Storage/CSLOG") \
+                  .verbatim(true) \
+                  .msg("CSLOG-DEBUG: " format, ##__VA_ARGS__); \
+    }
+
+#define CSLOG_INFO(format, ...) \
+    if (CSLOG_LOG_LEVEL <= CSLOG_LEVEL_INFO) { \
+        LogEvent().type(LOG_TYPE_ERROR) \
+                  .prio(WARNING_LEVEL) \
+                  .errcode(ER_PARSER_TRACE) \
+                  .subsys("Storage/CSLOG") \
+                  .verbatim(true) \
+                  .msg("CSLOG-INFO: " format, ##__VA_ARGS__); \
+    }
+
+#define CSLOG_WARNING(format, ...) \
+    if (CSLOG_LOG_LEVEL <= CSLOG_LEVEL_WARNING) { \
+        LogEvent().type(LOG_TYPE_ERROR) \
+                  .prio(WARNING_LEVEL) \
+                  .errcode(ER_PARSER_TRACE) \
+                  .subsys("Storage/CSLOG") \
+                  .verbatim(true) \
+                  .msg("CSLOG-WARNING: " format, ##__VA_ARGS__); \
+    }
+
+#define CSLOG_ERROR(format, ...) \
+    if (CSLOG_LOG_LEVEL <= CSLOG_LEVEL_ERROR) { \
+        LogEvent().type(LOG_TYPE_ERROR) \
+                  .prio(ERROR_LEVEL) \
+                  .errcode(ER_PARSER_TRACE) \
+                  .subsys("Storage/CSLOG") \
+                  .verbatim(true) \
+                  .msg("CSLOG-ERROR: " format, ##__VA_ARGS__); \
+    }
 
 class ha_heap;
 
