@@ -10,11 +10,17 @@
 #include "my_base.h"
 #include <dlfcn.h>
 #include "ha_heap.h"
+#include "sql/system_variables.h"
+#include "sql/handler.h"
 #include <mysql/components/services/log_builtins.h>
 
 #define CSLOG_MAX_KEY 64  // Maximum number of keys allowed
 #define CSLOG_MAX_KEY_LENGTH 1024  // Maximum key length
 #define CSLOG_MAX_KEY_PARTS 16     // Maximum parts in a composite key
+
+/* Session Variables
+*/
+static bool cslog_write_memory_only = false;
 
 static handlerton *cslog_hton = nullptr;
 
@@ -261,12 +267,15 @@ int ha_cslog::write_row(uchar *buf) {
         return memory_rc;
     }
 
-    // Then write to RocksDB
-    int rocks_rc = rocksdb_handler->write_row(buf);
-    if (rocks_rc) {
-        DBUG_PRINT("error",("Failed to write to RocksDB: %d", rocks_rc));
-        // Consider rolling back memory write if RocksDB write fails
-        return rocks_rc;
+    // Then write to RocksDB, if enabled
+    if (! cslog_write_memory_only) {
+
+        int rocks_rc = rocksdb_handler->write_row(buf);
+        if (rocks_rc) {
+            DBUG_PRINT("error",("Failed to write to RocksDB: %d", rocks_rc));
+          // Consider rolling back memory write if RocksDB write fails
+            return rocks_rc;
+        }
     }
     DBUG_RETURN(0);
     return 0;
@@ -631,7 +640,24 @@ int ha_cslog::delete_table(const char *name, const dd::Table *table_def) {
     return rocksdb_handler->delete_table(name, table_def);
 }
 
-// Add this structure before mysql_declare_plugin
+// Define the session variable
+static bool write_memory_only;
+
+static MYSQL_THDVAR_BOOL(
+    write_memory_only,                // Variable name
+    PLUGIN_VAR_RQCMDARG,              // Optional arguments
+    "Writes DML only in memory",      // Description
+    nullptr,                          // Check function
+    nullptr,                          // Update function
+    0                                 // Default value
+);
+
+// System variables array
+static struct SYS_VAR *cslog_system_variables[] = {
+    MYSQL_SYSVAR(write_memory_only),
+    nullptr
+};
+
 struct st_mysql_storage_engine cslog_storage_engine = {
     MYSQL_HANDLERTON_INTERFACE_VERSION
 };
@@ -648,7 +674,7 @@ mysql_declare_plugin(cslog) {
     cslog_deinit_func,
     0x0001,
     nullptr,
-    nullptr,
+    cslog_system_variables,
     nullptr,
     0
 } mysql_declare_plugin_end;
