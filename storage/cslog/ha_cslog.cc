@@ -26,7 +26,7 @@ static handler* cslog_create_handler(handlerton *hton, TABLE_SHARE *table,
     return new (mem_root) ha_cslog(hton, table);
 }
 
-static int cslog_check_write_memory_only(
+static int cslog_check_write(
     THD *const thd,
     struct SYS_VAR *var,
     void *save,
@@ -43,15 +43,24 @@ static int cslog_check_write_memory_only(
 
 static MYSQL_THDVAR_BOOL(
     write_memory_only,                    // Variable name
-    PLUGIN_VAR_RQCMDARG,                 // Flags
+    PLUGIN_VAR_RQCMDARG,                  // Flags
     "Write only in memory, skip RocksDB", // Help text
-    cslog_check_write_memory_only,        // Check function
-    nullptr,                             // Update function
-    false);                              // Default value
+    cslog_check_write,                    // Check function
+    nullptr,                              // Update function
+    false);                               // Default value
+
+static MYSQL_THDVAR_BOOL(
+    write_persist_only,                   // Variable name
+    PLUGIN_VAR_RQCMDARG,                  // Flags
+    "Write only in RocksDB, skip memory", // Help text
+    cslog_check_write,                    // Check function
+    nullptr,                              // Update function
+    false);                               // Default value
 
 // Define the system variables array
 static struct SYS_VAR *cslog_system_variables[] = {
     MYSQL_SYSVAR(write_memory_only),
+    MYSQL_SYSVAR(write_persist_only),
     nullptr
 };
 
@@ -287,22 +296,24 @@ int ha_cslog::write_row(uchar *buf) {
         return HA_ERR_INITIALIZATION;
     }
 
-    // Write to memory first (hot cache)
-    int memory_rc = memory_handler->write_row(buf);
-    if (memory_rc) {
-        DBUG_PRINT("error",("Failed to write to memory cache: %d", memory_rc));
-        DBUG_RETURN(memory_rc);
-        return memory_rc;
-    }
+    bool memory_only  = THDVAR(table->in_use, write_memory_only); 
+    bool persist_only = THDVAR(table->in_use, write_persist_only); 
+    DBUG_PRINT("info", ("Memory only mode: %s", memory_only ? "YES" : "NO"));
+    DBUG_PRINT("info", ("Persist only mode: %s", persist_only ? "YES" : "NO"));
 
-    bool write_only = THDVAR(table->in_use, write_memory_only); 
-    DBUG_PRINT("info", ("Memory only m ode: %s", write_only ? "YES" : "NO"));
+    // Write to memory first (hot cache)
+    if (! persist_only) {
+
+        int memory_rc = memory_handler->write_row(buf);
+        if (memory_rc) {
+            DBUG_PRINT("error",("Failed to write to memory cache: %d", memory_rc));
+            DBUG_RETURN(memory_rc);
+            return memory_rc;
+        }
+    }
     
     // Then write to RocksDB, if enabled
-    if (write_only) {
-
-        DBUG_PRINT("info",("Write memory only is set, skipping RocksDB"));
-    } else {
+    if (! memory_only) {
 
         int rocks_rc = rocksdb_handler->write_row(buf);
         if (rocks_rc) {
