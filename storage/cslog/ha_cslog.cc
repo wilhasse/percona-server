@@ -11,6 +11,7 @@
 #include <dlfcn.h>
 #include "ha_heap.h"
 #include "sql/system_variables.h"
+#include "sql/sql_plugin.h" // Add this line to include the definition of mysql_value_to_bool
 #include "sql/handler.h"
 #include <mysql/components/services/log_builtins.h>
 
@@ -18,16 +19,41 @@
 #define CSLOG_MAX_KEY_LENGTH 1024  // Maximum key length
 #define CSLOG_MAX_KEY_PARTS 16     // Maximum parts in a composite key
 
-/* Session Variables
-*/
-static bool cslog_write_memory_only = false;
-
 static handlerton *cslog_hton = nullptr;
 
 static handler* cslog_create_handler(handlerton *hton, TABLE_SHARE *table, 
                                    bool partitioned, MEM_ROOT *mem_root) {
     return new (mem_root) ha_cslog(hton, table);
 }
+
+static int cslog_check_write_memory_only(
+    THD *const thd,
+    struct SYS_VAR *var,
+    void *save,
+    struct st_mysql_value *value) 
+{
+    longlong temp_value;
+    int result = value->val_int(value, &temp_value);
+    if (result == 0) {
+        bool new_value = (temp_value != 0);
+        *(bool *)save = new_value;
+    }
+    return result;
+}
+
+static MYSQL_THDVAR_BOOL(
+    write_memory_only,                    // Variable name
+    PLUGIN_VAR_RQCMDARG,                 // Flags
+    "Write only in memory, skip RocksDB", // Help text
+    cslog_check_write_memory_only,        // Check function
+    nullptr,                             // Update function
+    false);                              // Default value
+
+// Define the system variables array
+static struct SYS_VAR *cslog_system_variables[] = {
+    MYSQL_SYSVAR(write_memory_only),
+    nullptr
+};
 
 // Helper function using MySQL's string formatting
 static const char* my_format(const char* format, ...) {
@@ -257,6 +283,7 @@ int ha_cslog::write_row(uchar *buf) {
     DBUG_ENTER(__PRETTY_FUNCTION__);
    
     if (!memory_handler || !rocksdb_handler) {
+        DBUG_RETURN(HA_ERR_INITIALIZATION);
         return HA_ERR_INITIALIZATION;
     }
 
@@ -264,16 +291,24 @@ int ha_cslog::write_row(uchar *buf) {
     int memory_rc = memory_handler->write_row(buf);
     if (memory_rc) {
         DBUG_PRINT("error",("Failed to write to memory cache: %d", memory_rc));
+        DBUG_RETURN(memory_rc);
         return memory_rc;
     }
 
+    bool write_only = THDVAR(table->in_use, write_memory_only); 
+    DBUG_PRINT("info", ("Memory only m ode: %s", write_only ? "YES" : "NO"));
+    
     // Then write to RocksDB, if enabled
-    if (! cslog_write_memory_only) {
+    if (write_only) {
+
+        DBUG_PRINT("info",("Write memory only is set, skipping RocksDB"));
+    } else {
 
         int rocks_rc = rocksdb_handler->write_row(buf);
         if (rocks_rc) {
             DBUG_PRINT("error",("Failed to write to RocksDB: %d", rocks_rc));
-          // Consider rolling back memory write if RocksDB write fails
+            // Consider rolling back memory write if RocksDB write fails
+            DBUG_RETURN(rocks_rc);
             return rocks_rc;
         }
     }
@@ -366,9 +401,7 @@ int ha_cslog::rnd_next(uchar *buf) {
         DBUG_PRINT("cslog", ("Memory hit - Column values:"));
         for (field = table->field; *field; field++) {
             (*field)->val_str(&tmp);
-            DBUG_PRINT("cslog", ("  %s = %s", 
-                                (*field)->field_name, 
-                                tmp.c_ptr_safe()));
+            DBUG_PRINT("cslog", ("  %s = %s", (*field)->field_name, tmp.c_ptr_safe()));
         }
         return rc;
     }
@@ -385,9 +418,7 @@ int ha_cslog::rnd_next(uchar *buf) {
         DBUG_PRINT("cslog", ("RocksDB hit - Column values:"));
         for (field = table->field; *field; field++) {
             (*field)->val_str(&tmp);
-            DBUG_PRINT("cslog", ("  %s = %s", 
-                                (*field)->field_name, 
-                                tmp.c_ptr_safe()));
+            DBUG_PRINT("cslog", ("  %s = %s", (*field)->field_name, tmp.c_ptr_safe()));
         }
     } else {
         DBUG_PRINT("cslog", ("RocksDB miss rc=%d", rc));
@@ -519,17 +550,14 @@ int ha_cslog::index_read_map(uchar *buf, const uchar *key,
          DBUG_PRINT("info",("Found key in memory cache"));
         return 0;
     }
-    
-     DBUG_PRINT("info",("Key not found in memory cache, trying RocksDB"));
-    
-    // If not found in memory, try RocksDB
+
+    // RocksDB    
     int rocks_rc = rocksdb_handler->index_read_map(buf, key, keypart_map, find_flag);
     if (rocks_rc == 0) {
-         DBUG_PRINT("info",("Found key in RocksDB"));
+        DBUG_PRINT("info",("Found key in RocksDB"));
     } else {
-         DBUG_PRINT("info",("Key not found in RocksDB: %d", rocks_rc));
+        DBUG_PRINT("info",("Key not found in RocksDB: %d", rocks_rc));
     }
-    
     return rocks_rc;
 }
 
@@ -639,24 +667,6 @@ int ha_cslog::delete_table(const char *name, const dd::Table *table_def) {
     }
     return rocksdb_handler->delete_table(name, table_def);
 }
-
-// Define the session variable
-static bool write_memory_only;
-
-static MYSQL_THDVAR_BOOL(
-    write_memory_only,                // Variable name
-    PLUGIN_VAR_RQCMDARG,              // Optional arguments
-    "Writes DML only in memory",      // Description
-    nullptr,                          // Check function
-    nullptr,                          // Update function
-    0                                 // Default value
-);
-
-// System variables array
-static struct SYS_VAR *cslog_system_variables[] = {
-    MYSQL_SYSVAR(write_memory_only),
-    nullptr
-};
 
 struct st_mysql_storage_engine cslog_storage_engine = {
     MYSQL_HANDLERTON_INTERFACE_VERSION
