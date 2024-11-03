@@ -27,6 +27,7 @@ private:
     cslog_share *share = nullptr;
     ha_heap* memory_handler;    
     myrocks::ha_rocksdb* rocksdb_handler;
+    handler* last_used_handler = nullptr;
     bool m_pk_can_be_decoded;
 
     cslog_share* get_share();

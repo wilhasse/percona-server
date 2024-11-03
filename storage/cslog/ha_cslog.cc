@@ -59,6 +59,9 @@ ulonglong ha_cslog::table_flags() const {
 
 ha_cslog::ha_cslog(handlerton *hton, TABLE_SHARE *table_arg)
     : handler(hton, table_arg),
+      memory_handler(nullptr),
+      rocksdb_handler(nullptr),
+      last_used_handler(nullptr),
       share(nullptr),
       m_pk_can_be_decoded(true) {
 
@@ -121,7 +124,7 @@ ulong ha_cslog::index_flags(uint idx, uint part, bool all_parts) const {
 
 // Update open method to properly handle table opening
 int ha_cslog::open(const char *name, int mode, uint test_if_locked, const dd::Table *tab_def) {
-    DBUG_ENTER("ha_cslog::open");
+    DBUG_ENTER(__PRETTY_FUNCTION__);
     DBUG_PRINT("info", ("Opening table %s", name));
     
     if (!(share = get_share())) {
@@ -194,7 +197,7 @@ static int cslog_deinit_func(void *p) {
 
 int ha_cslog::create(const char *name, TABLE *table_arg, 
                     HA_CREATE_INFO *create_info, dd::Table *table_def) {
-    DBUG_ENTER("ha_cslog::create");
+    DBUG_ENTER(__PRETTY_FUNCTION__);
     DBUG_PRINT("info", ("Creating table %s", name));
 
     if (!rocksdb_handler) {
@@ -245,7 +248,7 @@ int ha_cslog::close() {
 // The following methods are used to modify data in the table.
 //
 int ha_cslog::write_row(uchar *buf) {
-    DBUG_ENTER("ha_cslog::write_row");
+    DBUG_ENTER(__PRETTY_FUNCTION__);
    
     if (!memory_handler || !rocksdb_handler) {
         return HA_ERR_INITIALIZATION;
@@ -270,7 +273,7 @@ int ha_cslog::write_row(uchar *buf) {
 }
 
 int ha_cslog::delete_row(const uchar *buf) {
-    DBUG_ENTER("ha_cslog::delete_row");
+    DBUG_ENTER(__PRETTY_FUNCTION__);
     
     if (!memory_handler || !rocksdb_handler) {
         return HA_ERR_INITIALIZATION;
@@ -295,7 +298,7 @@ int ha_cslog::delete_row(const uchar *buf) {
 }
 
 int ha_cslog::update_row(const uchar *old_data, uchar *new_data) {
-    DBUG_ENTER("ha_cslog::update_row");
+    DBUG_ENTER(__PRETTY_FUNCTION__);
     
     if (!memory_handler || !rocksdb_handler) {
         return HA_ERR_INITIALIZATION;
@@ -327,47 +330,131 @@ int ha_cslog::rnd_init(bool scan) {
     if (!rocksdb_handler) {
         return HA_ERR_INITIALIZATION;
     }
+
     memory_handler->rnd_init(scan);
     return rocksdb_handler->rnd_init(scan);
 }
 
 int ha_cslog::rnd_next(uchar *buf) {
-    DBUG_ENTER("ha_cslog::rnd_next");
+    DBUG_TRACE;
     int rc;
     
+    // Print table info
+    DBUG_PRINT("cslog", ("Table: %s", table->s->table_name.str));
+    DBUG_PRINT("cslog", ("Current position: %lld", (long long)ref[0]));
+    
     if (!memory_handler || !rocksdb_handler) {
-        DBUG_PRINT("error", ("Handlers not initialized"));
-        DBUG_RETURN(HA_ERR_INITIALIZATION);
+        DBUG_PRINT("cslog", ("Init error"));
+        return HA_ERR_INITIALIZATION;
     }
 
     // Try memory cache first
     rc = memory_handler->rnd_next(buf);
     if (rc == 0) {
-        DBUG_RETURN(rc);
+        // Print column values for debugging
+        Field **field;
+        String tmp;
+        DBUG_PRINT("cslog", ("Memory hit - Column values:"));
+        for (field = table->field; *field; field++) {
+            (*field)->val_str(&tmp);
+            DBUG_PRINT("cslog", ("  %s = %s", 
+                                (*field)->field_name, 
+                                tmp.c_ptr_safe()));
+        }
+        return rc;
     }
-     
-    // If not found in memory, try RocksDB
+    
+    DBUG_PRINT("cslog", ("Memory miss rc=%d", rc));
+    
+    // Try RocksDB
     rc = rocksdb_handler->rnd_next(buf);
-    DBUG_RETURN(rc);
+    
+    if (rc == 0) {
+        // Print column values for debugging
+        Field **field;
+        String tmp;
+        DBUG_PRINT("cslog", ("RocksDB hit - Column values:"));
+        for (field = table->field; *field; field++) {
+            (*field)->val_str(&tmp);
+            DBUG_PRINT("cslog", ("  %s = %s", 
+                                (*field)->field_name, 
+                                tmp.c_ptr_safe()));
+        }
+    } else {
+        DBUG_PRINT("cslog", ("RocksDB miss rc=%d", rc));
+    }
+    
+    return rc;
 }
 
 int ha_cslog::rnd_end() {
-    if (!rocksdb_handler) {
+    DBUG_TRACE;
+    
+    if (!memory_handler || !rocksdb_handler) {
+        DBUG_PRINT("error", ("Handlers not initialized in rnd_end()"));
         return HA_ERR_INITIALIZATION;
     }
-    return rocksdb_handler->rnd_end();
+    
+    //
+    //TODO: Implement memory cache rnd_end , not sure if it is needed ???
+    //
+    //int memory_rc = memory_handler->rnd_end();
+    int rocks_rc = rocksdb_handler->rnd_end();
+    
+    // Reset the last used handler
+    last_used_handler = nullptr;
+    
+    // Return first error encountered, if any
+    // return (memory_rc ? memory_rc : rocks_rc);
+    return (rocks_rc);
 }
 
 int ha_cslog::rnd_pos(uchar *buf, uchar *pos) {
-    if (!rocksdb_handler) {
+    DBUG_TRACE;
+    
+    if (!memory_handler || !rocksdb_handler) {
+        DBUG_PRINT("error", ("Handlers not initialized in rnd_pos()"));
         return HA_ERR_INITIALIZATION;
     }
-    return rocksdb_handler->rnd_pos(buf, pos);
+
+    // Try memory cache first
+    int rc = memory_handler->rnd_pos(buf, pos);
+    if (rc == 0) {
+        DBUG_PRINT("info", ("Found record in memory cache"));
+        last_used_handler = memory_handler;
+        return 0;
+    }
+    
+    DBUG_PRINT("info", ("Record not in memory, trying RocksDB"));
+    
+    // If not in memory, try RocksDB
+    rc = rocksdb_handler->rnd_pos(buf, pos);
+    if (rc == 0) {
+        last_used_handler = rocksdb_handler;
+    }
+    
+    return rc;
 }
 
 void ha_cslog::position(const uchar *record) {
-    if (rocksdb_handler) {
+    DBUG_TRACE;
+    
+    if (!memory_handler || !rocksdb_handler) {
+        // Even for void functions, we should log errors
+        DBUG_PRINT("error", ("Handlers not initialized in position()"));
+        return;
+    }
+    
+    // Store position from the handler that last successfully returned data
+    // This is important for rnd_pos to know which handler to use
+    if (last_used_handler == memory_handler) {
+        DBUG_PRINT("info", ("Storing memory handler position"));
+        memory_handler->position(record);
+        memcpy(ref, memory_handler->ref, ref_length);
+    } else {
+        DBUG_PRINT("info", ("Storing rocksdb handler position"));
         rocksdb_handler->position(record);
+        memcpy(ref, rocksdb_handler->ref, ref_length);
     }
 }
 
@@ -411,7 +498,7 @@ int ha_cslog::index_end() {
 int ha_cslog::index_read_map(uchar *buf, const uchar *key,
                            key_part_map keypart_map,
                            enum ha_rkey_function find_flag) {
-    DBUG_ENTER("ha_cslog::index_read_map");
+    DBUG_ENTER(__PRETTY_FUNCTION__);
     
     if (!memory_handler || !rocksdb_handler) {
         return HA_ERR_INITIALIZATION;
@@ -438,7 +525,7 @@ int ha_cslog::index_read_map(uchar *buf, const uchar *key,
 }
 
 int ha_cslog::index_next(uchar *buf) {
-    DBUG_ENTER("ha_cslog::index_next");
+    DBUG_ENTER(__PRETTY_FUNCTION__);
     
     if (!memory_handler || !rocksdb_handler) {
         return HA_ERR_INITIALIZATION;
