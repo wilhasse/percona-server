@@ -36,7 +36,10 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "../global_defines.h"
 #ifdef MYSQL8
-#include "sql/sys_vars_ext.h"
+static constexpr uint DEFAULT_RPC_PORT = 33660;
+int32 opt_rpc_port = DEFAULT_RPC_PORT;
+bool opt_enable_polarx_rpc = true;
+//#include "sql/sys_vars_ext.h"
 #else
 extern int32 rpc_port;
 extern bool new_rpc;

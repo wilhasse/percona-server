@@ -10096,6 +10096,48 @@ ER_LOG_NAME_NOT_MATCHING_SEC_LOG_PATH_CLIENT
 
 start-error-number 8000
 
+ER_POLARX_RPC_CACHE_MISS
+  eng "PolarX-RPC cache miss."
+
+ER_POLARX_RPC_ERROR_MSG
+  eng "%s"
+
+### physical backfill
+start-error-number 8100
+
+ER_X_OPEN_FILE_FAIL
+  eng "%s"
+
+ER_X_CAN_NOT_READ_BUF
+  eng "%s"
+
+ER_X_CAN_NOT_WRITE_BUF
+  eng "%s"
+
+ER_X_BAD_FILE_INFO
+  eng "%s"
+
+ER_X_COPY_FILE_FAIL
+  eng "%s"
+
+ER_X_MISSING_FILE_INFO
+  eng "%s"
+
+ER_X_MISSING_TABLE_INFO
+  eng "%s"
+
+ER_X_FILE_NOT_EXISTS
+  eng "%s"
+
+ER_X_MISSING_PARTITION_NAMES
+  eng "%s"
+
+ER_X_NOT_ALLOW_NEGATIVE_OFFSET
+  eng "%s"
+
+ER_X_CAN_NOT_ALLOCATE_MEMORY
+  eng "%s"
+
 ER_KEYS_OUT_OF_ORDER
   eng "Keys are out order during bulk load"
 

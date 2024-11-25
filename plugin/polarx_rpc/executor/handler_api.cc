@@ -25,7 +25,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 *****************************************************************************/
 
 
-
+#include "sql/protocol_classic.h"
 #include "../global_defines.h"
 #ifndef MYSQL8
 #define MYSQL_SERVER
@@ -185,6 +185,7 @@ int handler_open_table(THD *thd, const char *db_name, const char *table_name,
           "ret: %d,name: %s.%s, lock_type: %d",
           ret, db_name, table_name, lock_type);
     } else {
+/* Percona
 #ifdef MYSQL8
       lizard::simulate_snapshot_clause(thd, &tables);
       /// set vision manually
@@ -194,6 +195,7 @@ int handler_open_table(THD *thd, const char *db_name, const char *table_name,
       // In any other case this function fails,
       // new_exec_table will be released by unique_ptr
       exec_table = new_exec_table.release();
+*/
     }
   }
 

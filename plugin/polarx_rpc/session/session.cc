@@ -321,10 +321,11 @@ void Csession::dispatch(msg_t &&msg, bool &run) {
 
         if (LIKELY(!err)) {
           auto err_no = 0;
+/* Percona
           LEX_CSTRING sp_name = {auto_sp_req.sp_name().data(),
                                  auto_sp_req.sp_name().length()};
 
-          switch (auto_sp_req.op()) {
+            switch (auto_sp_req.op()) {
             case PolarXRPC::ExecPlan::AutoSp_Operation_SET:
               err_no = mysql_session_->set_savepoint(sp_name);
               break;
@@ -338,7 +339,7 @@ void Csession::dispatch(msg_t &&msg, bool &run) {
               err_no = 2;
               break;
           }
-
+*/
           if (err_no) {
             err =
                 err_t(ER_POLARX_RPC_ERROR_MSG, "Handle auto savepoint failed.");
@@ -406,7 +407,11 @@ err_t Csession::sql_stmt_execute(const PolarXRPC::Sql::StmtExecute &msg) {
 
   /// apply GCN first to prevent any error
   auto thd = get_thd();
+
+/* Percona
+
 #ifdef MYSQL8
+
   /// lizard specific GCN timestamp
   if (!thd->in_active_multi_stmt_transaction()) thd->reset_gcn_variables();
   if (msg.has_use_cts_transaction() && msg.use_cts_transaction())
@@ -433,6 +438,8 @@ err_t Csession::sql_stmt_execute(const PolarXRPC::Sql::StmtExecute &msg) {
   if (msg.has_snapshot_seq()) thd->set_snapshot_seq(msg.snapshot_seq());
   if (msg.has_commit_seq()) thd->set_commit_seq(msg.commit_seq());
 #endif
+
+*/
 
   /// switch DB
   if (msg.has_schema_name()) {
@@ -639,6 +646,8 @@ err_t Csession::sql_plan_execute(const PolarXRPC::ExecPlan::ExecPlan &msg) {
 
   /// apply GCN first to prevent any error
   auto thd = get_thd();
+
+/* Percona
 #ifdef MYSQL8
   /// lizard specific GCN timestamp
   if (!thd->in_active_multi_stmt_transaction()) thd->reset_gcn_variables();
@@ -666,7 +675,7 @@ err_t Csession::sql_plan_execute(const PolarXRPC::ExecPlan::ExecPlan &msg) {
   if (msg.has_snapshot_seq()) thd->set_snapshot_seq(msg.snapshot_seq());
   if (msg.has_commit_seq()) thd->set_commit_seq(msg.commit_seq());
 #endif
-
+*/
   ///
   /// dealing cache
   ///

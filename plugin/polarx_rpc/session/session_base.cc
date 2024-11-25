@@ -98,7 +98,9 @@ err_t CsessionBase::init(uint16_t port) {
   if (0 != srv_session_info_set_client_port(mysql_session_, port))
     return err_t(ER_POLARX_RPC_ERROR_MSG, "Could not set session client port");
 
+/* Percona
   mysql_session_->set_safe(true);
+*/
   const auto thd = get_thd();
   flow_control_.set_thd(thd);
 

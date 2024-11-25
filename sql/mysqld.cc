@@ -2495,7 +2495,7 @@ void kill_mysql(void) {
   DBUG_PRINT("quit", ("After pthread_kill"));
 }
 
-static void unireg_abort(int exit_code) {
+void unireg_abort(int exit_code) {
   DBUG_TRACE;
 
   if (errno) {

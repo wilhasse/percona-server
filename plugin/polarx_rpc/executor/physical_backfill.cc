@@ -34,6 +34,10 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #define MYSQL_SERVER
 #endif
 
+#include <fcntl.h>      // For O_RDONLY, O_WRONLY
+#include "my_io.h"      // For MySQL's I/O functions
+#include "my_sys.h"     // For MyFlags
+
 #include "handler_api.h"
 #include "log.h"
 #include "mysql/psi/mysql_file.h"
@@ -67,6 +71,19 @@ const char *sub_sep_mark = "#sp#";
 #else
 const char *part_sep_mark = "#P#";
 const char *sub_sep_mark = "#SP#";
+#endif
+#endif
+
+// Percona
+#ifndef O_SHARE
+#define O_SHARE 0
+#endif
+
+#ifndef O_BINARY
+#ifdef _O_BINARY        // Windows style
+#define O_BINARY _O_BINARY
+#else
+#define O_BINARY 0      // Unix systems don't need O_BINARY
 #endif
 #endif
 
@@ -478,7 +495,7 @@ void Physical_backfill::normalize_table_name_low(char *norm_name,
   db_ptr = ptr + 1;
 
   norm_len = db_len + name_len + sizeof "/";
-  LIKELY(norm_len < FN_REFLEN - 1);
+  //LIKELY(norm_len < FN_REFLEN - 1);
 
   memcpy(norm_name, db_ptr, db_len);
 

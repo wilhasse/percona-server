@@ -160,6 +160,10 @@ ELSE ()
     SET_PROPERTY(TARGET polarx_rpc_protobuf_full PROPERTY EXCLUDE_FROM_ALL TRUE)
 
     # client
+    # Optional test builds - wrap in condition
+    OPTION(WITH_POLARX_RPC_TESTS "Build PolarX RPC tests" OFF)
+
+    IF(WITH_POLARX_RPC_TESTS)
 
     SET(CLIENT_SRC
             tests/client/authentication/mysql41_hash.cc
@@ -232,5 +236,5 @@ ELSE ()
     ADD_DEPENDENCIES(polarx_rpc_test GenError)
     TARGET_LINK_LIBRARIES(polarx_rpc_test
             mysys strings mysqlclient polarx_rpc_client polarx_rpc_protobuf_full ${PROTOBUF_LIBRARY})
-
+ENDIF()   
 ENDIF ()

@@ -5045,6 +5045,25 @@ class THD : public MDL_context_owner,
  public:
   bool add_external(unsigned int slot, void *data);
   void *fetch_external(unsigned int slot);
+  /** for PolarDB-X RPC thread pool */
+  THD_event_functions *polarx_rpc_monitor = nullptr;
+  void *polarx_rpc_context = nullptr;
+  bool polarx_rpc_record = false;
+  std::atomic<intptr_t> polarx_rpc_enter{0};
+
+  inline void register_polarx_rpc_monitor(THD_event_functions *cb, void *ctx) {
+    polarx_rpc_monitor = cb;
+    polarx_rpc_context = ctx;
+    polarx_rpc_record = false;
+    polarx_rpc_enter = 0;
+  }
+
+  inline void clear_polarx_rpc_monitor() {
+    polarx_rpc_monitor = nullptr;
+    polarx_rpc_context = nullptr;
+    polarx_rpc_record = false;
+    polarx_rpc_enter = 0;
+  }
 
  private:
   std::unordered_map<unsigned int, void *> external_store_;

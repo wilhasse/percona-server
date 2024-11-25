@@ -35,8 +35,9 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "../global_defines.h"
 #ifdef MYSQL8
 #include "sql/sql_lex.h"
+/*Percona
 #include "sql/timestamp_service.h"
-#else
+*/#else
 #define MYSQL_SERVER
 #include "global_timestamp_service.h"
 #endif
@@ -308,6 +309,7 @@ err_t CsessionManager::get_tso_mysql80(CtcpConnection &tcp, uint64_t &ts,
   CsessionBase::begin_query(thd, get_tso_query, sizeof(get_tso_query) - 1);
 
   /// get tso
+  /*Percona
   TimestampService ts_service(s->session.get_thd(), SYS_GTS_DB, SYS_GTS_TABLE);
   if (ts_service.init()) {
     err = err_t(ER_POLARX_RPC_ERROR_MSG, "Failed to init GTS table.");
@@ -316,6 +318,7 @@ err_t CsessionManager::get_tso_mysql80(CtcpConnection &tcp, uint64_t &ts,
       err = err_t(ER_POLARX_RPC_ERROR_MSG, "Failed to get tso.");
     ts_service.deinit();
   }
+  */
 
   /// mark end
   CsessionBase::end_query(thd);
