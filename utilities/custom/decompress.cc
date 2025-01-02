@@ -166,28 +166,6 @@ static bool seek_page(File file_in, const page_size_t &page_sz, page_no_t page_n
   return true;
 }
 
-static size_t read_page(File file_in,
-                        page_no_t page_no,
-                        const page_size_t &page_sz,
-                        unsigned char *buf,
-                        size_t buf_len)
-{
-  if (!seek_page(file_in, page_sz, page_no)) {
-    return SIZE_MAX;
-  }
-  const size_t psize = static_cast<size_t>(page_sz.physical());
-  if (buf_len < psize) {
-    fprintf(stderr, "Buffer is too small for reading page!\n");
-    return SIZE_MAX;
-  }
-  size_t r = my_read(file_in, buf, psize, MYF(0));
-  if (r == SIZE_MAX) {
-    fprintf(stderr, "my_read failed for page %u. Errno=%d (%s)\n",
-            page_no, errno, strerror(errno));
-  }
-  return r;
-}
-
 // ----------------------------------------------------------------
 // Minimal “determine page size” logic (like in ibd2sdi).
 // Reads page 0, parse fsp header, etc.
@@ -248,51 +226,91 @@ static bool determine_page_size(File file_in, page_size_t &page_sz)
 // (similar to fetch_page() in ibd2sdi).
 // If the tablespace is compressed, calls page_zip_decompress_low().
 // ----------------------------------------------------------------
-static bool fetch_page(File file_in,
-                       page_no_t page_no,
-                       const page_size_t &page_sz,
-                       unsigned char *dest_buf,
-                       size_t dest_len)
+static bool fetch_page(
+    File file_in,
+    page_no_t page_no,
+    const page_size_t &page_sz,
+    unsigned char *uncompressed_buf,  // >= page_sz.logical() bytes
+    size_t uncompressed_buf_len)
 {
-  // 1) Read raw page into dest_buf
-  size_t psize = page_sz.physical();
-  memset(dest_buf, 0, psize);
-  size_t r = read_page(file_in, page_no, page_sz, dest_buf, dest_len);
-  if (r != psize) {
-    fprintf(stderr, "Could not read page %u correctly.\n", page_no);
-    return false;
-  }
+    size_t psize      = page_sz.physical();   // e.g. 8 KB
+    size_t logical_sz = page_sz.logical();    // e.g. 16 KB
 
-  // 2) If the tablespace is compressed, attempt to decompress
-  if (page_sz.is_compressed()) {
-    unsigned char *temp = static_cast<unsigned char *>(
-        ut::malloc(2 * page_sz.logical()));
-    unsigned char *aligned_temp =
-        static_cast<unsigned char *>(ut_align(temp, page_sz.logical()));
-    memset(aligned_temp, 0, page_sz.logical());
-
-    page_zip_des_t page_zip;
-    page_zip_des_init(&page_zip);
-
-    // fill page_zip struct
-    page_zip.data  = dest_buf;
-    page_zip.ssize = page_size_to_ssize(page_sz.physical());
-
-    bool success = page_zip_decompress_low(&page_zip, aligned_temp, true);
-    if (!success) {
-      fprintf(stderr, "page_zip_decompress_low() failed on page %u.\n", page_no);
-      ut::free(temp);
-      return false;
+    // We temporarily read from disk into an 8 KB temp buffer if compressed
+    // or 16 KB if uncompressed.  Either way, allocate "disk_buf" of psize.
+    unsigned char* disk_buf = (unsigned char*)malloc(psize);
+    if (!disk_buf) {
+        fprintf(stderr, "Out of memory for disk_buf\n");
+        return false;
     }
 
-    // Overwrite original "dest_buf" with uncompressed.
-    memset(dest_buf, 0, psize);
-    memcpy(dest_buf, aligned_temp, page_sz.logical());
+    // 1) Read raw page from disk
+    if (!seek_page(file_in, page_sz, page_no)) {
+        free(disk_buf);
+        return false;
+    }
+    size_t r = my_read(file_in, disk_buf, psize, MYF(0));
+    if (r != psize) {
+        fprintf(stderr, "Could not read physical page %u correctly.\n", page_no);
+        free(disk_buf);
+        return false;
+    }
 
-    ut::free(temp);
-  }
+    memset(uncompressed_buf, 0, uncompressed_buf_len);
 
-  return true;
+    // 2) If compressed, decompress
+    if (page_sz.is_compressed()) {
+        // Set up a temp to hold the uncompressed data
+        // i.e. 16 KB
+        unsigned char* temp = (unsigned char*)ut::malloc(2 * logical_sz);
+        unsigned char* aligned_temp =
+            (unsigned char*)ut_align(temp, logical_sz);
+        memset(aligned_temp, 0, logical_sz);
+
+        page_zip_des_t page_zip;
+        page_zip_des_init(&page_zip);
+
+        // fill page_zip struct
+        page_zip.data  = disk_buf;
+        // For an 8 KB compressed page, this should end up being '4'.
+        page_zip.ssize = page_size_to_ssize(psize);
+
+        // 'disk_buf' has the raw 8 KB read from file
+        uint16_t page_type = mach_read_from_2(disk_buf + FIL_PAGE_TYPE);
+
+        // default no
+        bool success = false;
+
+        // only process index pages
+        if (page_type == FIL_PAGE_INDEX) {
+          // decompress
+          success = page_zip_decompress_low(&page_zip, aligned_temp, true);
+          if (!success) {
+            fprintf(stderr, "Failed to decompress page %u\n", page_no);
+          } else {
+            memcpy(uncompressed_buf, aligned_temp, logical_sz);
+          }
+        } else {
+          // Page is not an index page: just copy what we read
+          // into the beginning of uncompressed_buf
+          memcpy(uncompressed_buf, disk_buf, psize);
+
+          // Optionally fill the rest of uncompressed_buf with zeroes
+          // so that you can still do a 16 KB write:
+          memset(uncompressed_buf + psize, 0, logical_sz - psize);
+        }
+
+        // do not return false here:
+        ut::free(temp);
+        free(disk_buf);
+        return success;
+    } else {
+        // Uncompressed, just copy from 'disk_buf' to 'uncompressed_buf'
+        memcpy(uncompressed_buf, disk_buf, psize);
+    }
+
+    free(disk_buf);
+    return true;
 }
 
 // ----------------------------------------------------------------
@@ -324,7 +342,8 @@ static bool decompress_ibd(File in_fd, File out_fd)
           (unsigned long long)page_physical);
 
   // 4) For each page, fetch + decompress, then write out
-  unsigned char *page_buf = (unsigned char *)malloc(page_physical);
+  size_t buf_size = std::max(pg_sz.physical(), pg_sz.logical());
+  unsigned char* page_buf = (unsigned char*)malloc(buf_size);
   if (!page_buf) {
     fprintf(stderr, "malloc of %llu bytes for page_buf failed.\n",
             (unsigned long long)page_physical);
@@ -332,19 +351,19 @@ static bool decompress_ibd(File in_fd, File out_fd)
   }
 
   for (uint64_t i = 0; i < num_pages; i++) {
-    if (!fetch_page(in_fd, (page_no_t)i, pg_sz, page_buf, page_physical)) {
+     if (!fetch_page(in_fd, (page_no_t)i, pg_sz, page_buf, buf_size)) {
       fprintf(stderr, "Error reading/decompressing page %llu.\n",
               (unsigned long long)i);
-      free(page_buf);
-      return false;
-    }
-    // Write out the (uncompressed) page
-    size_t w = my_write(out_fd, (uchar *)page_buf,
-                        static_cast<size_t>(page_physical), MYF(0));
-    if (w != page_physical) {
-      fprintf(stderr, "my_write failed on page %llu.\n", (unsigned long long)i);
-      free(page_buf);
-      return false;
+      //free(page_buf);
+      //return false;      
+    } else {
+      // Write out the (uncompressed) page
+      size_t w = my_write(out_fd, (uchar*)page_buf, pg_sz.logical(), MYF(0));
+      if (w != UNIV_PAGE_SIZE_ORIG) {
+        fprintf(stderr, "my_write failed on page %llu.\n", (unsigned long long)i);
+        free(page_buf);
+        return false;
+      }
     }
   }
 
