@@ -184,3 +184,5 @@ IF(MY_COMPILER_IS_GNU_OR_CLANG)
   ADD_COMPILE_FLAGS(ibd2sdi.cc
     COMPILE_FLAGS "-Wno-unused-parameter -Wno-cast-qual")
 ENDIF()
+
+ADD_SUBDIRECTORY(custom)
