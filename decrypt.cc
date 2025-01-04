@@ -24,12 +24,6 @@
 // Then your custom AES / other definitions, etc.
 #include "decrypt_aes.h"
 
-// (Include your custom AES code: my_custom_aes_decrypt)
-bool my_custom_aes_decrypt(const unsigned char *in, int in_len,
-                           unsigned char *out,
-                           const unsigned char *key, int key_len,
-                           const unsigned char *iv);
-
 // Some constants for InnoDB page offsets
 static const size_t FIL_PAGE_DATA = 38; // or 56 if FIL_PAGE_VERSION_2
 static const size_t PAGE_SIZE     = 16384; // example
@@ -138,43 +132,6 @@ bool decrypt_tablespace_key(const unsigned char *info,
   return true;
 }
 
-// Minimal example of an ECB decryption for the tablespace key
-// A simplified version based on OpenSSL:
-bool my_custom_aes_decrypt_ecb(const unsigned char *in, int in_len,
-                               unsigned char *out,
-                               const unsigned char *key, int key_len)
-{
-  if (key_len != 32) return false; // for AES-256
-  const EVP_CIPHER *cipher = EVP_aes_256_ecb();
-
-  EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-  if (!ctx) return false;
-
-  bool success = true;
-  int out_len1 = 0, out_len2 = 0;
-  do {
-    if (EVP_DecryptInit_ex(ctx, cipher, NULL, key, NULL) != 1) {
-      success = false; break;
-    }
-    // No IV for ECB, so pass null
-    if (EVP_CIPHER_CTX_set_padding(ctx, 0) != 1) {
-      success = false; break;
-    }
-
-    if (EVP_DecryptUpdate(ctx, out, &out_len1, in, in_len) != 1) {
-      success = false; break;
-    }
-    if (EVP_DecryptFinal_ex(ctx, out + out_len1, &out_len2) != 1) {
-      success = false; break;
-    }
-  } while (0);
-
-  EVP_CIPHER_CTX_free(ctx);
-  if (!success) return false;
-
-  return true;
-}
-
 // Now let's do the page decryption with AES-256-CBC, like InnoDB does
 bool decrypt_innodb_page(unsigned char *page_data,
                          size_t page_data_len,
@@ -240,6 +197,7 @@ int main(int argc, char **argv)
   using keyring::Buffered_file_io;
   using keyring::Keys_container;
   using keyring::Logger;
+
 
   std::unique_ptr<Logger> logger(new Logger());
   std::unique_ptr<Keys_container> keys(new Keys_container(logger.get()));
