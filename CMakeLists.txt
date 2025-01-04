@@ -20,13 +20,22 @@ set(DECRYPT_SOURCES
   decrypt_aes.cc
   # If you need these for reading the keyring file:
   ${CMAKE_SOURCE_DIR}/plugin/keyring/buffered_file_io.cc
+  ${CMAKE_SOURCE_DIR}/plugin/keyring/common/keyring_key.cc
   ${CMAKE_SOURCE_DIR}/plugin/keyring/common/keyring_impl.cc
   ${CMAKE_SOURCE_DIR}/plugin/keyring/common/keys_container.cc
   ${CMAKE_SOURCE_DIR}/plugin/keyring/digest.cc
   ${CMAKE_SOURCE_DIR}/plugin/keyring/converter.cc
   ${CMAKE_SOURCE_DIR}/plugin/keyring/file_io.cc
+  ${CMAKE_SOURCE_DIR}/plugin/keyring/buffer.cc
   ${CMAKE_SOURCE_DIR}/plugin/keyring/checker/checker_factory.cc
   ${CMAKE_SOURCE_DIR}/plugin/keyring/checker/checker.cc
+  ${CMAKE_SOURCE_DIR}/plugin/keyring/checker/checker_ver_1_0.cc
+  ${CMAKE_SOURCE_DIR}/plugin/keyring/checker/checker_ver_2_0.cc
+  ${CMAKE_SOURCE_DIR}/plugin/keyring/common/keys_iterator.cc
+  ${CMAKE_SOURCE_DIR}/plugin/keyring/common/i_keys_container.h
+  ${CMAKE_SOURCE_DIR}/plugin/keyring/hash_to_buffer_serializer.cc
+  ${CMAKE_SOURCE_DIR}/plugin/keyring/common/i_keyring_key.h
+  ${CMAKE_SOURCE_DIR}/plugin/keyring/common/i_serializer.h
 
   # Our stubs:
   ${CMAKE_CURRENT_SOURCE_DIR}/keyring_stubs.cc
@@ -87,11 +96,17 @@ set_source_files_properties(
 # This must be separate flags, typically with escaped parentheses:
 set_source_files_properties(
   ${CMAKE_SOURCE_DIR}/plugin/keyring/buffered_file_io.cc
+  ${CMAKE_SOURCE_DIR}/plugin/keyring/common/keyring_key.cc
   ${CMAKE_SOURCE_DIR}/plugin/keyring/common/keyring_impl.cc
   ${CMAKE_SOURCE_DIR}/plugin/keyring/common/keys_container.cc
   ${CMAKE_SOURCE_DIR}/plugin/keyring/file_io.cc
+  ${CMAKE_SOURCE_DIR}/plugin/keyring/buffer.cc
   ${CMAKE_SOURCE_DIR}/plugin/keyring/checker/checker_factory.cc
   ${CMAKE_SOURCE_DIR}/plugin/keyring/checker/checker.cc
+  ${CMAKE_SOURCE_DIR}/plugin/keyring/checker/checker_ver_1_0.cc
+  ${CMAKE_SOURCE_DIR}/plugin/keyring/checker/checker_ver_2_0.cc
+  ${CMAKE_SOURCE_DIR}/plugin/keyring/common/keys_iterator.cc
+  ${CMAKE_SOURCE_DIR}/plugin/keyring/hash_to_buffer_serializer.cc
   PROPERTIES
     COMPILE_FLAGS
       "-DLogPluginErr\\(level,errcode,message\\)=do{}while\\(0\\) -DLogPluginErrV\\(level,errcode,vl\\)=do{}while\\(0\\)"
