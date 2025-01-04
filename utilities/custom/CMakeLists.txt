@@ -36,6 +36,7 @@ set(DECRYPT_SOURCES
   ${CMAKE_SOURCE_DIR}/plugin/keyring/hash_to_buffer_serializer.cc
   ${CMAKE_SOURCE_DIR}/plugin/keyring/common/i_keyring_key.h
   ${CMAKE_SOURCE_DIR}/plugin/keyring/common/i_serializer.h
+  ${CMAKE_SOURCE_DIR}/strings/ctype-latin1.cc
 
   # Our stubs:
   ${CMAKE_CURRENT_SOURCE_DIR}/keyring_stubs.cc
@@ -56,7 +57,7 @@ target_include_directories(decrypt
   PRIVATE
     ${CMAKE_SOURCE_DIR}/plugin/keyring
     ${CMAKE_SOURCE_DIR}/plugin/keyring/common
-    # ...
+    ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
 target_compile_definitions(decrypt

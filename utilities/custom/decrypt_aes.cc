@@ -68,3 +68,41 @@ bool my_custom_aes_decrypt(const unsigned char *in, int in_len,
 
   return true;
 }
+
+// Minimal example of an ECB decryption for the tablespace key
+// A simplified version based on OpenSSL:
+bool my_custom_aes_decrypt_ecb(const unsigned char *in, int in_len,
+                               unsigned char *out,
+                               const unsigned char *key, int key_len)
+{
+  if (key_len != 32) return false; // for AES-256
+  const EVP_CIPHER *cipher = EVP_aes_256_ecb();
+
+  EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+  if (!ctx) return false;
+
+  bool success = true;
+  int out_len1 = 0, out_len2 = 0;
+  do {
+    if (EVP_DecryptInit_ex(ctx, cipher, NULL, key, NULL) != 1) {
+      success = false; break;
+    }
+    // No IV for ECB, so pass null
+    if (EVP_CIPHER_CTX_set_padding(ctx, 0) != 1) {
+      success = false; break;
+    }
+
+    if (EVP_DecryptUpdate(ctx, out, &out_len1, in, in_len) != 1) {
+      success = false; break;
+    }
+    if (EVP_DecryptFinal_ex(ctx, out + out_len1, &out_len2) != 1) {
+      success = false; break;
+    }
+  } while (0);
+
+  EVP_CIPHER_CTX_free(ctx);
+  if (!success) return false;
+
+  return true;
+}
+
