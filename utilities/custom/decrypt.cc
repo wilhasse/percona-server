@@ -18,6 +18,8 @@
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <my_sys.h>
+#include <my_thread.h>
 
 // Then your custom AES / other definitions, etc.
 #include "decrypt_aes.h"
@@ -225,6 +227,12 @@ int main(int argc, char **argv)
   const char *keyring_path = argv[1];
   const char *ibd_path     = argv[2];
 
+  // Global MySQL library init
+  my_init();
+
+  // Per-thread init
+  my_thread_init();    
+  
   // 1) Initialize OpenSSL, etc. (some of this done in the plugin)
   OpenSSL_add_all_algorithms();
 
@@ -316,5 +324,8 @@ int main(int argc, char **argv)
 
   // ... at this point, you can parse the page data or dump it
 
+  // Global MySQL thread finalization
+  my_thread_end();
+  my_end(0);
   return 0;
 }

@@ -68,8 +68,47 @@ int mysql_rwlock_unlock(mysql_rwlock_t*) { return 0; }
 
 // ---------- 4) system_charset_info stub ----------
 
-struct CHARSET_INFO_fake {};
-CHARSET_INFO_fake *system_charset_info = nullptr;
+// The struct MySQL calls 'CHARSET_INFO'
+struct my_collation_handler_st;
+
+struct CHARSET_INFO {
+  // The real MySQL structure is big, but we only need what gets used
+  // by the keyring code. Typically it's "coll" pointer:
+  my_collation_handler_st* coll;
+};
+
+// A minimal collation handler with function pointers
+struct my_collation_handler_st {
+  // This matches the signature for strnncollsp in MySQL
+  size_t (*strnncollsp)(
+      CHARSET_INFO*, const unsigned char*, size_t,
+      const unsigned char*, size_t, bool);
+};
+
+// Our dummy function
+static size_t dummy_strnncollsp(
+    CHARSET_INFO*,
+    const unsigned char*, size_t,
+    const unsigned char*, size_t, bool)
+{
+  // Return 0 or 1, or a stable result
+  return 0;
+}
+
+// Now we define the global instances
+static my_collation_handler_st g_dummy_collation_handler = {
+  dummy_strnncollsp
+};
+
+static CHARSET_INFO g_charset_info = {
+  &g_dummy_collation_handler
+};
+
+// The global pointer that plugin code references
+extern "C" {
+  CHARSET_INFO* system_charset_info = &g_charset_info;
+}
+
 
 // ---------- 5) Minimal class definitions for vtable references ----------
 
