@@ -276,28 +276,23 @@ static bool fetch_page(
         page_zip.ssize = page_size_to_ssize(psize);
 
         // 'disk_buf' has the raw 8 KB read from file
-        uint16_t page_type = mach_read_from_2(disk_buf + FIL_PAGE_TYPE);
+        //uint16_t page_type = mach_read_from_2(disk_buf + FIL_PAGE_TYPE);
 
         // default no
         bool success = false;
 
         // only process index pages
-        if (page_type == FIL_PAGE_INDEX) {
-          // decompress
-          success = page_zip_decompress_low(&page_zip, aligned_temp, true);
-          if (!success) {
-            fprintf(stderr, "Failed to decompress page %u\n", page_no);
-          } else {
-            memcpy(uncompressed_buf, aligned_temp, logical_sz);
-          }
-        } else {
-          // Page is not an index page: just copy what we read
-          // into the beginning of uncompressed_buf
-          memcpy(uncompressed_buf, disk_buf, psize);
+        //if (page_type != FIL_PAGE_INDEX) {
 
-          // Optionally fill the rest of uncompressed_buf with zeroes
-          // so that you can still do a 16 KB write:
-          memset(uncompressed_buf + psize, 0, logical_sz - psize);
+        //  mach_write_to_2(disk_buf + PAGE_HEADER + PAGE_N_HEAP, 10000);
+        //}
+
+        // decompress
+        success = page_zip_decompress_low(&page_zip, aligned_temp, true);
+        if (!success) {
+          fprintf(stderr, "Failed to decompress page %u\n", page_no);
+        } else {
+          memcpy(uncompressed_buf, aligned_temp, logical_sz);
         }
 
         // do not return false here:
