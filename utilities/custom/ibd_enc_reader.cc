@@ -8,6 +8,13 @@
 #include <cstring>
 #include <iostream>
 
+/**
+ * Decrypt the tablespace key + IV from the encryption info
+ * using the (plaintext) master key from above.
+ *
+ * We now use MySQL's my_aes_decrypt(...) in AES-256-ECB mode,
+ * with no padding, matching how InnoDB encrypts the chunk.
+ */
 bool decode_ibd_encryption_info(const unsigned char *enc_info,
                                 bool decrypt_key,
                                 const std::vector<unsigned char> &master_key,
@@ -27,6 +34,7 @@ bool decode_ibd_encryption_info(const unsigned char *enc_info,
     return false;
   }
   enc_info += 3;
+  const int ENCRYPTED_LEN = 64; // 32 bytes key + 32 bytes IV, all encrypted
 
   // 2) Read server uuid if needed
   std::string srv_uuid;
@@ -53,15 +61,17 @@ bool decode_ibd_encryption_info(const unsigned char *enc_info,
     // Use MySQL’s my_aes_decrypt for AES-256-ECB, no padding
     unsigned char decrypted[64];
     std::memset(decrypted, 0, sizeof(decrypted));
+    // Call MySQL's my_aes_decrypt with mode = my_aes_256_ecb, no IV, no padding
     int ret = my_aes_decrypt(
-        key_info, 64,
-        decrypted,
-        master_key.data(),
-        static_cast<uint32>(master_key.size()),
-        my_aes_256_ecb,
-        /*iv=*/nullptr,
-        /*padding=*/false,
-        /*kdf_options=*/nullptr);
+        /* source        = */ key_info,
+        /* source_length = */ ENCRYPTED_LEN,
+        /* dest          = */ decrypted,
+        /* key           = */ master_key.data(),
+        /* key_length    = */ static_cast<uint32>(master_key.size()),
+        /* mode          = */ my_aes_256_ecb,   // AES-256-ECB
+        /* iv            = */ nullptr,          // no IV in ECB
+        /* padding       = */ false,            // InnoDB uses no padding
+        /* kdf_options   = */ nullptr);         // not used for basic decrypt
 
     if (ret == MY_AES_BAD_DATA) {
       std::cerr << "my_aes_decrypt returned MY_AES_BAD_DATA.\n";

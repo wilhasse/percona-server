@@ -10,6 +10,7 @@ namespace {
   Return a pointer that the caller can feed to fetch_key(...).
 */
 keyring::IKey* create_temp_key_object(const std::string &key_id) {
+    
   // arguments to the Key constructor are:
   //   (const char* key_id, const char* key_type, const char* user_id,
   //    const void* key_data, size_t key_len)
