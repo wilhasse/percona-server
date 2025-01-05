@@ -103,7 +103,7 @@ void Keys_container::allocate_and_set_data_for_key(
     IKey *key, std::string *source_key_type, uchar *source_key_data,
     size_t source_key_data_size) {
   key->set_key_type(source_key_type);
-  uchar *key_data = keyring_malloc<uchar *>(source_key_data_size);
+  uchar *key_data = new uchar[source_key_data_size];
   memcpy(key_data, source_key_data, source_key_data_size);
   key->set_key_data(key_data, source_key_data_size);
 }
