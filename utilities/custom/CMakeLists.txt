@@ -17,7 +17,9 @@ ENDIF()
 
 set(DECRYPT_SOURCES
   decrypt.cc
-  decrypt_aes.cc
+  ibd_enc_reader.cc
+  my_keyring_lookup.cc
+
   # If you need these for reading the keyring file:
   ${CMAKE_SOURCE_DIR}/plugin/keyring/buffered_file_io.cc
   ${CMAKE_SOURCE_DIR}/plugin/keyring/common/keyring_key.cc
@@ -70,6 +72,8 @@ target_compile_definitions(decrypt
 # If you want to disable the warning only for logger.h code, you can do:
 set_source_files_properties(  
   ${CMAKE_CURRENT_SOURCE_DIR}/decrypt.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/ibd_enc_reader.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/my_keyring_lookup.cc
     PROPERTIES
     COMPILE_FLAGS "-Wno-unused-parameter"
 )
@@ -83,16 +87,11 @@ file(GLOB KEYRING_SOURCES
 # Now disable -Wunused-parameter for all these sources:
 set_source_files_properties(
   ${KEYRING_SOURCES}
-  PROPERTIES
-    COMPILE_FLAGS "-Wno-unused-parameter"
-)
-
-set_source_files_properties(
-  ${KEYRING_SOURCES}
+  ${CMAKE_CURRENT_SOURCE_DIR}/ibd_enc_reader.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/my_keyring_lookup.cc
   PROPERTIES
     COMPILE_OPTIONS "-Wno-unused-parameter"
 )
-
 
 # This must be separate flags, typically with escaped parentheses:
 set_source_files_properties(
@@ -108,6 +107,8 @@ set_source_files_properties(
   ${CMAKE_SOURCE_DIR}/plugin/keyring/checker/checker_ver_2_0.cc
   ${CMAKE_SOURCE_DIR}/plugin/keyring/common/keys_iterator.cc
   ${CMAKE_SOURCE_DIR}/plugin/keyring/hash_to_buffer_serializer.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/ibd_enc_reader.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/my_keyring_lookup.cc
   PROPERTIES
     COMPILE_FLAGS
       "-DLogPluginErr\\(level,errcode,message\\)=do{}while\\(0\\) -DLogPluginErrV\\(level,errcode,vl\\)=do{}while\\(0\\)"

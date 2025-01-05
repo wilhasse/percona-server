@@ -7,6 +7,8 @@
 // 2) Now include the keyring code (which indirectly includes logger.h)
 #include "plugin/keyring/common/keyring.h"
 #include "plugin/keyring/buffered_file_io.h"
+#include "my_keyring_lookup.h"
+#include "plugin/keyring/common/keys_container.h"
 
 // 3) The rest of your includes
 #include <openssl/evp.h>
@@ -20,43 +22,19 @@
 #include <stdexcept>
 #include <my_sys.h>
 #include <my_thread.h>
+#include "my_aes.h"
 
 // Then your custom AES / other definitions, etc.
-#include "decrypt_aes.h"
+#include "ibd_enc_reader.h"
 
 // Some constants for InnoDB page offsets
 static const size_t FIL_PAGE_DATA = 38; // or 56 if FIL_PAGE_VERSION_2
 static const size_t PAGE_SIZE     = 16384; // example
 
-// Fake function to read the "encryption info" from .ibd
-// Normally you'd parse the .ibd header
-bool read_ibd_encryption_info(const char *ibd_file_path,
-                              unsigned char *encrypted_info_buffer)
-{
-  // For a real tool, read from the .ibd's header area
-  // Enough to store the 64 bytes or so that contain the
-  // Master Key ID, server_uuid, encrypted key, iv, etc.
-
-  FILE *f = fopen(ibd_file_path, "rb");
-  if (!f) {
-    std::cerr << "Cannot open .ibd file" << std::endl;
-    return false;
-  }
-
-  // Suppose the encryption info is at offset 0 or  page 0 + ...
-  // This depends on MySQL version. We'll just do an example:
-  fseek(f, 0, SEEK_SET);
-  // read 96 or so bytes
-  size_t n = fread(encrypted_info_buffer, 1, 96, f);
-  fclose(f);
-
-  if (n < 96) {
-    std::cerr << "Failed to read encryption info from .ibd\n";
-    return false;
-  }
-
-  return true;
-}
+#include <cstdio>
+#include <cstring>
+#include <iostream>
+#include <memory>
 
 // Parse out the master key ID & retrieve the key from keyring
 bool get_master_key_from_info(const unsigned char *info,
@@ -97,75 +75,52 @@ bool get_master_key_from_info(const unsigned char *info,
 
 /**
  * Decrypt the tablespace key + IV from the encryption info
- * using the (plaintext) master key from above
+ * using the (plaintext) master key from above.
+ *
+ * We now use MySQL's my_aes_decrypt(...) in AES-256-ECB mode,
+ * with no padding, matching how InnoDB encrypts the chunk.
  */
 bool decrypt_tablespace_key(const unsigned char *info,
                             const std::vector<unsigned char> &master_key,
                             unsigned char *tablespace_key, // out
                             unsigned char *tablespace_iv)   // out
 {
-  // In real MySQL, the chunk that has the tablespace key+IV is typically
-  // encrypted with AES-256-ECB (not CBC) using the master key.
-  // So you'd either replicate that or just do what MySQL does:
-  //    my_aes_decrypt(..., my_aes_256_ecb, master_key, ...)
-
-  // For illustration, let's do an ECB decrypt with OpenSSL:
-
-  // Let's say the chunk is 64 bytes at offset 32 in `info`:
+  // In real InnoDB, the chunk that has the tablespace key + IV is
+  // typically 64 bytes (32 bytes key + 32 bytes IV), encrypted with
+  // AES-256-ECB using the master key. We'll assume it's located
+  // starting at offset 32 within `info`, but adjust if your format differs.
   const unsigned char *encrypted_key_iv = info + 32;
-  const int ENCRYPTED_LEN = 64; // 32 bytes key + 32 bytes IV, encrypted
+  const int ENCRYPTED_LEN = 64; // 32 bytes key + 32 bytes IV, all encrypted
 
-  unsigned char outbuf[64];
-  memset(outbuf, 0, sizeof(outbuf));
+  // We'll decrypt into this temporary buffer:
+  unsigned char outbuf[ENCRYPTED_LEN];
+  std::memset(outbuf, 0, sizeof(outbuf));
 
-  // We'll do a separate function for ECB:
-  if (!my_custom_aes_decrypt_ecb(encrypted_key_iv, ENCRYPTED_LEN,
-                                 outbuf, master_key.data(), 32)) {
-    std::cerr << "Failed to decrypt tablespace key/IV with master key (ECB)\n";
+  // Call MySQL's my_aes_decrypt with mode = my_aes_256_ecb, no IV, no padding
+  int ret = my_aes_decrypt(
+      /* source        = */ encrypted_key_iv,
+      /* source_length = */ ENCRYPTED_LEN,
+      /* dest          = */ outbuf,
+      /* key           = */ master_key.data(),
+      /* key_length    = */ static_cast<uint32>(master_key.size()),
+      /* mode          = */ my_aes_256_ecb,   // AES-256-ECB
+      /* iv            = */ nullptr,          // no IV in ECB
+      /* padding       = */ false,            // InnoDB uses no padding
+      /* kdf_options   = */ nullptr);         // not used for basic decrypt
+
+  // Check for error
+  if (ret == MY_AES_BAD_DATA) {
+    std::cerr << "Failed to decrypt tablespace key/IV with master key (ECB). "
+              << "my_aes_decrypt() returned MY_AES_BAD_DATA.\n";
     return false;
   }
 
-  // Then split the output into 32 bytes key, 32 bytes IV
-  memcpy(tablespace_key, outbuf,    32);
-  memcpy(tablespace_iv,  outbuf+32, 32);
+  // The first 32 bytes of outbuf = the plaintext tablespace key
+  // The next 32 bytes = the plaintext IV
+  std::memcpy(tablespace_key, outbuf,     32);
+  std::memcpy(tablespace_iv,  outbuf + 32, 32);
 
-  return true;
-}
-
-// Now let's do the page decryption with AES-256-CBC, like InnoDB does
-bool decrypt_innodb_page(unsigned char *page_data,
-                         size_t page_data_len,
-                         const unsigned char *tablespace_key,
-                         const unsigned char *tablespace_iv)
-{
-  // InnoDB encrypts data from offset FIL_PAGE_DATA to the end (or to the
-  // compressed length). For a 16K page, that's from 38..16384, etc.
-
-  if (page_data_len < FIL_PAGE_DATA) {
-    // malformed
-    return false;
-  }
-
-  unsigned char *cipher_area = page_data + FIL_PAGE_DATA;
-  int cipher_len = (int)(page_data_len - FIL_PAGE_DATA);
-
-  // InnoDB has some nuances about the "last 2 blocks" if not aligned, etc.
-  // For a simple example, we just do a single AES-256-CBC decrypt pass:
-  // (Production code mimics exactly what os0enc.cc does with the final blocks.)
-
-  // We'll store the plaintext in-place (CBC can do in-place if careful).
-  if (!my_custom_aes_decrypt(cipher_area, cipher_len, 
-                             cipher_area,
-                             tablespace_key, 32,
-                             tablespace_iv)) {
-    std::cerr << "Failed to decrypt page data.\n";
-    return false;
-  }
-
-  // Also fix up the FIL_PAGE_TYPE, etc. if needed
-  // In real code: if the page was FIL_PAGE_ENCRYPTED, you read the
-  // original type from FIL_PAGE_ORIGINAL_TYPE_V1, etc.
-
+  std::cout << "Successfully decrypted tablespace key+IV using AES-256-ECB.\n";
   return true;
 }
 
@@ -173,16 +128,16 @@ bool decrypt_innodb_page(unsigned char *page_data,
  *  The main() function: tie it all together.
  ************************************************************/
 
-int main(int argc, char **argv)
-{
-  if (argc < 3) {
+int main(int argc, char** argv) {
+  if (argc < 5) {
     std::cerr << "Usage: " << argv[0]
-              << " <keyring_file> <ibd_file>\n";
+              << " <master_key_id> <server_uuid> <keyring_file> <ibd_path>\n";
     return 1;
   }
-
-  const char *keyring_path = argv[1];
-  const char *ibd_path     = argv[2];
+  uint32_t master_id       = static_cast<uint32_t>(std::atoi(argv[1]));
+  std::string srv_uuid     = argv[2];
+  const char* keyring_path = argv[3];
+  const char* ibd_path     = argv[4];
 
   // Global MySQL library init
   my_init();
@@ -198,7 +153,6 @@ int main(int argc, char **argv)
   using keyring::Keys_container;
   using keyring::Logger;
 
-
   std::unique_ptr<Logger> logger(new Logger());
   std::unique_ptr<Keys_container> keys(new Keys_container(logger.get()));
 
@@ -206,39 +160,81 @@ int main(int argc, char **argv)
     keyring::keyring_file_version_2_0,
     keyring::keyring_file_version_1_0
   };
-  // The plugin code uses a pointer to a file IO object
-  Buffered_file_io *keyring_io = new Buffered_file_io(logger.get(),
-                                                      &allowedFileVersions);
+  auto *keyring_io = new Buffered_file_io(logger.get(), &allowedFileVersions);
 
-  // keys->init(...) will parse the keyring file
   if (keys->init(keyring_io, keyring_path)) {
     std::cerr << "Failed to load keyring from " << keyring_path << "\n";
     return 1;
   }
-
   std::cout << "Loaded keyring from: " << keyring_path << "\n";
 
-  // 3) Read the "encryption info" from the .ibd
-  unsigned char enc_info[128];
-  memset(enc_info, 0, sizeof(enc_info));
-  if (!read_ibd_encryption_info(ibd_path, enc_info)) {
-    std::cerr << "Failed to read encryption info.\n";
+  // 2) Now make MyKeyringLookup
+  MyKeyringLookup lookup(keys.get());
+
+  // 3) Attempt to get the InnoDB master key
+  std::vector<unsigned char> master_key;
+  if (!lookup.get_innodb_master_key(srv_uuid, master_id, master_key)) {
+    std::cerr << "Could not find the master key in the container.\n";
     return 1;
   }
 
+  std::cout << "Got master key length=" << master_key.size() << "\n";
+
+  // 3) Read ~100 bytes from the start of the .ibd file
+  FILE* f = std::fopen(ibd_path, "rb");
+  if (!f) {
+    std::cerr << "Cannot open .ibd\n";
+    return 1;
+  }
+
+  // 4) <-- Key change: Seek to offset 5270 (0x1496 or 0x149D, whichever you confirmed)
+  long offset = 5270; // or 0x1496, or 0x149D, depending on your exact find
+  if (std::fseek(f, offset, SEEK_SET) != 0) {
+    std::cerr << "Failed to fseek() to offset " << offset << " in .ibd file.\n";
+    std::fclose(f);
+    return 1;
+  }
+
+  // 5) Read key and other info
+  unsigned char enc_info[128];
+  std::memset(enc_info, 0, sizeof(enc_info));
+  size_t n = std::fread(enc_info, 1, sizeof(enc_info), f);
+  std::fclose(f);
+
+  if (n < 80) {
+    std::cerr << "Not enough data read for encryption info\n";
+    return 1;
+  }
+
+  // 6) decode the 80-100 bytes, using the master_key we already have
+  Tablespace_key_iv ts_key_iv;
+  if (!decode_ibd_encryption_info(enc_info, /* decrypt_key */true,
+                                  master_key, // pass in the raw 32 bytes
+                                  ts_key_iv))
+  {
+    std::cerr << "Failed to decode ibd encryption header.\n";
+    return 1;
+  }
+
+  // 7) print info
+  std::cout << "Successfully read encryption info!\n"
+            << "master_key = "
+            << "Tablespace key = ";
+  for (int i = 0; i < 32; i++) {
+    std::printf("%02X", ts_key_iv.key[i]);
+  }
+  std::cout << "\nIV = ";
+  for (int i = 0; i < 32; i++) {
+    std::printf("%02X", ts_key_iv.iv[i]);
+  }
+  std::cout << std::endl;
+
   // 4) Parse out the master_key_id + fetch from keys container
   std::string master_key_id_str;
-  std::vector<unsigned char> master_key;
   if (!get_master_key_from_info(enc_info, master_key_id_str, master_key)) {
     std::cerr << "Failed to parse master key id or load from keyring.\n";
     return 1;
   }
-
-  // In real code, you'd do something like:
-  //   auto masterKeyObj = keys->get_key_by_id(master_key_id_str, ...);
-  //   if (!masterKeyObj) { ... }
-  //   master_key.assign(masterKeyObj->get_key(), masterKeyObj->get_key() + masterKeyObj->get_key_length());
-
   std::cout << "Got master key id=" << master_key_id_str
             << " size=" << master_key.size() << "\n";
 
@@ -258,7 +254,7 @@ int main(int argc, char **argv)
   unsigned char page_buf[PAGE_SIZE];
   memset(page_buf, 0, PAGE_SIZE);
 
-  FILE *f = fopen(ibd_path, "rb");
+  f = fopen(ibd_path, "rb");
   if (!f) {
     std::cerr << "Failed to open .ibd again.\n";
     return 1;
@@ -272,8 +268,8 @@ int main(int argc, char **argv)
   }
 
   // decrypt the page
-  if (!decrypt_innodb_page(page_buf, PAGE_SIZE, tbl_key, tbl_iv)) {
-    std::cerr << "Page decryption failed.\n";
+  if (!decrypt_tablespace_key(enc_info, master_key, tbl_key, tbl_iv)) {
+    std::cerr << "Failed to decrypt the tablespace key.\n";
     return 1;
   }
 
