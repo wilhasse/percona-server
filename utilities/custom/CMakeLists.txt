@@ -17,6 +17,8 @@ ENDIF()
 
 set(DECRYPT_SOURCES
   decrypt.cc
+  mysql_crc32c.cc
+  keyring_stubs.cc
   ibd_enc_reader.cc
   my_keyring_lookup.cc
 
@@ -39,9 +41,6 @@ set(DECRYPT_SOURCES
   ${CMAKE_SOURCE_DIR}/plugin/keyring/common/i_keyring_key.h
   ${CMAKE_SOURCE_DIR}/plugin/keyring/common/i_serializer.h
   ${CMAKE_SOURCE_DIR}/strings/ctype-latin1.cc
-
-  # Our stubs:
-  ${CMAKE_CURRENT_SOURCE_DIR}/keyring_stubs.cc
 )
 
 MYSQL_ADD_EXECUTABLE(decrypt
@@ -52,7 +51,6 @@ MYSQL_ADD_EXECUTABLE(decrypt
     mysys
     ssl
     crypto
-    # ext::lz4, extra::rapidjson, etc if you really need them
 )
 
 target_include_directories(decrypt
@@ -74,6 +72,7 @@ set_source_files_properties(
   ${CMAKE_CURRENT_SOURCE_DIR}/decrypt.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/ibd_enc_reader.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/my_keyring_lookup.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/crc32c.c
     PROPERTIES
     COMPILE_FLAGS "-Wno-unused-parameter"
 )
@@ -90,8 +89,8 @@ set_source_files_properties(
   ${CMAKE_CURRENT_SOURCE_DIR}/ibd_enc_reader.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/my_keyring_lookup.cc
   PROPERTIES
-    COMPILE_OPTIONS "-Wno-unused-parameter"
-)
+  COMPILE_OPTIONS "-Wno-unused-parameter"
+  )
 
 # This must be separate flags, typically with escaped parentheses:
 set_source_files_properties(

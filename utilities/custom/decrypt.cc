@@ -94,7 +94,7 @@ int main(int argc, char** argv) {
   }
 
   // 4) <-- Key change: Seek to offset 5270 (0x1496)
-  long offset = 5270;
+  long offset = 5270; 
   if (std::fseek(f, offset, SEEK_SET) != 0) {
     std::cerr << "Failed to fseek() to offset " << offset << " in .ibd file.\n";
     std::fclose(f);
