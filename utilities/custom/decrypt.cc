@@ -30,6 +30,16 @@
 static const size_t FIL_PAGE_DATA = 38; // or 56 if FIL_PAGE_VERSION_2
 static const size_t PAGE_SIZE     = 16384; // example
 
+// Decrypts an obfuscated key using MySQL's keyring XOR method
+void keyring_deobfuscate(unsigned char* key_data, size_t key_len) {
+    const char* obfuscate_str = "*305=Ljt0*!@$Hnm(*-9-w;:";
+    const size_t obfuscate_len = strlen(obfuscate_str);
+    
+    for (size_t i = 0, l = 0; i < key_len; i++, l = ((l + 1) % obfuscate_len)) {
+        key_data[i] ^= obfuscate_str[l];
+    }
+}
+
 /************************************************************
  *  The main() function: tie it all together.
  ************************************************************/
@@ -74,26 +84,29 @@ int main(int argc, char** argv) {
   }
   std::cout << "Loaded keyring from: " << keyring_path << "\n";
 
-  // 2) Now make MyKeyringLookup
+  // 3) Now make MyKeyringLookup
   MyKeyringLookup lookup(keys.get());
 
-  // 3) Attempt to get the InnoDB master key
+  // 4) Attempt to get the InnoDB master key
   std::vector<unsigned char> master_key;
   if (!lookup.get_innodb_master_key(srv_uuid, master_id, master_key)) {
     std::cerr << "Could not find the master key in the container.\n";
     return 1;
   }
 
+  // 5) Master key is obfuscated
+  keyring_deobfuscate(master_key.data(), master_key.size());
+
   std::cout << "Got master key length=" << master_key.size() << "\n";
 
-  // 3) Read ~100 bytes from the start of the .ibd file
+  // 6) Read ~100 bytes from the start of the .ibd file
   FILE* f = std::fopen(ibd_path, "rb");
   if (!f) {
     std::cerr << "Cannot open .ibd\n";
     return 1;
   }
 
-  // 4) <-- Key change: Seek to offset 5270 (0x1496)
+  // 7) <-- Key change: Seek to offset 5270 (0x1496)
   long offset = 5270; 
   if (std::fseek(f, offset, SEEK_SET) != 0) {
     std::cerr << "Failed to fseek() to offset " << offset << " in .ibd file.\n";
@@ -101,7 +114,7 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // 5) Read key and other info
+  // 8) Read key and other info
   unsigned char enc_info[128];
   std::memset(enc_info, 0, sizeof(enc_info));
   size_t n = std::fread(enc_info, 1, sizeof(enc_info), f);
@@ -112,7 +125,7 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // 6) decode the 80-100 bytes, using the master_key we already have
+  // 9) decode the 80-100 bytes, using the master_key we already have
   Tablespace_key_iv ts_key_iv;
   if (!decode_ibd_encryption_info(enc_info, /* decrypt_key */true,
                                   master_key, // pass in the raw 32 bytes
@@ -122,7 +135,7 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // 7) print info
+  // 10) print info
   std::cout << "Successfully read encryption info!\n"
             << "master_key = "
             << "Tablespace key = ";
@@ -135,7 +148,7 @@ int main(int argc, char** argv) {
   }
   std::cout << std::endl;
 
-  // 8) Now let's decrypt an *actual page* from the .ibd offline as a demo
+  // 11) Now let's decrypt an *actual page* from the .ibd offline as a demo
   // We'll just read page 0 for example
   unsigned char page_buf[PAGE_SIZE];
   memset(page_buf, 0, PAGE_SIZE);
@@ -165,3 +178,4 @@ int main(int argc, char** argv) {
   my_end(0);
   return 0;
 }
+

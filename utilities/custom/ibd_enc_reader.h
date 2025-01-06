@@ -24,13 +24,12 @@ struct Tablespace_key_iv {
   unsigned char iv[32];
 };
 
-/// A minimal function to read a 4-byte *little-endian* integer
-static inline uint32_t read_u32_le(const unsigned char* ptr) {
-  // MySQL code uses "mach_read_from_4()", but let's do a direct version:
-  return (uint32_t)ptr[0]
-       | ((uint32_t)ptr[1] << 8)
-       | ((uint32_t)ptr[2] << 16)
-       | ((uint32_t)ptr[3] << 24);
+/// A minimal function to read a 4-byte *big-endian* integer
+static inline uint32_t read_u32_be(const unsigned char* ptr) {
+    return ((uint32_t)ptr[0] << 24) |
+           ((uint32_t)ptr[1] << 16) |
+           ((uint32_t)ptr[2] << 8)  |
+            (uint32_t)ptr[3];
 }
 
 // A placeholder for a simple or partial CRC32 if needed:

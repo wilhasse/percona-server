@@ -7,8 +7,7 @@
 #include "ibd_enc_reader.h"
 #include "plugin/keyring/common/keys_container.h"
 #include "my_aes.h"
-#include "keyring_operations_helper.h"  // for keyring_operations_helper::read_secret
-#include "my_sys.h"                    // for my_free(...)
+#include "my_sys.h"
 #include "mysql_crc32c.h"
 
 /**
@@ -39,9 +38,11 @@ bool decode_ibd_encryption_info(const unsigned char *enc_info,
   enc_info += 3;
 
   // 2) master_key_id,if 0 old 5.7 skip it
-  uint32_t key_id = read_u32_le(enc_info);
+  uint32_t key_id = read_u32_be(enc_info);
   if (key_id == 0) {
     enc_info += 8;
+  } else {
+    enc_info += 4;
   }
 
   // 3) Read server uuid if needed
@@ -60,8 +61,7 @@ bool decode_ibd_encryption_info(const unsigned char *enc_info,
   enc_info += 64;
 
   // 5) read 4-byte checksum
-  uint32_t stored_crc = read_u32_le(enc_info);
-  // enc_info += 4; // optional
+  uint32_t stored_crc = read_u32_be(enc_info);
 
   // 6) If decrypt:
   if (decrypt_key) {
@@ -86,7 +86,7 @@ bool decode_ibd_encryption_info(const unsigned char *enc_info,
       return false;
     }
     // copy plaintext back
-    std::memcpy(key_info, decrypted, 64);
+    std::memcpy(key_info, decrypted, sizeof(key_info));
   } else {
     // interpret key_info as plaintext
     //W ...
@@ -100,7 +100,7 @@ bool decode_ibd_encryption_info(const unsigned char *enc_info,
   if (calc != stored_crc) {
     std::cerr << "Checksum mismatch! Calculated CRC: " << calc
               << ", Calculated zlib CRC: " << calc2 
-              << ", Stored CRC: " << stored_crc << "\n";
+                  << ", Stored CRC: " << stored_crc << "\n";
     //return false;
   }
 
