@@ -1,4 +1,3 @@
-#include <zlib.h>
 #include <cstdint>
 #include <vector>
 #include <cstring>
@@ -95,13 +94,12 @@ bool decode_ibd_encryption_info(const unsigned char *enc_info,
   // 7) check crc
   mysql_crc32c_init();
   uint32_t calc = mysql_crc32c(key_info, 64);
-  uint32_t calc2 = calc_crc32(key_info, 64);
-
   if (calc != stored_crc) {
     std::cerr << "Checksum mismatch! Calculated CRC: " << calc
-              << ", Calculated zlib CRC: " << calc2 
-                  << ", Stored CRC: " << stored_crc << "\n";
-    //return false;
+              << ", Stored CRC: " << stored_crc << "\n";
+    return false;
+  } else {
+    std::cerr << "Checksum CRC: " << calc << "\n";
   }
 
   // 8) first 32 bytes => tablespace key, next 32 => IV
@@ -109,16 +107,4 @@ bool decode_ibd_encryption_info(const unsigned char *enc_info,
   std::memcpy(out_ts_key_iv.iv,  key_info + 32, 32);
 
   return true;
-}
-
-uint32_t calc_crc32(const unsigned char* data, size_t len)
-{
-    // The second parameter is the current CRC, which is typically
-    // initialized to 0 (or Z_NULL for the “initial”).
-    uLong crc = crc32(0L, Z_NULL, 0);
-
-    // Now update the CRC with your data
-    crc = crc32(crc, reinterpret_cast<const Bytef*>(data), static_cast<uInt>(len));
-
-    return static_cast<uint32_t>(crc);
 }

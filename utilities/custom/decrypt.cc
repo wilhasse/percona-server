@@ -96,7 +96,6 @@ int main(int argc, char** argv) {
 
   // 5) Master key is obfuscated
   keyring_deobfuscate(master_key.data(), master_key.size());
-
   std::cout << "Got master key length=" << master_key.size() << "\n";
 
   // 6) Read ~100 bytes from the start of the .ibd file
@@ -137,8 +136,11 @@ int main(int argc, char** argv) {
 
   // 10) print info
   std::cout << "Successfully read encryption info!\n"
-            << "master_key = "
-            << "Tablespace key = ";
+            << "master_key = ";
+  for (size_t i = 0; i < master_key.size(); i++) {
+    std::printf("%02X", master_key[i]);
+  }
+  std::cout << "\nTablespace key = ";
   for (int i = 0; i < 32; i++) {
     std::printf("%02X", ts_key_iv.key[i]);
   }
