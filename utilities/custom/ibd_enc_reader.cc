@@ -2,12 +2,74 @@
 #include <vector>
 #include <cstring>
 #include <iostream>
+#include <iomanip>
+#include <sstream>
 
 #include "ibd_enc_reader.h"
 #include "plugin/keyring/common/keys_container.h"
 #include "my_aes.h"
 #include "my_sys.h"
 #include "mysql_crc32c.h"
+
+/**
+ * This utility function provides several ways to view your Tablespace_key_iv structure
+ * 
+ * A traditional hex dump format with offset, hexadecimal values, and ASCII representation
+ * Separate displays of the key and IV as continuous hex strings
+ */
+void print_hex_dump(const Tablespace_key_iv& data, bool include_ascii = true) {
+    std::stringstream ss;
+    const unsigned char* ptr = reinterpret_cast<const unsigned char*>(&data);
+    const size_t total_size = sizeof(Tablespace_key_iv);
+    
+    // Print header
+    ss << "Tablespace Key and IV\n";
+    ss << "Offset    | Hexadecimal                                                | ASCII\n";
+    ss << "----------|------------------------------------------------------------|-----------------\n";
+    
+    // Process 16 bytes per line
+    for (size_t i = 0; i < total_size; i += 16) {
+        // Print offset
+        ss << std::setw(8) << std::setfill('0') << std::hex << i << " | ";
+        
+        // Print hex values
+        for (size_t j = 0; j < 16; j++) {
+            if (i + j < total_size) {
+                ss << std::setw(2) << std::setfill('0') << std::hex 
+                   << static_cast<int>(ptr[i + j]) << " ";
+            } else {
+                ss << "   "; // Padding for incomplete last line
+            }
+        }
+        
+        if (include_ascii) {
+            // Print ASCII representation
+            ss << "| ";
+            for (size_t j = 0; j < 16; j++) {
+                if (i + j < total_size) {
+                    char c = ptr[i + j];
+                    ss << (isprint(c) ? c : '.');
+                }
+            }
+        }
+        ss << "\n";
+    }
+    
+    // Print key and IV separately
+    ss << "\nKey (32 bytes):\n";
+    for (size_t i = 0; i < 32; i++) {
+        ss << std::setw(2) << std::setfill('0') << std::hex 
+           << static_cast<int>(data.key[i]);
+    }
+    
+    ss << "\n\nIV (32 bytes):\n";
+    for (size_t i = 0; i < 32; i++) {
+        ss << std::setw(2) << std::setfill('0') << std::hex 
+           << static_cast<int>(data.iv[i]);
+    }
+    
+    std::cout << ss.str() << std::endl;
+}
 
 /**
  * Decrypt the tablespace key + IV from the encryption info
@@ -105,6 +167,9 @@ bool decode_ibd_encryption_info(const unsigned char *enc_info,
   // 8) first 32 bytes => tablespace key, next 32 => IV
   std::memcpy(out_ts_key_iv.key, key_info,     32);
   std::memcpy(out_ts_key_iv.iv,  key_info + 32, 32);
+
+  // Print for debugging
+  print_hex_dump(out_ts_key_iv);
 
   return true;
 }
