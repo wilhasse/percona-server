@@ -236,15 +236,14 @@ static bool fetch_page(
     size_t psize      = page_sz.physical();   // e.g. 8 KB
     size_t logical_sz = page_sz.logical();    // e.g. 16 KB
 
-    // We temporarily read from disk into an 8 KB temp buffer if compressed
-    // or 16 KB if uncompressed.  Either way, allocate "disk_buf" of psize.
+    // Allocate a buffer for the raw on-disk page (psize bytes).
     unsigned char* disk_buf = (unsigned char*)malloc(psize);
     if (!disk_buf) {
         fprintf(stderr, "Out of memory for disk_buf\n");
         return false;
     }
 
-    // 1) Read raw page from disk
+    // 1) Read the page from disk
     if (!seek_page(file_in, page_sz, page_no)) {
         free(disk_buf);
         return false;
@@ -258,49 +257,47 @@ static bool fetch_page(
 
     memset(uncompressed_buf, 0, uncompressed_buf_len);
 
-    // 2) If compressed, decompress
+    // 2) If "compressed" means page size < 16k, we check if we must decompress
     if (page_sz.is_compressed()) {
-        // Set up a temp to hold the uncompressed data
-        // i.e. 16 KB
+        // Read the page type
+        uint16_t page_type = mach_read_from_2(disk_buf + FIL_PAGE_TYPE);
+
+        // We'll allocate a temporary buffer for the decompressed data
         unsigned char* temp = (unsigned char*)ut::malloc(2 * logical_sz);
-        unsigned char* aligned_temp =
-            (unsigned char*)ut_align(temp, logical_sz);
+        unsigned char* aligned_temp = (unsigned char*)ut_align(temp, logical_sz);
         memset(aligned_temp, 0, logical_sz);
 
+        // Set up the page_zip descriptor
         page_zip_des_t page_zip;
         page_zip_des_init(&page_zip);
 
-        // fill page_zip struct
-        page_zip.data  = disk_buf;
-        // For an 8 KB compressed page, this should end up being '4'.
+        // "page_zip.data" points to a compressed page structure
+        page_zip.data  = reinterpret_cast<page_zip_t*>(disk_buf);
+        // Fill the shift size, letting InnoDB figure out how many bytes to use
         page_zip.ssize = page_size_to_ssize(psize);
 
-        // 'disk_buf' has the raw 8 KB read from file
-        //uint16_t page_type = mach_read_from_2(disk_buf + FIL_PAGE_TYPE);
-
-        // default no
         bool success = false;
 
-        // only process index pages
-        //if (page_type != FIL_PAGE_INDEX) {
-
-        //  mach_write_to_2(disk_buf + PAGE_HEADER + PAGE_N_HEAP, 10000);
-        //}
-
-        // decompress
-        success = page_zip_decompress_low(&page_zip, aligned_temp, true);
-        if (!success) {
-          fprintf(stderr, "Failed to decompress page %u\n", page_no);
+        // Only attempt to decompress if it's a real index page
+        if (page_type == FIL_PAGE_INDEX) {
+            success = page_zip_decompress_low(&page_zip, aligned_temp, true);
+            if (!success) {
+                fprintf(stderr, "Failed to decompress index page %u\n", page_no);
+            } else {
+                memcpy(uncompressed_buf, aligned_temp, logical_sz);
+            }
         } else {
-          memcpy(uncompressed_buf, aligned_temp, logical_sz);
+            // Not an index page => just copy the raw page data
+            memcpy(uncompressed_buf, disk_buf, psize);
+            success = true;
         }
 
-        // do not return false here:
         ut::free(temp);
         free(disk_buf);
         return success;
+
     } else {
-        // Uncompressed, just copy from 'disk_buf' to 'uncompressed_buf'
+        // Not a compressed table: just copy raw data
         memcpy(uncompressed_buf, disk_buf, psize);
     }
 
