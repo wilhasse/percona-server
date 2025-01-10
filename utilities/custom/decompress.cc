@@ -1,6 +1,6 @@
 /*****************************************************************************
-  Minimal example that reads a possibly compressed .ibd (or ibdata*)
-  and writes out an "uncompressed" copy of every page to a new output file.
+  Code that reads a possibly compressed .ibd (or ibdata*) and writes out 
+  an "uncompressed" copy of every page to a new output file.
 
   Includes STUBS for references like:
     - ib::logger, ib::warn, ib::error, ib::fatal
@@ -222,9 +222,66 @@ static bool determine_page_size(File file_in, page_size_t &page_sz)
 }
 
 // ----------------------------------------------------------------
-// The core “read and optionally decompress page” logic
-// (similar to fetch_page() in ibd2sdi).
-// If the tablespace is compressed, calls page_zip_decompress_low().
+// 1) NEW FUNCTION: decompress_page_inplace()
+//    - Decompresses (if needed) a single page that’s already in memory
+//    - This can be called by other code that wants to do per-page logic
+// ----------------------------------------------------------------
+bool decompress_page_inplace(
+    const unsigned char* src_buf,
+    size_t               physical_size,
+    bool                 is_compressed,
+    unsigned char*       out_buf,        // Must be at least "logical_size" bytes
+    size_t               out_buf_len,
+    size_t               logical_size)
+{
+    memset(out_buf, 0, out_buf_len);
+
+    // If not compressed, just copy
+    if (!is_compressed) {
+        memcpy(out_buf, src_buf, physical_size);
+        return true;
+    }
+
+    // If compressed, check page_type
+    uint16_t page_type = mach_read_from_2(src_buf + FIL_PAGE_TYPE);
+
+    // We'll allocate a temporary buffer for the decompressed data
+    unsigned char* temp = (unsigned char*)ut::malloc(2 * logical_size);
+    unsigned char* aligned_temp = (unsigned char*)ut_align(temp, logical_size);
+    memset(aligned_temp, 0, logical_size);
+
+    // Set up the page_zip descriptor
+    page_zip_des_t page_zip;
+    page_zip_des_init(&page_zip);
+
+    // "page_zip.data" points to a compressed page structure
+    page_zip.data  = reinterpret_cast<page_zip_t*>(const_cast<unsigned char*>(src_buf));
+    // Fill the shift size, letting InnoDB figure out how many bytes to use
+    page_zip.ssize = page_size_to_ssize(physical_size);
+
+    bool success = false;
+
+    // Only attempt to decompress if it's a real index page
+    if (page_type == FIL_PAGE_INDEX) {
+        success = page_zip_decompress_low(&page_zip, aligned_temp, true);
+        if (!success) {
+            fprintf(stderr, "Failed to decompress index page.\n");
+        } else {
+            memcpy(out_buf, aligned_temp, logical_size);
+        }
+    } else {
+        // Not an index page => just copy the raw page data
+        memcpy(out_buf, src_buf, physical_size);
+        success = true;
+    }
+
+    ut::free(temp);
+    return success;
+}
+
+// ----------------------------------------------------------------
+// 2) fetch_page() calls decompress_page_inplace() to get the final
+//    uncompressed data into 'uncompressed_buf'.
 // ----------------------------------------------------------------
 static bool fetch_page(
     File file_in,
@@ -255,54 +312,17 @@ static bool fetch_page(
         return false;
     }
 
-    memset(uncompressed_buf, 0, uncompressed_buf_len);
-
-    // 2) If "compressed" means page size < 16k, we check if we must decompress
-    if (page_sz.is_compressed()) {
-        // Read the page type
-        uint16_t page_type = mach_read_from_2(disk_buf + FIL_PAGE_TYPE);
-
-        // We'll allocate a temporary buffer for the decompressed data
-        unsigned char* temp = (unsigned char*)ut::malloc(2 * logical_sz);
-        unsigned char* aligned_temp = (unsigned char*)ut_align(temp, logical_sz);
-        memset(aligned_temp, 0, logical_sz);
-
-        // Set up the page_zip descriptor
-        page_zip_des_t page_zip;
-        page_zip_des_init(&page_zip);
-
-        // "page_zip.data" points to a compressed page structure
-        page_zip.data  = reinterpret_cast<page_zip_t*>(disk_buf);
-        // Fill the shift size, letting InnoDB figure out how many bytes to use
-        page_zip.ssize = page_size_to_ssize(psize);
-
-        bool success = false;
-
-        // Only attempt to decompress if it's a real index page
-        if (page_type == FIL_PAGE_INDEX) {
-            success = page_zip_decompress_low(&page_zip, aligned_temp, true);
-            if (!success) {
-                fprintf(stderr, "Failed to decompress index page %u\n", page_no);
-            } else {
-                memcpy(uncompressed_buf, aligned_temp, logical_sz);
-            }
-        } else {
-            // Not an index page => just copy the raw page data
-            memcpy(uncompressed_buf, disk_buf, psize);
-            success = true;
-        }
-
-        ut::free(temp);
-        free(disk_buf);
-        return success;
-
-    } else {
-        // Not a compressed table: just copy raw data
-        memcpy(uncompressed_buf, disk_buf, psize);
-    }
+    // 2) Decompress (or copy) into uncompressed_buf
+    bool ok = decompress_page_inplace(
+                  disk_buf,
+                  psize,
+                  page_sz.is_compressed(),
+                  uncompressed_buf,
+                  uncompressed_buf_len,
+                  logical_sz);
 
     free(disk_buf);
-    return true;
+    return ok;
 }
 
 // ----------------------------------------------------------------
