@@ -19,3 +19,15 @@ extern bool decompress_page_inplace(
     size_t               out_buf_len,
     size_t               logical_size
 );
+
+/**
+ * decompress_ibd():
+ *   The function that reads each page from `in_fd`, checks if compressed,
+ *   and writes uncompressed pages to `out_fd`.
+ */
+bool decompress_ibd(File in_fd, File out_fd);
+
+bool is_page_compressed(const unsigned char* page_data,
+                               size_t physical_size,
+                               size_t logical_size);
+

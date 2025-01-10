@@ -30,3 +30,8 @@ extern bool decrypt_page_inplace(
     const unsigned char* iv,
     size_t               block_size
 );
+
+// Decrypt file
+bool decrypt_ibd_file(const char* src_ibd_path,
+                      const char* dst_path,
+                      const Tablespace_key_iv &ts_key_iv);

@@ -116,27 +116,6 @@ class dbug : public logger {
 static bool opt_version = false;
 static bool opt_help    = false;
 
-// For simplicity, we only define minimal options: e.g. --help, --version
-static struct my_option decompress_opts[] = {
-    {"help", 'h', "Display this help and exit.", &opt_help, &opt_help, 0,
-     GET_NO_ARG, NO_ARG, 0, 0, 0, 0, 0, 0},
-    {"version", 'v', "Display version information and exit.",
-     &opt_version, &opt_version, 0, GET_NO_ARG, NO_ARG, 0, 0, 0, 0, 0, 0},
-    {nullptr, 0, nullptr, nullptr, nullptr, nullptr, GET_NO_ARG, NO_ARG,
-     0, 0, 0, nullptr, 0, nullptr}
-};
-
-// Minimal usage print
-static void usage() {
-#ifdef NDEBUG
-  print_version();
-#else
-  print_version_debug();
-#endif
-  puts(ORACLE_WELCOME_COPYRIGHT_NOTICE("2024"));
-  printf("Usage: decompress [options] <in_file> <out_file>\n\n");
-}
-
 // Callback for the standard MySQL option parser
 extern "C" bool decompress_get_one_option(int optid, const struct my_option *,
                                           char *argument) {
@@ -222,15 +201,36 @@ static bool determine_page_size(File file_in, page_size_t &page_sz)
 }
 
 // ----------------------------------------------------------------
-// 1) NEW FUNCTION: decompress_page_inplace()
-//    - Decompresses (if needed) a single page that’s already in memory
-//    - This can be called by other code that wants to do per-page logic
+// NEW: Helper function to detect compression by physical vs logical size
+//     or by page type = FIL_PAGE_COMPRESSED (14). 
+// ----------------------------------------------------------------
+bool is_page_compressed(const unsigned char* page_data,
+                               size_t physical_size,
+                               size_t logical_size)
+{
+  // If physical < logical => likely compressed
+  if (physical_size < logical_size) {
+    return true;
+  }
+
+  // Or if the page_type is FIL_PAGE_COMPRESSED (14).
+  static const uint16_t FIL_PAGE_COMPRESSED = 14;
+  uint16_t page_type = mach_read_from_2(page_data + FIL_PAGE_TYPE);
+  if (page_type == FIL_PAGE_COMPRESSED) {
+    return true;
+  }
+
+  return false;
+}
+
+// ----------------------------------------------------------------
+// decompress_page_inplace()
 // ----------------------------------------------------------------
 bool decompress_page_inplace(
     const unsigned char* src_buf,
     size_t               physical_size,
     bool                 is_compressed,
-    unsigned char*       out_buf,        // Must be at least "logical_size" bytes
+    unsigned char*       out_buf,
     size_t               out_buf_len,
     size_t               logical_size)
 {
@@ -285,10 +285,10 @@ bool decompress_page_inplace(
 // ----------------------------------------------------------------
 static bool fetch_page(
     File file_in,
-    page_no_t page_no,
-    const page_size_t &page_sz,
-    unsigned char *uncompressed_buf,  // >= page_sz.logical() bytes
-    size_t uncompressed_buf_len)
+                       page_no_t page_no,
+                       const page_size_t &page_sz,
+                       unsigned char *uncompressed_buf,
+                       size_t uncompressed_buf_len)
 {
     size_t psize      = page_sz.physical();   // e.g. 8 KB
     size_t logical_sz = page_sz.logical();    // e.g. 16 KB
@@ -312,11 +312,14 @@ static bool fetch_page(
         return false;
     }
 
-    // 2) Decompress (or copy) into uncompressed_buf
+    // CHANGED: call is_page_compressed() instead of page_sz.is_compressed().
+    bool compressed = is_page_compressed(disk_buf, psize, logical_sz);
+
+    // decompress or copy
     bool ok = decompress_page_inplace(
                   disk_buf,
                   psize,
-                  page_sz.is_compressed(),
+                  compressed,
                   uncompressed_buf,
                   uncompressed_buf_len,
                   logical_sz);
@@ -329,7 +332,7 @@ static bool fetch_page(
 // The main logic that reads each page from input, decompresses if needed,
 // writes out the uncompressed page to the output.
 // ----------------------------------------------------------------
-static bool decompress_ibd(File in_fd, File out_fd)
+bool decompress_ibd(File in_fd, File out_fd)
 {
   // 1) Determine size of in_fd
   MY_STAT stat_info;
@@ -381,62 +384,4 @@ static bool decompress_ibd(File in_fd, File out_fd)
 
   free(page_buf);
   return true;
-}
-
-// ----------------------------------------------------------------
-// main()
-// - parse minimal options
-// - open input + output
-// - call decompress_ibd()
-// ----------------------------------------------------------------
-int main(int argc, char** argv)
-{
-  MY_INIT(argv[0]);
-  DBUG_TRACE;
-  DBUG_PROCESS(argv[0]);
-
-  // parse options
-  if (handle_options(&argc, &argv, decompress_opts, decompress_get_one_option)) {
-    exit(EXIT_FAILURE);
-  }
-  if (opt_version) {
-#ifdef NDEBUG
-    print_version();
-#else
-    print_version_debug();
-#endif
-    return 0;
-  }
-  if (opt_help) {
-    usage();
-    return 0;
-  }
-  if (argc < 2) {
-    // We expect 2 positional args: in_file, out_file
-    usage();
-    return 1;
-  }
-
-  const char *in_file  = argv[0];
-  const char *out_file = argv[1];
-
-  // open input
-  File in_fd = my_open(in_file, O_RDONLY, MYF(0));
-  if (in_fd < 0) {
-    fprintf(stderr, "Cannot open input '%s'.\n", in_file);
-    return 1;
-  }
-  // open output
-  File out_fd = my_open(out_file, O_CREAT | O_WRONLY | O_TRUNC, MYF(0));
-  if (out_fd < 0) {
-    fprintf(stderr, "Cannot open/create output '%s'.\n", out_file);
-    my_close(in_fd, MYF(0));
-    return 1;
-  }
-
-  bool ok = decompress_ibd(in_fd, out_fd);
-  my_close(in_fd, MYF(0));
-  my_close(out_fd, MYF(0));
-
-  return ok ? 0 : 1;
 }

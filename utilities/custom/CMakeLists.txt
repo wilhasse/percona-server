@@ -1,28 +1,26 @@
-MYSQL_ADD_EXECUTABLE(decompress
-  decompress.cc
-  COMPONENT Server
-  DEPENDENCIES GenError
-  LINK_LIBRARIES mysys innodb_zipdecompress ext::lz4 extra::rapidjson
-)
+# CMakeLists.txt for building a single "ib_parser" utility
 
-TARGET_COMPILE_DEFINITIONS(decompress
-  PRIVATE UNIV_NO_ERR_MSGS UNIV_LIBRARY DISABLE_PSI_MEMORY
-)
+cmake_minimum_required(VERSION 3.10)
+project(MyIbParser LANGUAGES CXX)
 
-IF(MY_COMPILER_IS_GNU_OR_CLANG)
-  ADD_COMPILE_FLAGS(decompress.cc
-    COMPILE_FLAGS "-Wno-unused-parameter -Wno-cast-qual"
-  )
-ENDIF()
+# Example: C++17
+set(CMAKE_CXX_STANDARD 17)
+add_compile_options(-Wno-cast-qual -Wall -Wextra -Wno-unused-parameter)
 
-set(DECRYPT_SOURCES
-  decrypt.cc
-  mysql_crc32c.cc
-  keyring_stubs.cc
+
+# If you have a "GenError" or "COMPONENT Server" reference from MySQL macros,
+# you can adapt them or remove them if you're not actually using them.
+# We'll do a straightforward "add_executable" example.
+
+# -- Provide a list of source files for decryption logic (excluding the old main)
+set(DECRYPT_LIB_SOURCES
+  decrypt.cc        # <--- This file has e.g. decrypt_page_inplace(), get_master_key(), etc.
   ibd_enc_reader.cc
   my_keyring_lookup.cc
+  mysql_crc32c.cc
+  keyring_stubs.cc
 
-  # If you need these for reading the keyring file:
+  # plus all your plugin/keyring .cc if needed
   ${CMAKE_SOURCE_DIR}/plugin/keyring/buffered_file_io.cc
   ${CMAKE_SOURCE_DIR}/plugin/keyring/common/keyring_key.cc
   ${CMAKE_SOURCE_DIR}/plugin/keyring/common/keyring_impl.cc
@@ -40,57 +38,54 @@ set(DECRYPT_SOURCES
   ${CMAKE_SOURCE_DIR}/plugin/keyring/hash_to_buffer_serializer.cc
   ${CMAKE_SOURCE_DIR}/plugin/keyring/common/i_keyring_key.h
   ${CMAKE_SOURCE_DIR}/plugin/keyring/common/i_serializer.h
+  ${CMAKE_SOURCE_DIR}/plugin/keyring/common/logger.h
   ${CMAKE_SOURCE_DIR}/strings/ctype-latin1.cc
 )
 
-MYSQL_ADD_EXECUTABLE(decrypt
-  ${DECRYPT_SOURCES}
-  COMPONENT Server
-  DEPENDENCIES GenError
-  LINK_LIBRARIES
-    mysys
-    ssl
-    crypto
+# -- Provide a list of source files for decompress logic (excluding the old main)
+set(DECOMPRESS_LIB_SOURCES
+  decompress.cc     # <--- This has decompress_page_inplace(), decompress_ibd(), etc.
 )
 
-target_include_directories(decrypt
+# -- The main entry point: "ib_parser.cc"
+set(IB_PARSER_MAIN
+  ib_parser.cc
+)
+
+# Combine them all for building a single binary "ib_parser"
+MYSQL_ADD_EXECUTABLE(ib_parser
+  ${IB_PARSER_MAIN}
+  ${DECRYPT_LIB_SOURCES}
+  ${DECOMPRESS_LIB_SOURCES}
+  COMPONENT Server
+  DEPENDENCIES GenError
+  LINK_LIBRARIES mysys innodb_zipdecompress ext::lz4 extra::rapidjson
+)
+
+# Example: include directories
+target_include_directories(ib_parser
   PRIVATE
     ${CMAKE_SOURCE_DIR}/plugin/keyring
     ${CMAKE_SOURCE_DIR}/plugin/keyring/common
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-target_compile_definitions(decrypt
+# If you need compile definitions
+target_compile_definitions(ib_parser
   PRIVATE
     UNIV_NO_ERR_MSGS
     UNIV_LIBRARY
     DISABLE_PSI_MEMORY
 )
 
-# If you want to disable the warning only for logger.h code, you can do:
-set_source_files_properties(  
-  ${CMAKE_CURRENT_SOURCE_DIR}/decrypt.cc
-  ${CMAKE_CURRENT_SOURCE_DIR}/ibd_enc_reader.cc
-  ${CMAKE_CURRENT_SOURCE_DIR}/my_keyring_lookup.cc
-  ${CMAKE_CURRENT_SOURCE_DIR}/crc32c.c
-    PROPERTIES
+# If you want to disable warnings:
+set_source_files_properties(
+  ${IB_PARSER_MAIN}
+  ${DECRYPT_LIB_SOURCES}
+  ${DECOMPRESS_LIB_SOURCES}
+  PROPERTIES
     COMPILE_FLAGS "-Wno-unused-parameter"
 )
-
-# Example: gather all .cc in plugin/keyring/ + subdirs
-file(GLOB KEYRING_SOURCES
-  "${CMAKE_SOURCE_DIR}/plugin/keyring/*.cc"
-  "${CMAKE_SOURCE_DIR}/plugin/keyring/*/*.cc"
-)
-
-# Now disable -Wunused-parameter for all these sources:
-set_source_files_properties(
-  ${KEYRING_SOURCES}
-  ${CMAKE_CURRENT_SOURCE_DIR}/ibd_enc_reader.cc
-  ${CMAKE_CURRENT_SOURCE_DIR}/my_keyring_lookup.cc
-  PROPERTIES
-  COMPILE_OPTIONS "-Wno-unused-parameter"
-  )
 
 # This must be separate flags, typically with escaped parentheses:
 set_source_files_properties(
@@ -107,8 +102,11 @@ set_source_files_properties(
   ${CMAKE_SOURCE_DIR}/plugin/keyring/common/keys_iterator.cc
   ${CMAKE_SOURCE_DIR}/plugin/keyring/hash_to_buffer_serializer.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/ibd_enc_reader.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/ibd_enc_reader.h
   ${CMAKE_CURRENT_SOURCE_DIR}/my_keyring_lookup.cc
   PROPERTIES
     COMPILE_FLAGS
       "-DLogPluginErr\\(level,errcode,message\\)=do{}while\\(0\\) -DLogPluginErrV\\(level,errcode,vl\\)=do{}while\\(0\\)"
 )
+
+# Done. "make" => builds "ib_parser".
