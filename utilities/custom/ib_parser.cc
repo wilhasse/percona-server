@@ -29,15 +29,12 @@
 #include <mysys_err.h>
 #include <mysqld_error.h>
 #include <fcntl.h>  // For O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC
+#include "page0size.h"  // Add this for page_size_t
 
 // Your headers that declare "decrypt_page_inplace()", "decompress_page_inplace()",
 // "get_master_key()", "read_tablespace_key_iv()", etc.
 #include "decrypt.h"     // Contains e.g. decrypt_page_inplace(), get_master_key() ...
 #include "decompress.h"  // Contains e.g. decompress_page_inplace(), etc.
-
-// Some defines or constants if needed
-// (like PAGE_SIZE, or command-line usage messages, etc.)
-static const size_t PAGE_SIZE = 16384;
 
 /** 
  * Minimal usage print 
@@ -90,7 +87,9 @@ static int do_decrypt_main(int argc, char** argv)
 
   // 3) read the tablespace key/IV
   //    pick offset=10390 or 5270 or whichever is appropriate
-  long offset = 10390; 
+  // Compressed Page: Seek to offset 5270 (0x1496)
+  // Uncompressed Page: Offset 10390 (0x2896)
+  long offset = 5270; 
   Tablespace_key_iv ts_key_iv;
   if (!read_tablespace_key_iv(ibd_path, offset, master_key, ts_key_iv)) {
     std::cerr << "Could not read tablespace key\n";
@@ -156,7 +155,8 @@ static int do_decrypt_then_decompress_main(int argc, char** argv)
 {
   if (argc < 6) {
     std::cerr << "Usage for mode=3 (decrypt+decompress):\n"
-              << "  ib_parser 3 <master_key_id> <server_uuid> <keyring_file> <ibd_path> <dest_path>\n";
+              << "  ib_parser 3 <master_key_id> <server_uuid> <keyring_file> "
+              << "<ibd_path> <dest_path>\n";
     return 1;
   }
 
@@ -166,58 +166,107 @@ static int do_decrypt_then_decompress_main(int argc, char** argv)
   const char* ibd_path     = argv[4];
   const char* out_file     = argv[5];
 
-  // (A) get master key
+  // -----------------------------
+  // (A) Global MySQL / OpenSSL init
+  // -----------------------------
   my_init();
   my_thread_init();
   OpenSSL_add_all_algorithms();
 
+  // -----------------------------
+  // (B) Retrieve the master key
+  // -----------------------------
   std::vector<unsigned char> master_key;
   if (!get_master_key(master_id, srv_uuid, keyring_path, master_key)) {
     std::cerr << "Could not get master key\n";
     return 1;
   }
 
-  // (B) read tablespace key/IV
-  long offset = 10390;
+  // -----------------------------
+  // (C) Read the tablespace key/IV
+  //     If you already know the file is "encrypted & compressed" => offset=5270.
+  //     Or if you know it's "encrypted & uncompressed" => offset=10390.
+  //     (In real logic, you'd detect from page 0, but we'll keep your existing approach.)
+  // -----------------------------
+  long offset = 5270; // e.g. compressed
   Tablespace_key_iv ts_key_iv;
   if (!read_tablespace_key_iv(ibd_path, offset, master_key, ts_key_iv)) {
     std::cerr << "Could not read tablespace key\n";
     return 1;
   }
 
-  // (C) open input
+  // -----------------------------
+  // (D) Open input file with MySQL I/O or system I/O
+  //     so we can run "determine_page_size()"
+  // -----------------------------
+  File in_fd = my_open(ibd_path, O_RDONLY, MYF(0));
+  if (in_fd < 0) {
+    std::cerr << "Cannot open input file " << ibd_path << "\n";
+    return 1;
+  }
+
+  // (D.1) Figure out the actual page size by reading the FSP header from page 0
+  page_size_t pg_sz(0, 0, false);
+  if (!determine_page_size(in_fd, pg_sz)) {
+    std::cerr << "Could not determine page size from " << ibd_path << "\n";
+    my_close(in_fd, MYF(0));
+    return 1;
+  }
+
+  // We now know the physical page size => e.g. 8192 or 16384, etc.
+  const size_t physical_page_size = pg_sz.physical();
+  const size_t logical_page_size  = pg_sz.logical();
+
+  // -----------------------------
+  // (E) Reopen with FILE* APIs, or rewind using my_seek()
+  //     For clarity, let's just close the File handle and use std::fopen.
+  // -----------------------------
+  my_close(in_fd, MYF(0)); // close
   FILE* fin = std::fopen(ibd_path, "rb");
   if (!fin) {
-    std::cerr << "Cannot open input .ibd for reading.\n";
+    std::cerr << "Cannot reopen input " << ibd_path << "\n";
     return 1;
   }
   FILE* fout = std::fopen(out_file, "wb");
   if (!fout) {
-    std::cerr << "Cannot open output for writing.\n";
+    std::cerr << "Cannot open output " << out_file << "\n";
     std::fclose(fin);
     return 1;
   }
 
-  // temp buffers
-  unsigned char page_buf[PAGE_SIZE];
-  unsigned char final_buf[PAGE_SIZE];
-  uint64_t page_number = 0;
+  // -----------------------------
+  // (F) Allocate buffers based on actual page size
+  // -----------------------------
+  std::unique_ptr<unsigned char[]> page_buf(new unsigned char[physical_page_size]);
+  std::unique_ptr<unsigned char[]> final_buf(new unsigned char[logical_page_size]);
 
+  // -----------------------------
+  // (G) Page-by-page loop
+  // -----------------------------
+  uint64_t page_number = 0;
   while (true) {
-    size_t rd = std::fread(page_buf, 1, PAGE_SIZE, fin);
+    // Read exactly 'physical_page_size' from the file
+    size_t rd = std::fread(page_buf.get(), 1, physical_page_size, fin);
     if (rd == 0) {
       // EOF
       break;
     }
-    if (rd < PAGE_SIZE) {
-      std::cerr << "Warning: partial page read at page " << page_number << "\n";
+    if (rd < physical_page_size) {
+      std::cerr << "Warning: partial page read at page " 
+                << page_number << "\n";
+      // We can either break or continue with partial data
+      // But usually we break because it's incomplete
+      break;
     }
 
-    // 1) decrypt in place
+    // 1) Decrypt in-place
     bool dec_ok = decrypt_page_inplace(
-        page_buf, PAGE_SIZE,
-        ts_key_iv.key, 32,
-        ts_key_iv.iv, 8 * 1024);
+        page_buf.get(), 
+        physical_page_size,   // or logical_page_size, depends on your encryption
+        ts_key_iv.key, 
+        32, 
+        ts_key_iv.iv, 
+        8 * 1024);
     if (!dec_ok) {
       std::cerr << "Decrypt failed on page " << page_number << "\n";
       std::fclose(fin);
@@ -225,16 +274,17 @@ static int do_decrypt_then_decompress_main(int argc, char** argv)
       return 1;
     }
 
-    // 2) decompress in place
-    size_t physical_size = (rd < PAGE_SIZE) ? rd : PAGE_SIZE;
-    bool page_is_compressed = is_page_compressed(page_buf, physical_size, PAGE_SIZE);
+    // 2) Decompress in-place (if needed)
+    bool page_is_compressed =
+        is_page_compressed(page_buf.get(), physical_page_size, logical_page_size);
+
     bool cmp_ok = decompress_page_inplace(
-        page_buf,
-        physical_size,
-        page_is_compressed,
-        final_buf,
-        PAGE_SIZE,
-        PAGE_SIZE
+        page_buf.get(),          /* src data        */
+        physical_page_size,      /* physical_size   */
+        page_is_compressed,      /* is_compressed?  */
+        final_buf.get(),         /* output buffer   */
+        logical_page_size,       /* out_buf_len     */
+        logical_page_size        /* "logical size"  */
     );
     if (!cmp_ok) {
       std::cerr << "Decompress failed on page " << page_number << "\n";
@@ -243,9 +293,9 @@ static int do_decrypt_then_decompress_main(int argc, char** argv)
       return 1;
     }
 
-    // 3) write final
-    size_t wr = std::fwrite(final_buf, 1, PAGE_SIZE, fout);
-    if (wr < PAGE_SIZE) {
+    // 3) Write out the final uncompressed page
+    size_t wr = std::fwrite(final_buf.get(), 1, logical_page_size, fout);
+    if (wr < logical_page_size) {
       std::cerr << "Failed to write final page " << page_number << "\n";
       std::fclose(fin);
       std::fclose(fout);
@@ -258,7 +308,8 @@ static int do_decrypt_then_decompress_main(int argc, char** argv)
   std::fclose(fin);
   std::fclose(fout);
 
-  std::cout << "Decrypt+Decompress done. " << page_number << " pages written.\n";
+  std::cout << "Decrypt+Decompress done. " << page_number 
+            << " pages written.\n";
   my_thread_end();
   my_end(0);
   return 0;

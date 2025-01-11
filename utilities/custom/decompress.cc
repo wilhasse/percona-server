@@ -59,15 +59,15 @@ namespace ib {
 logger::~logger() = default;
 
 info::~info() {
-  std::cerr << "[INFO] ibd2sdi: " << m_oss.str() << "." << std::endl;
+  std::cerr << "[INFO] decompress: " << m_oss.str() << "." << std::endl;
 }
 
 warn::~warn() {
-  std::cerr << "[WARNING] ibd2sdi: " << m_oss.str() << "." << std::endl;
+  std::cerr << "[WARNING] decompress: " << m_oss.str() << "." << std::endl;
 }
 
 error::~error() {
-  std::cerr << "[ERROR] ibd2sdi: " << m_oss.str() << "." << std::endl;
+  std::cerr << "[ERROR] decompress: " << m_oss.str() << "." << std::endl;
 }
 
 /*
@@ -78,7 +78,7 @@ MY_COMPILER_DIAGNOSTIC_PUSH()
 MY_COMPILER_MSVC_DIAGNOSTIC_IGNORE(4722)
 
 fatal::~fatal() {
-  std::cerr << "[FATAL] ibd2sdi: " << m_oss.str() << "." << std::endl;
+  std::cerr << "[FATAL] decompress: " << m_oss.str() << "." << std::endl;
   ut_error;
 }
 
@@ -88,7 +88,7 @@ MY_COMPILER_DIAGNOSTIC_POP()
 /* TODO: Improve Object creation & destruction on NDEBUG */
 class dbug : public logger {
  public:
-  ~dbug() override { DBUG_PRINT("ibd2sdi", ("%s", m_oss.str().c_str())); }
+  ~dbug() override { DBUG_PRINT("decompress", ("%s", m_oss.str().c_str())); }
 };
 }  // namespace ib
 
@@ -98,11 +98,11 @@ class dbug : public logger {
 @param[in]	line	line number of the assertion */
 [[noreturn]] void ut_dbg_assertion_failed(const char *expr, const char *file,
                                           uint64_t line) {
-  fprintf(stderr, "ibd2sdi: Assertion failure in file %s line " UINT64PF "\n",
+  fprintf(stderr, "decompress: Assertion failure in file %s line " UINT64PF "\n",
           file, line);
 
   if (expr != nullptr) {
-    fprintf(stderr, "ibd2sdi: Failing assertion: %s\n", expr);
+    fprintf(stderr, "decompress: Failing assertion: %s\n", expr);
   }
 
   fflush(stderr);
@@ -149,7 +149,7 @@ static bool seek_page(File file_in, const page_size_t &page_sz, page_no_t page_n
 // Minimal “determine page size” logic (like in ibd2sdi).
 // Reads page 0, parse fsp header, etc.
 // ----------------------------------------------------------------
-static bool determine_page_size(File file_in, page_size_t &page_sz)
+bool determine_page_size(File file_in, page_size_t &page_sz)
 {
   // Temporarily read smallest page
   unsigned char buf[UNIV_ZIP_SIZE_MIN];
@@ -215,8 +215,9 @@ bool is_page_compressed(const unsigned char* page_data,
 
   // Or if the page_type is FIL_PAGE_COMPRESSED (14).
   static const uint16_t FIL_PAGE_COMPRESSED = 14;
+  static const uint16_t FIL_PAGE_COMPRESSED_AND_ENCRYPTED = 16;
   uint16_t page_type = mach_read_from_2(page_data + FIL_PAGE_TYPE);
-  if (page_type == FIL_PAGE_COMPRESSED) {
+  if (page_type == FIL_PAGE_COMPRESSED || page_type == FIL_PAGE_COMPRESSED_AND_ENCRYPTED) {
     return true;
   }
 

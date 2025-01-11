@@ -25,44 +25,13 @@
 #include <my_thread.h>
 #include "mysys_err.h"     // for MY_AES_BAD_DATA constant, etc.
 #include "my_aes.h"
+#include "page0size.h"  // Add this for page_size_t
+#include "page0types.h"
+#include "fil0fil.h"
 
 // Custom
+#include "decrypt.h"
 #include "ibd_enc_reader.h" // for decode_ibd_encryption_info()
-
-// ----------------------------------------------------------------
-// This is the simplified page size for InnoDB pages
-// Typically it's 16KB, but adapt if your system differs
-static const size_t PAGE_SIZE = 16384;
-//static const size_t PAGE_SIZE = 8192;
-
-/* Some MySQL/Innodb constants you’ll need: */
-static const size_t FIL_PAGE_DATA     = 38;   // Typical offset for raw page data
-static const size_t FIL_PAGE_TYPE     = 24;   // Offset of 2-byte page type
-static const size_t FIL_PAGE_VERSION  = 26;
-static const size_t FIL_PAGE_COMPRESS_SIZE_V1   = 64;
-static const size_t FIL_PAGE_ORIGINAL_SIZE_V1   = 66;
-static const size_t FIL_PAGE_ALGORITHM_V1       = FIL_PAGE_VERSION + 1;
-static const uint32_t FIL_PAGE_ORIGINAL_TYPE_V1 = FIL_PAGE_ALGORITHM_V1 + 1;
-static const uint16_t FIL_PAGE_COMPRESSED               = 14;
-static const uint16_t FIL_PAGE_ENCRYPTED                = 15;
-static const uint16_t FIL_PAGE_COMPRESSED_AND_ENCRYPTED = 16;
-static const uint16_t FIL_PAGE_ENCRYPTED_RTREE          = 17;
-static const uint16_t FIL_PAGE_RTREE = 17854;
-// ^ In real code, confirm these offsets/types match your MySQL version!
-
-// a minimal stand-in for reading from page, typical MySQL macros
-inline uint8_t mach_read_from_1(const unsigned char* ptr) {
-  return ptr[0];
-}
-
-inline uint16_t mach_read_from_2(const unsigned char* ptr) {
-  return (ptr[0] << 8) | ptr[1];
-}
-
-inline void mach_write_to_2(unsigned char* ptr, uint16_t val) {
-  ptr[0] = static_cast<unsigned char>((val >> 8) & 0xFF);
-  ptr[1] = static_cast<unsigned char>( val       & 0xFF);
-}
 
 // Decrypts an obfuscated key using MySQL's keyring XOR method
 void keyring_deobfuscate(unsigned char* key_data, size_t key_len) {
@@ -193,34 +162,6 @@ bool is_encrypted_page(const unsigned char* page_data) {
           page_type == FIL_PAGE_ENCRYPTED_RTREE);
 }
 
-/** Calculates the smallest multiple of m that is not smaller than n
-    when m is a power of two. In other words, rounds n up to m*k.
-    @param n  in: number to round up
-    @param m  in: alignment, must be a power of two
-    @return n rounded up to the smallest possible integer multiple of m */
-#define ut_calc_align(n, m) (((n) + ((m) - 1)) & ~((m) - 1))
-
-/** Example: A minimal structure to hold compression metadata */
-namespace Compression {
-struct meta_t {
-  uint8_t  m_version;
-  uint16_t m_original_type;
-  uint16_t m_compressed_size;
-  uint16_t m_original_size;
-  uint8_t  m_algorithm;
-};
-
-/** Deserialise the page header compression meta-data */
-inline void deserialize_header(const unsigned char* page, meta_t* control) {
-  // For a real environment, ensure we have "is_compressed_page(page)" checks etc.
-  control->m_version         = static_cast<uint8_t>(mach_read_from_1(page + FIL_PAGE_VERSION));
-  control->m_original_type   = static_cast<uint16_t>(mach_read_from_2(page + FIL_PAGE_ORIGINAL_TYPE_V1));
-  control->m_compressed_size = static_cast<uint16_t>(mach_read_from_2(page + FIL_PAGE_COMPRESS_SIZE_V1));
-  control->m_original_size   = static_cast<uint16_t>(mach_read_from_2(page + FIL_PAGE_ORIGINAL_SIZE_V1));
-  control->m_algorithm       = static_cast<uint8_t>(mach_read_from_1(page + FIL_PAGE_ALGORITHM_V1));
-}
-} // namespace Compression
-
 /**
  * @brief Offline function that decrypts a single uncompressed page in-place
  *        using MySQL's partial-block approach, calling `my_aes_decrypt()`.
@@ -252,8 +193,8 @@ bool decrypt_page_inplace(
     uint16_t       original_type
         = mach_read_from_2(page_data + FIL_PAGE_ORIGINAL_TYPE_V1);
 
-  // 3) The actual data portion to decrypt is everything after FIL_PAGE_DATA
-  //    (i.e., skip the InnoDB file header).
+    // 3) The actual data portion to decrypt is everything after FIL_PAGE_DATA
+    //    (i.e., skip the InnoDB file header).
     if (page_len <= FIL_PAGE_DATA) {
     // Malformed / no space to decrypt
         return false;
@@ -294,50 +235,51 @@ bool decrypt_page_inplace(
     size_t main_len   = (data_len / MY_AES_BLOCK_SIZE) * MY_AES_BLOCK_SIZE;
     size_t remain_len = data_len - main_len;
 
-  // We need a temp buffer for partial-block decrypt
-  // or for the entire chunk if we want to replicate MySQL exactly.
-  // In real MySQL code, 'tmp' might be allocated from a block pool.
+    // We need a temp buffer for partial-block decrypt
+    // or for the entire chunk if we want to replicate MySQL exactly.
+    // In real MySQL code, 'tmp' might be allocated from a block pool.
     unsigned char* tmp_buf = new unsigned char[data_len];
     unsigned char  remain_buf[MY_AES_BLOCK_SIZE * 2];
 
-  // 4) If there's a remainder, MySQL decrypts the last 2 blocks first
-  //    (remain_len != 0 => do a 2-block decrypt)
+    // 4) If there's a remainder, MySQL decrypts the last 2 blocks first
+    //    (remain_len != 0 => do a 2-block decrypt)
     if (remain_len != 0) {
-    // MySQL logic: “remain_len = MY_AES_BLOCK_SIZE * 2;”
-    // so effectively we always decrypt the last 2 blocks as a chunk.
-        remain_len = MY_AES_BLOCK_SIZE * 2;
 
-    // Copy last 2 blocks into remain_buf
-    size_t offset_of_last_2 = data_len - remain_len; // from ptr
-        memcpy(remain_buf, ptr + offset_of_last_2, remain_len);
+      // MySQL logic: “remain_len = MY_AES_BLOCK_SIZE * 2;”
+      // so effectively we always decrypt the last 2 blocks as a chunk.
+      remain_len = MY_AES_BLOCK_SIZE * 2;
 
-    // my_aes_decrypt(src, src_len, dest, key, key_len, mode, iv, pad)
-    // using mode = my_aes_256_cbc, pad=false
-    // Decrypt the 2-block chunk into tmp_buf + offset_of_last_2
-        int elen = my_aes_decrypt(
-            remain_buf,
-        static_cast<uint32>(remain_len),
-            tmp_buf + offset_of_last_2,
-            key,
-        static_cast<uint32>(key_len),
-        my_aes_256_cbc,
-            iv,
-            false /* no padding */);
+      // Copy last 2 blocks into remain_buf
+      size_t offset_of_last_2 = data_len - remain_len; // from ptr
+      memcpy(remain_buf, ptr + offset_of_last_2, remain_len);
 
-        if (elen == MY_AES_BAD_DATA) {
-            delete[] tmp_buf;
-            return false;
-        }
+      // my_aes_decrypt(src, src_len, dest, key, key_len, mode, iv, pad)
+      // using mode = my_aes_256_cbc, pad=false
+      // Decrypt the 2-block chunk into tmp_buf + offset_of_last_2
+      int elen = my_aes_decrypt(
+          remain_buf,
+      static_cast<uint32>(remain_len),
+          tmp_buf + offset_of_last_2,
+          key,
+      static_cast<uint32>(key_len),
+      my_aes_256_cbc,
+          iv,
+          false /* no padding */);
 
-    // Copy everything *before* those last 2 blocks into tmp_buf unchanged
-        memcpy(tmp_buf, ptr, offset_of_last_2);
+      if (elen == MY_AES_BAD_DATA) {
+          delete[] tmp_buf;
+          return false;
+      }
+
+      // Copy everything *before* those last 2 blocks into tmp_buf unchanged
+      memcpy(tmp_buf, ptr, offset_of_last_2);
     } else {
-    // If data_len is a multiple of 16, MySQL just copies it all to tmp_buf
-        memcpy(tmp_buf, ptr, data_len);
+      // If data_len is a multiple of 16, MySQL just copies it all to tmp_buf
+      memcpy(tmp_buf, ptr, data_len);
     }
 
-  // 5) Decrypt the “main” portion from tmp_buf => ptr
-  //    (which is the portion except those last 2 blocks, if any)
+    // 5) Decrypt the “main” portion from tmp_buf => ptr
+    //    (which is the portion except those last 2 blocks, if any)
     {
         int elen = my_aes_decrypt(
             tmp_buf,
@@ -355,8 +297,8 @@ bool decrypt_page_inplace(
         }
     }
 
-  // 6) If remain_len != 0, copy the decrypted tail from tmp_buf to ptr
-  //    (beyond main_len)
+    // 6) If remain_len != 0, copy the decrypted tail from tmp_buf to ptr
+    //    (beyond main_len)
     if (data_len > main_len) {
         memcpy(ptr + main_len, tmp_buf + main_len, data_len - main_len);
     }
@@ -373,7 +315,7 @@ bool decrypt_page_inplace(
         // We might also want to clear FIL_PAGE_ORIGINAL_TYPE_V1, etc.
     }
 
-  // Cleanup
+    // Cleanup
     delete[] tmp_buf;
     return true;
 }

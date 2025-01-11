@@ -101,6 +101,7 @@ set_source_files_properties(
   ${CMAKE_SOURCE_DIR}/plugin/keyring/checker/checker_ver_2_0.cc
   ${CMAKE_SOURCE_DIR}/plugin/keyring/common/keys_iterator.cc
   ${CMAKE_SOURCE_DIR}/plugin/keyring/hash_to_buffer_serializer.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/ib_parser.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/ibd_enc_reader.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/ibd_enc_reader.h
   ${CMAKE_CURRENT_SOURCE_DIR}/my_keyring_lookup.cc
