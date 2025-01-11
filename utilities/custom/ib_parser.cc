@@ -40,6 +40,7 @@
 // "get_master_key()", "read_tablespace_key_iv()", etc.
 #include "decrypt.h"     // Contains e.g. decrypt_page_inplace(), get_master_key() ...
 #include "decompress.h"  // Contains e.g. decompress_page_inplace(), etc.
+#include "parser.h"      // Contains parser logic
 
 // We assume a fixed 16K buffer for reading page 0, 
 // since the maximum InnoDB page size is 16K in many setups.
@@ -201,15 +202,94 @@ static int do_decompress_main(int argc, char** argv)
 }
 
 /**
- * (C) The "decrypt + decompress" combined logic in a single pass,
+ * (C) The "parse only" routine (unencrypted + uncompressed).
+ *     Illustrative minimal example based on undrop-for-innodb code.
+ */
+static int do_parse_main(int argc, char** argv)
+{
+  if (argc < 2) {
+    std::cerr << "Usage for mode=3 (parse-only):\n"
+              << "  ib_parser 3 <in_file.ibd>\n";
+    return 1;
+  }
+
+  const char* in_file = argv[1];
+
+  // 1) MySQL init
+  my_init();
+  my_thread_init();
+
+  // 2) Open input .ibd file
+  File in_fd = my_open(in_file, O_RDONLY, MYF(0));
+  if (in_fd < 0) {
+    std::cerr << "Cannot open file " << in_file << std::endl;
+    return 1;
+  }
+
+  // 3) Determine page size (for 8KB,16KB, etc.)
+  page_size_t pg_sz(0, 0, false);
+  if (!determine_page_size(in_fd, pg_sz)) {
+    std::cerr << "Could not determine page size from " << in_file << "\n";
+    my_close(in_fd, MYF(0));
+    return 1;
+  }
+  const size_t physical_page_size = pg_sz.physical();
+
+  // 4) Rewind to start
+  if (my_seek(in_fd, 0, MY_SEEK_SET, MYF(0)) == MY_FILEPOS_ERROR) {
+    std::cerr << "Cannot seek to start of " << in_file << "\n";
+    my_close(in_fd, MYF(0));
+    return 1;
+  }
+
+  // 5) Allocate a buffer for reading pages
+  std::unique_ptr<unsigned char[]> page_buf(new unsigned char[physical_page_size]);
+
+  // 6) Page-by-page loop
+  uint64_t page_no = 0;
+  while (true) {
+    size_t rd = my_read(in_fd, page_buf.get(), physical_page_size, MYF(0));
+    if (rd == 0) {
+      // EOF
+      break;
+    }
+    if (rd < physical_page_size) {
+      std::cerr << "Warning: partial page read at page "
+                << page_no << "\n";
+      break;
+    }
+
+    //--- If this is a leaf page (PAGE_LEVEL == 0), parse records
+    const ulint  page_level   = mach_read_from_2(page_buf.get() + PAGE_HEADER + PAGE_LEVEL);
+    const bool   is_leaf_page = (page_level == 0);
+
+    if (is_leaf_page) {
+      // Minimal example: parse records from page.
+      // This snippet calls a helper function like "parse_records_on_page()".
+      parse_records_on_page(page_buf.get(), physical_page_size, page_no);
+    }
+
+    page_no++;
+  }
+
+  my_close(in_fd, MYF(0));
+  my_thread_end();
+  my_end(0);
+
+  std::cout << "Parse-only complete. Pages read: " << page_no << "\n";
+  return 0;
+}
+
+/**
+ * (D) The "decrypt + decompress" combined logic in a single pass,
  *     adapted from what we did in "combined_decrypt_decompress.cc".
  *     Page by page => decrypt_page_inplace => decompress_page_inplace => write final.
  */
 static int do_decrypt_then_decompress_main(int argc, char** argv)
 {
   if (argc < 6) {
-    std::cerr << "Usage for mode=3 (decrypt+decompress):\n"
-              << "  ib_parser 3 <master_key_id> <server_uuid> <keyring_file> "
+    std::cerr << "Usage for mode=4 (decrypt+decompress):\n"
+              << "  ib_parser 4 <master_key_id> <server_uuid> <keyring_file> "
               << "<ibd_path> <dest_path>\n";
     return 1;
   }
@@ -390,18 +470,19 @@ int main(int argc, char** argv)
     return 1;
   }
 
-  // parse "mode" from argv[1]
   int mode = std::atoi(argv[1]);
   switch (mode) {
-  case 1:  // decrypt only
-    return do_decrypt_main(argc - 1, &argv[1]);
-  case 2:  // decompress only
-    return do_decompress_main(argc - 1, &argv[1]);
-  case 3:  // decrypt + decompress
-    return do_decrypt_then_decompress_main(argc - 1, &argv[1]);
-  default:
-    std::cerr << "Error: invalid mode '" << mode << "'\n";
-    usage();
-    return 1;
+    case 1:  // decrypt only
+      return do_decrypt_main(argc - 1, &argv[1]);
+    case 2:  // decompress only
+      return do_decompress_main(argc - 1, &argv[1]);
+    case 3:  // parse-only
+      return do_parse_main(argc - 1, &argv[1]);
+    case 4:  // decrypt + decompress
+      return do_decrypt_then_decompress_main(argc - 1, &argv[1]);
+    default:
+      std::cerr << "Error: invalid mode '" << mode << "'\n";
+      usage();
+      return 1;
   }
 }

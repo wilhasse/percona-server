@@ -50,6 +50,7 @@ set(DECOMPRESS_LIB_SOURCES
 # -- The main entry point: "ib_parser.cc"
 set(IB_PARSER_MAIN
   ib_parser.cc
+  parser.cc
 )
 
 # Combine them all for building a single binary "ib_parser"
@@ -65,9 +66,9 @@ MYSQL_ADD_EXECUTABLE(ib_parser
 # Example: include directories
 target_include_directories(ib_parser
   PRIVATE
-    ${CMAKE_SOURCE_DIR}/plugin/keyring
-    ${CMAKE_SOURCE_DIR}/plugin/keyring/common
-    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/storage/innobase/include
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}
 )
 
 # If you need compile definitions
