@@ -1,26 +1,36 @@
 // Standard C++ includes
 #include <iostream>
 #include <cstdint>
+#include <vector>
+#include <string>
+#include <cstdio>
+#include <rapidjson/document.h>
+#include <rapidjson/error/en.h>
+#include <rapidjson/istreamwrapper.h>
+#include <fstream>
+#include <iostream>
 
 // InnoDB includes
 #include "page0page.h"  // For page structure constants
 #include "rem0rec.h"    // For record handling
 #include "mach0data.h"  // For mach_read_from_2
 #include "ut0byte.h"    // For byte utilities
+#include "page0page.h"  // FIL_PAGE_INDEX, PAGE_HEADER, etc.
+#include "fil0fil.h"    // fil_page_get_type()
+#include "rem0rec.h"    // btr_root_fseg_validate() might be declared
+#include "mach0data.h"  // mach_read_from_8(), mach_read_from_4()
+#include "fsp0fsp.h"    // FSP_SPACE_ID
+#include "fsp0types.h"  // btr_root_fseg_validate() signature
 
-#include <iostream>
-#include <cstdint>
+/** A minimal column-definition struct */
+struct MyColumnDef {
+    std::string name;            // e.g., "id", "name", ...
+    std::string type_utf8;       // e.g., "int", "char", "varchar"
+    uint32_t    length;          // For char(N), the N, or 4 if int
+};
 
-// InnoDB includes
-#include "page0page.h"         // FIL_PAGE_INDEX, PAGE_HEADER, etc.
-#include "fil0fil.h"           // fil_page_get_type()
-#include "rem0rec.h"           // btr_root_fseg_validate() might be declared
-#include "mach0data.h"         // mach_read_from_8(), mach_read_from_4()
-#include "fsp0fsp.h"           // FSP_SPACE_ID
-#include "fsp0types.h"         // btr_root_fseg_validate() signature
-
-// Adapt from your code:
-static const size_t kPageSize = 16384;
+/** We store the columns here, loaded from JSON. */
+static std::vector<MyColumnDef> g_columns;
 
 // We'll store the discovered ID in this struct:
 struct Dulint {
@@ -62,6 +72,11 @@ static inline uint64_t read_uint64_from_page(const unsigned char* ptr) {
  */
 int discover_primary_index_id(int fd)
 {
+
+  // Standard Innodb Page Size
+  // TODO: I couldn't use UNIV_PAGE_SIZE due to variable-length array (VLA)
+  static const size_t kPageSize = 16384;
+
   // 1) get file size
   struct stat stat_buf;
   if (fstat(fd, &stat_buf) == -1) {
@@ -136,6 +151,178 @@ bool is_primary_index(const unsigned char* page)
 }
 
 /**
+ * load_ib2sdi_table_columns():
+ *   Parses an ib2sdi-generated JSON file (like the one you pasted),
+ *   searches for the array element that has "dd_object_type" == "Table",
+ *   then extracts its "columns" array from "dd_object".
+ *
+ * Returns 0 on success, non-0 on error.
+ */
+int load_ib2sdi_table_columns(const char* json_path)
+{
+    // 1) Open the file
+    std::ifstream ifs(json_path);
+    if (!ifs.is_open()) {
+        std::cerr << "[Error] Could not open JSON file: " << json_path << std::endl;
+        return 1;
+    }
+
+    // 2) Parse the top-level JSON
+    rapidjson::IStreamWrapper isw(ifs);
+    rapidjson::Document d;
+    d.ParseStream(isw);
+    if (d.HasParseError()) {
+        std::cerr << "[Error] JSON parse error: " 
+                  << rapidjson::GetParseError_En(d.GetParseError())
+                  << " at offset " << d.GetErrorOffset() << std::endl;
+        return 1;
+    }
+
+    if (!d.IsArray()) {
+        std::cerr << "[Error] Top-level JSON is not an array.\n";
+        return 1;
+    }
+
+    // 3) Find the array element whose "dd_object_type" == "Table".
+    //    In your example, you had something like:
+    //    [
+    //       "ibd2sdi",
+    //       { "type":1, "object": { "dd_object_type":"Table", ... } },
+    //       { "type":2, "object": { "dd_object_type":"Tablespace", ... } }
+    //    ]
+    // We'll loop the array to find the "Table" entry.
+
+    const rapidjson::Value* table_obj = nullptr;
+
+    for (auto& elem : d.GetArray()) {
+        // Each elem might be "ibd2sdi" (string) or an object with { "type":..., "object":... }
+        if (elem.IsObject() && elem.HasMember("object")) {
+            const rapidjson::Value& obj = elem["object"];
+            if (obj.HasMember("dd_object_type") && obj["dd_object_type"].IsString()) {
+                std::string ddtype = obj["dd_object_type"].GetString();
+                if (ddtype == "Table") {
+                    // Found the table element
+                    table_obj = &obj;
+                    break; 
+                }
+            }
+        }
+    }
+
+    if (!table_obj) {
+        std::cerr << "[Error] Could not find any array element with dd_object_type=='Table'.\n";
+        return 1;
+    }
+
+    // 4) Inside that "object", we want "dd_object" => "columns"
+    //    i.e. table_obj->HasMember("dd_object") => columns in table_obj["dd_object"]["columns"]
+    if (!table_obj->HasMember("dd_object")) {
+        std::cerr << "[Error] Table object is missing 'dd_object' member.\n";
+        return 1;
+    }
+    const rapidjson::Value& dd_obj = (*table_obj)["dd_object"];
+
+    if (!dd_obj.HasMember("columns") || !dd_obj["columns"].IsArray()) {
+        std::cerr << "[Error] 'dd_object' is missing 'columns' array.\n";
+        return 1;
+    }
+
+    const rapidjson::Value& columns = dd_obj["columns"];
+    g_columns.clear();
+
+    // 5) Iterate the columns array
+    for (auto& c : columns.GetArray()) {
+        // We expect "name", "column_type_utf8", "char_length" in each
+        if (!c.HasMember("name") || !c.HasMember("column_type_utf8") || !c.HasMember("char_length")) {
+            // Some columns might be hidden or missing fields
+            // That's typical for DB_TRX_ID, DB_ROLL_PTR, etc.
+            // We'll just skip them or give defaults.
+            // For demo, skip if missing 'name' or 'column_type_utf8'
+            if (!c.HasMember("name") || !c.HasMember("column_type_utf8")) {
+                std::cerr << "[Warn] A column is missing 'name' or 'column_type_utf8'. Skipping.\n";
+                continue;
+            }
+        }
+
+        MyColumnDef def;
+        def.name      = c["name"].GetString();
+        def.type_utf8 = c["column_type_utf8"].GetString();
+
+        // default length = 4 if "int"? 
+        // or from "char_length"
+        uint32_t length = 4; // fallback
+        if (c.HasMember("char_length") && c["char_length"].IsUint()) {
+            length = c["char_length"].GetUint();
+        }
+        def.length = length;
+
+        // Add to global vector
+        g_columns.push_back(def);
+
+        // Optional debug
+        std::cout << "[Debug] Added column: name='" << def.name
+                  << "', type='" << def.type_utf8
+                  << "', length=" << def.length << "\n";
+    }
+
+    ifs.close();
+    return 0;
+}
+
+/**
+ * parse_and_print_record():
+ *   Given the page buffer + offset, read each column 
+ *   from g_columns, and print their values.
+ *
+ *   This is very simplistic: it treats "int" as 4 bytes,
+ *   "char"/"varchar" as 'length' bytes, etc.
+ *   Adapt as needed for real InnoDB row formats.
+ */
+static void parse_and_print_record(const unsigned char* page,
+                                   size_t page_size,
+                                   ulint rec_offset)
+{
+    // For a real solution, you'd want the "rec" pointer, etc.
+    // We'll do a minimal approach:
+    const rec_t* rec = reinterpret_cast<const rec_t*>(page + rec_offset);
+
+    // Example: you might check rec_get_status(rec) or rec_get_deleted_flag()
+
+    std::cout << "  Parsing record at offset " << rec_offset << "...\n";
+
+    // Loop over the columns from the JSON
+    for (size_t i = 0; i < g_columns.size(); i++) {
+        const MyColumnDef& col = g_columns[i];
+
+        // For demonstration, we assume columns are laid out in 
+        // a fixed offset: i.e. col i starts at offset (some calculation).
+        // This is NOT how real InnoDB row format works! 
+        // In real code, you’d build field offsets with rec_offs_* logic 
+        // or the undrop approach. 
+        // We'll do a naive offset = sum of previous columns' lengths:
+        static size_t cumulative_offset = 0; 
+        // obviously you'd store these offsets in a global array or something.
+
+        std::cout << "    Column '" << col.name << "' = ";
+
+        if (col.type_utf8 == "int") {
+            // read 4 bytes, maybe do sign flipping
+            uint32_t val = mach_read_from_4((byte*)rec + cumulative_offset);
+            val ^= 0x80000000; // if you do that in your table
+            std::cout << val << "\n";
+            cumulative_offset += 4;
+        } else {
+            // char or varchar
+            std::string s((char*)rec + cumulative_offset, col.length);
+            std::cout << s << "\n";
+            cumulative_offset += col.length;
+        }
+    }
+
+    // Possibly read hidden columns (DB_TRX_ID, DB_ROLL_PTR) if you want.
+}
+
+/**
  * Example: parse and print records from a leaf page.
  * Very minimal, ignoring many corner cases.
  *
@@ -199,6 +386,9 @@ void parse_records_on_page(const unsigned char* page,
                 << " (page " << page_no << ")\n";
     }
 
+    // **Here** we call parse_and_print_record to interpret columns
+    parse_and_print_record(page, page_size, rec_offset);
+      
     if (next_off == rec_offset || next_off >= page_size) {
       // Corruption or end
       break;

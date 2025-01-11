@@ -95,7 +95,7 @@ static void usage() {
             << "Examples:\n"
             << "  ib_parser 1 <master_key_id> <server_uuid> <keyring_file> <ibd_path> <dest_path>\n"
             << "  ib_parser 2 <in_file.ibd> <out_file>\n"
-            << "  ib_parser 3 <in_file.ibd>\n"
+            << "  ib_parser 3 <in_file.ibd> <table_def.json>\n"
             << "  ib_parser 4 <master_key_id> <server_uuid> <keyring_file> <ibd_path> <dest_path>\n"
             << std::endl;
 }
@@ -211,11 +211,14 @@ static int do_parse_main(int argc, char** argv)
 {
   if (argc < 2) {
     std::cerr << "Usage for mode=3 (parse-only):\n"
-              << "  ib_parser 3 <in_file.ibd>\n";
+              << "  ib_parser 3 <in_file.ibd> <table_def.json>\n";
     return 1;
   }
 
   const char* in_file = argv[1];
+
+  // 0) Load table definition
+  load_ib2sdi_table_columns(argv[2]);
 
   // 1) MySQL init
   my_init();

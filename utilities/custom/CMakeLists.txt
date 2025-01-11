@@ -7,7 +7,6 @@ project(MyIbParser LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 add_compile_options(-Wno-cast-qual -Wall -Wextra -Wno-unused-parameter)
 
-
 # If you have a "GenError" or "COMPONENT Server" reference from MySQL macros,
 # you can adapt them or remove them if you're not actually using them.
 # We'll do a straightforward "add_executable" example.
@@ -60,8 +59,17 @@ MYSQL_ADD_EXECUTABLE(ib_parser
   ${DECOMPRESS_LIB_SOURCES}
   COMPONENT Server
   DEPENDENCIES GenError
-  LINK_LIBRARIES mysys innodb_zipdecompress ext::lz4 extra::rapidjson
+  LINK_LIBRARIES mysys innodb_zipdecompress ext::lz4
 )
+
+# Add RapidJSON include path
+# Adjust the path below to point to your downloaded rapidjson include directory
+set(RAPIDJSON_INCLUDE_DIR "/home/cslog/rapidjson/include")
+
+# Verify that the path exists
+if(NOT EXISTS "${RAPIDJSON_INCLUDE_DIR}")
+    message(FATAL_ERROR "RapidJSON include directory not found: ${RAPIDJSON_INCLUDE_DIR}")
+endif()
 
 # Example: include directories
 target_include_directories(ib_parser
@@ -69,6 +77,7 @@ target_include_directories(ib_parser
     ${CMAKE_SOURCE_DIR}/storage/innobase/include
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}
+    ${RAPIDJSON_INCLUDE_DIR}
 )
 
 # If you need compile definitions

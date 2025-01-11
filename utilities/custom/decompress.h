@@ -30,6 +30,6 @@ bool decompress_ibd(File in_fd, File out_fd);
 bool determine_page_size(File file_in, page_size_t &page_sz);
 
 bool is_page_compressed(const unsigned char* page_data,
-                               size_t physical_size,
-                               size_t logical_size);
+                        size_t physical_size,
+                        size_t logical_size);
 
