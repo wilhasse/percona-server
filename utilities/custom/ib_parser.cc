@@ -90,11 +90,13 @@ static void usage() {
             << "Where <mode> is:\n"
             << "  1 = Decrypt only\n"
             << "  2 = Decompress only\n"
-            << "  3 = Decrypt then Decompress in a single pass\n\n"
+            << "  3 = Parser only\n"
+            << "  4 = Decrypt then Decompress in a single pass\n\n"
             << "Examples:\n"
             << "  ib_parser 1 <master_key_id> <server_uuid> <keyring_file> <ibd_path> <dest_path>\n"
             << "  ib_parser 2 <in_file.ibd> <out_file>\n"
-            << "  ib_parser 3 <master_key_id> <server_uuid> <keyring_file> <ibd_path> <dest_path>\n"
+            << "  ib_parser 3 <in_file.ibd>\n"
+            << "  ib_parser 4 <master_key_id> <server_uuid> <keyring_file> <ibd_path> <dest_path>\n"
             << std::endl;
 }
 
@@ -219,33 +221,56 @@ static int do_parse_main(int argc, char** argv)
   my_init();
   my_thread_init();
 
-  // 2) Open input .ibd file
+  // 2) *** DISCOVER PRIMARY INDEX ID *** using system "open + pread" approach
+  {
+    int sys_fd = ::open(in_file, O_RDONLY);
+    if (sys_fd < 0) {
+      perror("open");
+      return 1;
+    }
+    if (discover_primary_index_id(sys_fd) != 0) {
+      std::cerr << "Could not discover primary index from " << in_file << std::endl;
+      ::close(sys_fd);
+      my_thread_end();
+      my_end(0);
+      return 1;
+    }
+    ::close(sys_fd);
+  }
+
+  // 3) Now open the file with MySQL's my_open
   File in_fd = my_open(in_file, O_RDONLY, MYF(0));
   if (in_fd < 0) {
     std::cerr << "Cannot open file " << in_file << std::endl;
+    my_thread_end();
+    my_end(0);
     return 1;
   }
 
-  // 3) Determine page size (for 8KB,16KB, etc.)
+  // 4) Determine page size (for 8KB,16KB, etc.)
   page_size_t pg_sz(0, 0, false);
   if (!determine_page_size(in_fd, pg_sz)) {
     std::cerr << "Could not determine page size from " << in_file << "\n";
     my_close(in_fd, MYF(0));
+    my_thread_end();
+    my_end(0);
     return 1;
   }
   const size_t physical_page_size = pg_sz.physical();
 
-  // 4) Rewind to start
+  // 5) Rewind
   if (my_seek(in_fd, 0, MY_SEEK_SET, MYF(0)) == MY_FILEPOS_ERROR) {
     std::cerr << "Cannot seek to start of " << in_file << "\n";
     my_close(in_fd, MYF(0));
+    my_thread_end();
+    my_end(0);
     return 1;
   }
 
-  // 5) Allocate a buffer for reading pages
+  // 6) Allocate a buffer
   std::unique_ptr<unsigned char[]> page_buf(new unsigned char[physical_page_size]);
 
-  // 6) Page-by-page loop
+  // 7) Page-by-page loop
   uint64_t page_no = 0;
   while (true) {
     size_t rd = my_read(in_fd, page_buf.get(), physical_page_size, MYF(0));
@@ -254,19 +279,18 @@ static int do_parse_main(int argc, char** argv)
       break;
     }
     if (rd < physical_page_size) {
-      std::cerr << "Warning: partial page read at page "
-                << page_no << "\n";
+      std::cerr << "Warning: partial page read at page " << page_no << "\n";
       break;
     }
 
-    //--- If this is a leaf page (PAGE_LEVEL == 0), parse records
-    const ulint  page_level   = mach_read_from_2(page_buf.get() + PAGE_HEADER + PAGE_LEVEL);
-    const bool   is_leaf_page = (page_level == 0);
-
-    if (is_leaf_page) {
-      // Minimal example: parse records from page.
-      // This snippet calls a helper function like "parse_records_on_page()".
-      parse_records_on_page(page_buf.get(), physical_page_size, page_no);
+    // Check if page's index ID == primary
+    if (is_primary_index(page_buf.get())) {
+      // Now also check if it's a LEAF page
+      ulint page_level = mach_read_from_2(page_buf.get() + PAGE_HEADER + PAGE_LEVEL);
+      if (page_level == 0) {
+        // parse
+        parse_records_on_page(page_buf.get(), physical_page_size, page_no);
+      }
     }
 
     page_no++;
