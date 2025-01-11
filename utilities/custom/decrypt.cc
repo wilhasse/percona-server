@@ -325,7 +325,8 @@ bool decrypt_page_inplace(
 // ----------------------------------------------------------------
 bool decrypt_ibd_file(const char* src_ibd_path,
                       const char* dst_path,
-                      const Tablespace_key_iv& ts_key_iv)
+                      const Tablespace_key_iv& ts_key_iv,
+                      const bool compressed)
 {
   // 1) Open source file
   FILE* f_in = std::fopen(src_ibd_path, "rb");
@@ -343,11 +344,12 @@ bool decrypt_ibd_file(const char* src_ibd_path,
   }
 
   // 3) Read page by page, decrypt, write
-  unsigned char page_buf[PAGE_SIZE];
+  const size_t PAGE_SIZE = compressed ? 8192 : 16384;
+  std::vector<unsigned char> page_buf(PAGE_SIZE);
 
   uint64_t page_number = 0;
   while (true) {
-    size_t read_bytes = fread(page_buf, 1, PAGE_SIZE, f_in);
+    size_t read_bytes = fread(page_buf.data(), 1, PAGE_SIZE, f_in);
     if (read_bytes == 0) {
       // Probably end of file
       break;
@@ -361,7 +363,7 @@ bool decrypt_ibd_file(const char* src_ibd_path,
     }
 
     // Decrypt in place
-    if (!decrypt_page_inplace(page_buf, PAGE_SIZE,
+    if (!decrypt_page_inplace(page_buf.data(), PAGE_SIZE,
                               ts_key_iv.key, 32,
                               ts_key_iv.iv, 8*1024)) {
       std::cerr << "Failed to decrypt page #" << page_number << "\n";
@@ -371,7 +373,7 @@ bool decrypt_ibd_file(const char* src_ibd_path,
     }
 
     // Write the decrypted page
-    size_t written = fwrite(page_buf, 1, PAGE_SIZE, f_out);
+    size_t written = fwrite(page_buf.data(), 1, PAGE_SIZE, f_out);
     if (written < PAGE_SIZE) {
       std::cerr << "Failed to write page #" << page_number << "\n";
       std::fclose(f_in);

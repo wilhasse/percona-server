@@ -29,12 +29,56 @@
 #include <mysys_err.h>
 #include <mysqld_error.h>
 #include <fcntl.h>  // For O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC
+
+// InnoDB
 #include "page0size.h"  // Add this for page_size_t
+#include "fil0fil.h"      // for fsp_header_get_flags()
+#include "fsp0fsp.h"      // for fsp_flags_is_valid(), etc.
+
 
 // Your headers that declare "decrypt_page_inplace()", "decompress_page_inplace()",
 // "get_master_key()", "read_tablespace_key_iv()", etc.
 #include "decrypt.h"     // Contains e.g. decrypt_page_inplace(), get_master_key() ...
 #include "decompress.h"  // Contains e.g. decompress_page_inplace(), etc.
+
+// We assume a fixed 16K buffer for reading page 0, 
+// since the maximum InnoDB page size is 16K in many setups.
+// (If you allow 32K or 64K pages, you’ll need a bigger buffer.)
+static bool is_table_compressed(File in_fd)
+{
+    // Step 1: Seek to 0
+    if (my_seek(in_fd, 0, MY_SEEK_SET, MYF(0)) == MY_FILEPOS_ERROR) {
+        fprintf(stderr, "Error: cannot seek to start.\n");
+        return false; // default
+    }
+
+    // Step 2: Read up to 16 KB for page 0
+    unsigned char page0[UNIV_PAGE_SIZE_ORIG]; 
+    memset(page0, 0, sizeof(page0));
+
+    size_t r = my_read(in_fd, page0, sizeof(page0), MYF(0));
+    if (r < FIL_PAGE_DATA) {
+        fprintf(stderr, "Error: cannot read page 0.\n");
+        // For safety, return false => 'not compressed' as fallback
+        return false;
+    }
+
+    // Step 3: Extract the fsp flags from page 0
+    uint32_t flags = fsp_header_get_flags(page0);
+    if (!fsp_flags_is_valid(flags)) {
+        fprintf(stderr, "Error: fsp flags not valid on page 0.\n");
+        return false;
+    }
+
+    // Depending on MySQL version, the "space is compressed" bit
+    // is often tested by something like "FSP_FLAGS_GET_ZIP_SSIZE(flags) != 0"
+    // or "fsp_flags_is_compressed(flags)" if you have that helper.
+    // We'll demonstrate one possible check:
+    ulint zip_ssize = FSP_FLAGS_GET_ZIP_SSIZE(flags);
+    bool compressed = (zip_ssize != 0);
+
+    return compressed;
+}
 
 /** 
  * Minimal usage print 
@@ -85,11 +129,21 @@ static int do_decrypt_main(int argc, char** argv)
     return 1;
   }
 
-  // 3) read the tablespace key/IV
-  //    pick offset=10390 or 5270 or whichever is appropriate
+  // 3) Open .ibd for reading so we can see if it's compressed
+  File in_fd = my_open(ibd_path, O_RDONLY, MYF(0));
+  if (in_fd < 0) {
+    std::cerr << "Cannot open file " << ibd_path << std::endl;
+    return 1;
+  }
+  bool compressed = is_table_compressed(in_fd);
+  my_close(in_fd, MYF(0));
+
+  // -----------------------------
+  // 3a) read the tablespace key/IV
   // Compressed Page: Seek to offset 5270 (0x1496)
   // Uncompressed Page: Offset 10390 (0x2896)
-  long offset = 5270; 
+  // -----------------------------
+  long offset = compressed ? 5270 : 10390;
   Tablespace_key_iv ts_key_iv;
   if (!read_tablespace_key_iv(ibd_path, offset, master_key, ts_key_iv)) {
     std::cerr << "Could not read tablespace key\n";
@@ -97,7 +151,7 @@ static int do_decrypt_main(int argc, char** argv)
   }
 
   // 4) Decrypt the entire .ibd
-  if (!decrypt_ibd_file(ibd_path, dest_path, ts_key_iv)) {
+  if (!decrypt_ibd_file(ibd_path, dest_path, ts_key_iv, compressed)) {
     std::cerr << "Decrypt failed.\n";
     return 1;
   }
@@ -182,13 +236,24 @@ static int do_decrypt_then_decompress_main(int argc, char** argv)
     return 1;
   }
 
+  // (C) Open .ibd for reading so we can see if it's compressed
+  File in_fd = my_open(ibd_path, O_RDONLY, MYF(0));
+  if (in_fd < 0) {
+    std::cerr << "Cannot open file " << ibd_path << std::endl;
+    return 1;
+  }
+
+  bool compressed = is_table_compressed(in_fd);
+  my_close(in_fd, MYF(0));
+
   // -----------------------------
-  // (C) Read the tablespace key/IV
+  // (C.1) Read the tablespace key/IV
   //     If you already know the file is "encrypted & compressed" => offset=5270.
   //     Or if you know it's "encrypted & uncompressed" => offset=10390.
-  //     (In real logic, you'd detect from page 0, but we'll keep your existing approach.)
+  //  5270 (0x1496) => For "encrypted & compressed"  (8 KB physical, etc.)
+  // 10390 (0x2896) => For "encrypted & uncompressed" (16 KB pages).
   // -----------------------------
-  long offset = 5270; // e.g. compressed
+  long offset = compressed ? 5270 : 10390;
   Tablespace_key_iv ts_key_iv;
   if (!read_tablespace_key_iv(ibd_path, offset, master_key, ts_key_iv)) {
     std::cerr << "Could not read tablespace key\n";
@@ -199,7 +264,7 @@ static int do_decrypt_then_decompress_main(int argc, char** argv)
   // (D) Open input file with MySQL I/O or system I/O
   //     so we can run "determine_page_size()"
   // -----------------------------
-  File in_fd = my_open(ibd_path, O_RDONLY, MYF(0));
+  in_fd = my_open(ibd_path, O_RDONLY, MYF(0));
   if (in_fd < 0) {
     std::cerr << "Cannot open input file " << ibd_path << "\n";
     return 1;
