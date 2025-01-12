@@ -222,7 +222,7 @@ static int do_parse_main(int argc, char** argv)
 
   // Build a table_def_t from g_columns
   static table_def_t my_table;
-  if (build_table_def_from_json(&my_table, "HISTORICO") != 0) {
+  if (build_table_def_from_json(&my_table, "TESTE") != 0) {
     std::cerr << "Failed to build table_def_t from JSON.\n";
     return 1;
   }
@@ -286,6 +286,7 @@ static int do_parse_main(int argc, char** argv)
   table_definitions[0] = my_table;
   table_definitions_cnt = 1;
   init_table_defs(1);
+  debug_print_table_def(&my_table);
 
   // 6) Allocate a buffer
   std::unique_ptr<unsigned char[]> page_buf(new unsigned char[physical_page_size]);

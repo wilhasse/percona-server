@@ -66,6 +66,201 @@ static inline uint64_t read_uint64_from_page(const unsigned char* ptr) {
   return mach_read_from_8(ptr);
 }
 
+// If you used "my_rec_offs_*" from the "undrop" style code:
+extern ulint my_rec_offs_nth_size(const ulint* offsets, ulint i);
+extern bool  my_rec_offs_nth_extern(const ulint* offsets, ulint i);
+extern const unsigned char*
+       my_rec_get_nth_field(const rec_t* rec, const ulint* offsets,
+                            ulint i, ulint* len);
+
+// --------------------------------------------------------------------
+// 1) debug_print_table_def: print table->fields[] in a user-friendly way.
+void debug_print_table_def(const table_def_t *table)
+{
+    if (!table) {
+        printf("[debug_print_table_def] table is NULL\n");
+        return;
+    }
+
+    printf("=== Table Definition for '%s' ===\n", (table->name ? table->name : "(null)"));
+    printf("fields_count=%u, n_nullable=%u\n", table->fields_count, table->n_nullable);
+
+    // Possibly also print data_min_size / data_max_size if your code uses them:
+    // e.g. printf("data_min_size=%d, data_max_size=%ld\n",
+    //              table->data_min_size, table->data_max_size);
+
+    for (int i = 0; i < table->fields_count; i++) {
+        const field_def_t *fld = &table->fields[i];
+
+        // for "type" => we have an enum { FT_INT, FT_UINT, FT_CHAR, FT_TEXT, FT_DATETIME, FT_INTERNAL, etc. }
+        // We'll define a helper to map enum => string:
+        const char* type_str = nullptr;
+        switch (fld->type) {
+        case FT_INTERNAL:   type_str = "FT_INTERNAL"; break;
+        case FT_INT:        type_str = "FT_INT";      break;
+        case FT_UINT:       type_str = "FT_UINT";     break;
+        case FT_CHAR:       type_str = "FT_CHAR";     break;
+        case FT_TEXT:       type_str = "FT_TEXT";     break;
+        case FT_BLOB:       type_str = "FT_BLOB";     break;
+        case FT_DATETIME:   type_str = "FT_DATETIME"; break;
+        case FT_FLOAT:      type_str = "FT_FLOAT";    break;
+        case FT_DOUBLE:     type_str = "FT_DOUBLE";   break;
+        // ... if you have more, add them
+        default:            type_str = "FT_???";      break;
+        }
+
+        printf(" Field #%u:\n", i);
+        printf("   name=%s\n", (fld->name ? fld->name : "(null)"));
+        printf("   type=%s\n", type_str);
+        printf("   can_be_null=%s\n", (fld->can_be_null ? "true" : "false"));
+        printf("   fixed_length=%u\n", fld->fixed_length);
+        printf("   min_length=%u, max_length=%u\n", fld->min_length, fld->max_length);
+        printf("   decimal_precision=%d, decimal_digits=%d\n",
+               fld->decimal_precision, fld->decimal_digits);
+        printf("   time_precision=%d\n", fld->time_precision);
+    }
+    printf("=== End of Table Definition ===\n\n");
+}
+
+// --------------------------------------------------------------------
+// 2) debug_print_compact_row: read each field from offsets[] 
+//    and print in a "rough" typed format (e.g. int => 4 bytes, char => string).
+//
+//    This is for demonstration or debugging. 
+//    If your code calls "check_for_a_record(...)" first to build offsets, 
+//    you can then do:
+//      debug_print_compact_row(page, rec, table, offsets);
+// 
+void debug_print_compact_row(const page_t* page,
+                             const rec_t* rec,
+                             const table_def_t* table,
+                             const ulint* offsets)
+{
+    if (!page || !rec || !table || !offsets) {
+        printf("[debug_print_compact_row] invalid pointer(s)\n");
+        return;
+    }
+
+    // Print a header line or something
+    printf("Row at rec=%p => columns:\n", (const void*)rec);
+
+    // For each field
+    for (ulint i = 0; i < (ulint)table->fields_count; i++) {
+
+        // read the pointer and length
+        ulint field_len;
+        const unsigned char* field_ptr = my_rec_get_nth_field(rec, offsets, i, &field_len);
+
+        // If length is UNIV_SQL_NULL => print "NULL"
+        if (field_len == UNIV_SQL_NULL) {
+            printf("  [%2lu] %-15s => NULL\n", i, table->fields[i].name);
+            continue;
+        }
+
+        // Otherwise interpret based on "table->fields[i].type"
+        switch (table->fields[i].type) {
+        case FT_INT:
+        case FT_UINT:
+            // If it's truly a 4-byte int, let's read it:
+            if (field_len == 4) {
+                // typical InnoDB "int" might also do sign-flipping. 
+                // For a quick debug, let's do:
+                uint32_t val = 0;
+                memcpy(&val, field_ptr, 4);
+                // If you do sign-flipping => val ^= 0x80000000;
+                printf("  [%2lu] %-15s => (INT) %u\n",
+                       i, table->fields[i].name, val);
+            } else {
+                // length isn't 4 => just hex-dump or do naive printing
+                printf("  [%2lu] %-15s => (INT?) length=%lu => ",
+                       i, table->fields[i].name, (unsigned long)field_len);
+                for (ulint k=0; k<field_len && k<16; k++) {
+                    printf("%02X ", field_ptr[k]);
+                }
+                printf("\n");
+            }
+            break;
+
+        case FT_CHAR:
+        case FT_TEXT:
+            // Treat as textual => do a naive printing (limit ~200 bytes for safety)
+            {
+                ulint to_print = (field_len < 200 ? field_len : 200);
+                printf("  [%2lu] %-15s => (CHAR) len=%lu => \"", 
+                       i, table->fields[i].name, (unsigned long)field_len);
+                for (ulint k=0; k<to_print; k++) {
+                    unsigned char c = field_ptr[k];
+                    if (c >= 32 && c < 127) {
+                        putchar((int)c);
+                    } else {
+                        // print as \xNN
+                        printf("\\x%02X", c);
+                    }
+                }
+                if (field_len > 200) printf("...(truncated)...");
+                printf("\"\n");
+            }
+            break;
+
+        case FT_DATETIME:
+            // If we treat it as 5 or 8 bytes, let's do a mini decode
+            if (field_len == 5) {
+                // e.g. MySQL 5.6 DATETIME(0) in "COMPACT" 
+                // This is advanced, but let's just hex dump for now:
+                printf("  [%2lu] %-15s => (DATETIME-5) => ",
+                       i, table->fields[i].name);
+                for (ulint k=0; k<field_len; k++) {
+                    printf("%02X ", field_ptr[k]);
+                }
+                printf("\n");
+            } else if (field_len == 8) {
+                // older DATETIME
+                // same approach
+                printf("  [%2lu] %-15s => (DATETIME-8) => ",
+                       i, table->fields[i].name);
+                for (ulint k=0; k<8; k++) {
+                    printf("%02X ", field_ptr[k]);
+                }
+                printf("\n");
+            } else {
+                // fallback
+                printf("  [%2lu] %-15s => (DATETIME) length=%lu => raw hex ",
+                       i, table->fields[i].name, (unsigned long)field_len);
+                for (ulint k=0; k<field_len && k<16; k++) {
+                    printf("%02X ", field_ptr[k]);
+                }
+                printf("\n");
+            }
+            break;
+
+        case FT_INTERNAL:
+            // e.g. DB_TRX_ID(6 bytes) or DB_ROLL_PTR(7 bytes)
+            printf("  [%2lu] %-15s => (INTERNAL) length=%lu => ", 
+                   i, table->fields[i].name, (unsigned long)field_len);
+            for (ulint k=0; k<field_len && k<16; k++) {
+                printf("%02X ", field_ptr[k]);
+            }
+            printf("\n");
+            break;
+
+        // ... other types (FLOAT, DOUBLE, DECIMAL, BLOB, etc.)
+        default:
+            // fallback => hex-dump
+            printf("  [%2lu] %-15s => (type=%d) length=%lu => ",
+                   i, table->fields[i].name, table->fields[i].type,
+                   (unsigned long)field_len);
+            for (ulint k=0; k<field_len && k<16; k++) {
+                printf("%02X ", field_ptr[k]);
+            }
+            if (field_len>16) printf("...(truncated)...");
+            printf("\n");
+            break;
+        } // switch
+    }
+
+    printf("End of row\n\n");
+}
+
 /**
  * discover_primary_index_id():
  *   Scans all pages to find the *first* root page
@@ -163,30 +358,6 @@ bool is_primary_index(const unsigned char* page)
  *   @param[out] table    The table_def_t to fill
  *   @param[in]  tbl_name The table name (e.g. "HISTORICO")
  *   @return 0 on success
- */
-/**
- * build_table_def_from_json.cpp
- *
- * This function shows how you might parse the JSON column metadata more fully,
- * so your table_def_t->fields[i] also get "min_length", "max_length",
- * "can_be_null", "type=FT_UINT if unsigned", etc.
- */
-
-#include <cstdio>
-#include <cstdlib>  // for atoi
-#include <cstring>
-#include <string>
-#include <vector>
-
-// Suppose you have these from your environment:
-#include "tables_dict.h"  // table_def_t, field_def_t, etc.
-
-// This is your global "g_columns" describing columns from JSON
-// e.g. struct MyColumnDef { std::string name; std::string type_utf8; uint32_t length; ... };
-extern std::vector<MyColumnDef> g_columns;
-
-/**
- * Example: an expanded "build_table_def_from_json" that sets more details.
  */
 int build_table_def_from_json(table_def_t* table, const char* tbl_name)
 {
@@ -502,6 +673,9 @@ void parse_records_on_page(const unsigned char* page,
           rec, 
           table, 
           offsets);
+
+      // Debug data
+      debug_print_compact_row(page, rec, table, offsets);
 
       if (valid) {
         // (A.2) If valid => call process_ibrec() to print each column
