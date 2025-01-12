@@ -438,32 +438,6 @@ int build_table_def_from_json(table_def_t* table, const char* tbl_name)
         colcount++;
     }
 
-    // 4) Possibly add hidden columns if not already in g_columns
-    // e.g. DB_TRX_ID, DB_ROLL_PTR
-    // For example:
-    if (colcount + 2 <= MAX_TABLE_FIELDS) {
-        // DB_TRX_ID
-        field_def_t* trx = &table->fields[colcount++];
-        std::memset(trx, 0, sizeof(*trx));
-        trx->name         = strdup("DB_TRX_ID");
-        trx->type         = FT_INTERNAL;
-        trx->fixed_length = 6;
-        trx->can_be_null  = false;
-        // min_length=6, max_length=6 if you want consistent checks
-        trx->min_length   = 6;
-        trx->max_length   = 6;
-
-        // DB_ROLL_PTR
-        field_def_t* roll = &table->fields[colcount++];
-        std::memset(roll, 0, sizeof(*roll));
-        roll->name        = strdup("DB_ROLL_PTR");
-        roll->type        = FT_INTERNAL;
-        roll->fixed_length= 7;
-        roll->can_be_null = false;
-        roll->min_length  = 7;
-        roll->max_length  = 7;
-    }
-
     // 5) fields_count
     table->fields_count = colcount;
 
