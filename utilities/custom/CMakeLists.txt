@@ -50,6 +50,8 @@ set(DECOMPRESS_LIB_SOURCES
 set(IB_PARSER_MAIN
   ib_parser.cc
   parser.cc
+  tables_dict.cc
+  undrop_for_innodb.cc
 )
 
 # Combine them all for building a single binary "ib_parser"
@@ -74,9 +76,9 @@ endif()
 # Example: include directories
 target_include_directories(ib_parser
   PRIVATE
+    ${CMAKE_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/storage/innobase/include
     ${CMAKE_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}
     ${RAPIDJSON_INCLUDE_DIR}
 )
 

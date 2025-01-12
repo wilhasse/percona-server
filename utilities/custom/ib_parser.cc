@@ -220,7 +220,19 @@ static int do_parse_main(int argc, char** argv)
   // 0) Load table definition
   load_ib2sdi_table_columns(argv[2]);
 
-  // 1) MySQL init
+  // Build a table_def_t from g_columns
+  static table_def_t my_table;
+  if (build_table_def_from_json(&my_table, "HISTORICO") != 0) {
+    std::cerr << "Failed to build table_def_t from JSON.\n";
+    return 1;
+  }
+
+  // If your code uses the n_nullable field in ibrec_init_offsets_new():
+  my_table.n_nullable = 0;
+  for (int i = 0; i < my_table.fields_count; i++) {
+    if (my_table.fields[i].can_be_null) my_table.n_nullable++;
+  }
+    // 1) MySQL init
   my_init();
   my_thread_init();
 
@@ -269,6 +281,10 @@ static int do_parse_main(int argc, char** argv)
     my_end(0);
     return 1;
   }
+
+  // 6) [**CRUCIAL**] Overwrite table_definitions[] with your new table
+  table_definitions[0] = my_table;
+  table_definitions_cnt = 1;
 
   // 6) Allocate a buffer
   std::unique_ptr<unsigned char[]> page_buf(new unsigned char[physical_page_size]);

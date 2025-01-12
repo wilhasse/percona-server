@@ -22,6 +22,9 @@
 #include "fsp0fsp.h"    // FSP_SPACE_ID
 #include "fsp0types.h"  // btr_root_fseg_validate() signature
 
+#include "tables_dict.h"
+#include "undrop_for_innodb.h"
+
 /** A minimal column-definition struct */
 struct MyColumnDef {
     std::string name;            // e.g., "id", "name", ...
@@ -151,6 +154,101 @@ bool is_primary_index(const unsigned char* page)
 }
 
 /**
+ * build_table_def_from_json():
+ *   Creates a table_def_t from the columns in g_columns.
+ *   This way, you can pass table_def_t into ibrec_init_offsets_new().
+ *
+ *   @param[out] table    The table_def_t to fill
+ *   @param[in]  tbl_name The table name (e.g. "HISTORICO")
+ *   @return 0 on success
+ */
+int build_table_def_from_json(table_def_t* table, const char* tbl_name)
+{
+    // 1) Clear the entire struct
+    memset(table, 0, sizeof(table_def_t));
+
+    // 2) Set table name
+    table->name = strdup(tbl_name);
+
+    // 3) Fill table->fields[] from g_columns
+    unsigned colcount = 0;
+    for (size_t i = 0; i < g_columns.size(); i++) {
+        if (colcount >= MAX_TABLE_FIELDS) {
+            fprintf(stderr, "[Error] Too many columns (>MAX_TABLE_FIELDS)\n");
+            return 1;
+        }
+
+        field_def_t* fld = &table->fields[colcount];
+        memset(fld, 0, sizeof(*fld));
+
+        // Copy the name
+        fld->name = strdup(g_columns[i].name.c_str());
+
+        // Decide the "type" (a simplified mapping)
+        // If "int" -> FT_INT; if "char" -> FT_CHAR, etc.:
+        if (g_columns[i].type_utf8.find("int") != std::string::npos) {
+            fld->type = FT_INT;
+            fld->fixed_length = 4; // typical for "int"
+        } else if (g_columns[i].type_utf8.find("char") != std::string::npos) {
+            fld->type = FT_CHAR;
+            fld->fixed_length = g_columns[i].length; 
+            fld->max_length   = g_columns[i].length;
+        } else if (g_columns[i].type_utf8.find("datetime") != std::string::npos) {
+            fld->type         = FT_DATETIME;
+            // Undrop sometimes sets 5 bytes for 5.6 format with fractional seconds
+            // or 8 bytes for older. Adapt as needed:
+            fld->fixed_length = 5;
+        } else {
+            // fallback
+            fld->type = FT_CHAR;
+            fld->fixed_length = g_columns[i].length;
+            fld->max_length   = g_columns[i].length;
+        }
+
+        // Mark "can_be_null" if you like, or get it from JSON
+        fld->can_be_null = true;
+
+        // Possibly set min_length, max_length, decimal_digits, etc.
+
+        colcount++;
+    }
+
+    // 4) Possibly add hidden columns if they’re not already in g_columns
+    //    For example, DB_TRX_ID + DB_ROLL_PTR. If you do that in your grammar
+    //    automatically, skip this. Otherwise:
+    if (colcount + 2 < MAX_TABLE_FIELDS) {
+        // DB_TRX_ID
+        field_def_t *trx = &table->fields[colcount++];
+        memset(trx, 0, sizeof(*trx));
+        trx->name          = strdup("DB_TRX_ID");
+        trx->type          = FT_INTERNAL;
+        trx->fixed_length  = 6;
+        trx->can_be_null   = false;
+
+        // DB_ROLL_PTR
+        field_def_t *roll = &table->fields[colcount++];
+        memset(roll, 0, sizeof(*roll));
+        roll->name         = strdup("DB_ROLL_PTR");
+        roll->type         = FT_INTERNAL;
+        roll->fixed_length = 7;
+        roll->can_be_null  = false;
+    }
+
+    // 5) Set the fields_count
+    table->fields_count = colcount;
+
+    // 6) Optionally compute table->n_nullable if needed by ibrec_init_offsets_new()
+    //    Some code in undrop uses table->n_nullable to help parse the “null bits.”
+    //    Example:
+    //    table->n_nullable = 0;
+    //    for (unsigned i=0; i<colcount; i++) {
+    //       if (table->fields[i].can_be_null) table->n_nullable++;
+    //    }
+
+    return 0;
+}
+
+/**
  * load_ib2sdi_table_columns():
  *   Parses an ib2sdi-generated JSON file (like the one you pasted),
  *   searches for the array element that has "dd_object_type" == "Table",
@@ -270,59 +368,6 @@ int load_ib2sdi_table_columns(const char* json_path)
 }
 
 /**
- * parse_and_print_record():
- *   Given the page buffer + offset, read each column 
- *   from g_columns, and print their values.
- *
- *   This is very simplistic: it treats "int" as 4 bytes,
- *   "char"/"varchar" as 'length' bytes, etc.
- *   Adapt as needed for real InnoDB row formats.
- */
-static void parse_and_print_record(const unsigned char* page,
-                                   size_t page_size,
-                                   ulint rec_offset)
-{
-    // For a real solution, you'd want the "rec" pointer, etc.
-    // We'll do a minimal approach:
-    const rec_t* rec = reinterpret_cast<const rec_t*>(page + rec_offset);
-
-    // Example: you might check rec_get_status(rec) or rec_get_deleted_flag()
-
-    std::cout << "  Parsing record at offset " << rec_offset << "...\n";
-
-    // Loop over the columns from the JSON
-    for (size_t i = 0; i < g_columns.size(); i++) {
-        const MyColumnDef& col = g_columns[i];
-
-        // For demonstration, we assume columns are laid out in 
-        // a fixed offset: i.e. col i starts at offset (some calculation).
-        // This is NOT how real InnoDB row format works! 
-        // In real code, you’d build field offsets with rec_offs_* logic 
-        // or the undrop approach. 
-        // We'll do a naive offset = sum of previous columns' lengths:
-        static size_t cumulative_offset = 0; 
-        // obviously you'd store these offsets in a global array or something.
-
-        std::cout << "    Column '" << col.name << "' = ";
-
-        if (col.type_utf8 == "int") {
-            // read 4 bytes, maybe do sign flipping
-            uint32_t val = mach_read_from_4((byte*)rec + cumulative_offset);
-            val ^= 0x80000000; // if you do that in your table
-            std::cout << val << "\n";
-            cumulative_offset += 4;
-        } else {
-            // char or varchar
-            std::string s((char*)rec + cumulative_offset, col.length);
-            std::cout << s << "\n";
-            cumulative_offset += col.length;
-        }
-    }
-
-    // Possibly read hidden columns (DB_TRX_ID, DB_ROLL_PTR) if you want.
-}
-
-/**
  * Example: parse and print records from a leaf page.
  * Very minimal, ignoring many corner cases.
  *
@@ -335,42 +380,40 @@ void parse_records_on_page(const unsigned char* page,
 {
   // 1) Check if this page belongs to the primary index
   if (!is_primary_index(page)) {
-    // Not primary => skip
+    return; // Not primary => skip
+  }
+
+  // 2) Check if it’s a LEAF page
+  ulint page_level = mach_read_from_2(page + PAGE_HEADER + PAGE_LEVEL);
+  if (page_level != 0) {
+    // Non-leaf => skip
     return;
   }
 
-  // 2) Check page level
-  ulint level = mach_read_from_2(page + PAGE_HEADER + PAGE_LEVEL);
-  if (level != 0) {
-    // Not a leaf => skip
-    return;
-  }
+  std::cout << "Page " << page_no 
+            << " is primary index leaf. Parsing records.\n";
 
-  // From here on, we know it’s a leaf of the primary index
-  std::cout << "Page " << page_no << " is primary index leaf. Parsing records.\n";
-
-  // 3) Check if it's compact or redundant
+  // 3) Check if COMPACT or REDUNDANT
   bool is_compact = page_is_comp(page);
 
-  // 4) We find the "infimum" / "supremum" offsets
+  // 4) infimum / supremum offsets
   ulint inf_offset = (is_compact) ? PAGE_NEW_INFIMUM : PAGE_OLD_INFIMUM;
   ulint sup_offset = (is_compact) ? PAGE_NEW_SUPREMUM : PAGE_OLD_SUPREMUM;
 
-  // 5) Basic loop from infimum -> supremum
+  // 5) Loop from infimum -> supremum
   ulint rec_offset = inf_offset;
   ulint n_records  = 0;
 
   while (rec_offset != sup_offset) {
     // Safety checks
     if (rec_offset < 2 || rec_offset + 2 > page_size) {
-      // Corrupted pointer
+      // Looks corrupted => break
       break;
     }
 
-    // Next record pointer is stored differently in compact vs. redundant
+    // Next record pointer is stored differently in COMPACT vs. REDUNDANT
     ulint next_off;
     if (is_compact) {
-      // The last 2 bytes before the record store the "next" offset
       next_off = mach_read_from_2(page + rec_offset - 2);
       next_off = rec_offset + next_off;
     } else {
@@ -378,19 +421,35 @@ void parse_records_on_page(const unsigned char* page,
       next_off = mach_read_from_2(page + rec_offset - 2);
     }
 
-    // Skip the infimum record itself
+    // skip infimum
     if (rec_offset != inf_offset) {
-      // Attempt to parse or print this record
       n_records++;
-      std::cout << "  - Found record at offset " << rec_offset
-                << " (page " << page_no << ")\n";
+      std::cout << "  - Found record at offset " 
+                << rec_offset << " (page " << page_no << ")\n";
+
+      // (A) We'll do the undrop approach: check_for_a_record() => if valid => process_ibrec()
+      rec_t* rec = (rec_t*)(page + rec_offset);
+      ulint offsets[MAX_TABLE_FIELDS + 2];
+
+      // Using the JSON-based table you previously set
+      table_def_t* table = &table_definitions[0];
+
+      // (A.1) Attempt to build offsets + check constraints
+      bool valid = check_for_a_record(
+          (page_t*)page, 
+          rec, 
+          table, 
+          offsets);
+
+      if (valid) {
+        // (A.2) If valid => call process_ibrec() to print each column
+        bool hex_output = false; // or true if you want hex strings
+        process_ibrec((page_t*)page, rec, table, offsets, hex_output);
+      }
     }
 
-    // **Here** we call parse_and_print_record to interpret columns
-    parse_and_print_record(page, page_size, rec_offset);
-      
     if (next_off == rec_offset || next_off >= page_size) {
-      // Corruption or end
+      // corruption or end
       break;
     }
     rec_offset = next_off;
