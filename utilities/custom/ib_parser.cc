@@ -282,9 +282,10 @@ static int do_parse_main(int argc, char** argv)
     return 1;
   }
 
-  // 6) [**CRUCIAL**] Overwrite table_definitions[] with your new table
+  // 6) Overwrite table_definitions[] with your new table and init table defs
   table_definitions[0] = my_table;
   table_definitions_cnt = 1;
+  init_table_defs(1);
 
   // 6) Allocate a buffer
   std::unique_ptr<unsigned char[]> page_buf(new unsigned char[physical_page_size]);

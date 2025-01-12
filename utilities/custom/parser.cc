@@ -30,6 +30,8 @@ struct MyColumnDef {
     std::string name;            // e.g., "id", "name", ...
     std::string type_utf8;       // e.g., "int", "char", "varchar"
     uint32_t    length;          // For char(N), the N, or 4 if int
+    bool        is_nullable;     // Add this
+    bool        is_unsigned;     // Add this too since it's used
 };
 
 /** We store the columns here, loaded from JSON. */
@@ -162,15 +164,39 @@ bool is_primary_index(const unsigned char* page)
  *   @param[in]  tbl_name The table name (e.g. "HISTORICO")
  *   @return 0 on success
  */
+/**
+ * build_table_def_from_json.cpp
+ *
+ * This function shows how you might parse the JSON column metadata more fully,
+ * so your table_def_t->fields[i] also get "min_length", "max_length",
+ * "can_be_null", "type=FT_UINT if unsigned", etc.
+ */
+
+#include <cstdio>
+#include <cstdlib>  // for atoi
+#include <cstring>
+#include <string>
+#include <vector>
+
+// Suppose you have these from your environment:
+#include "tables_dict.h"  // table_def_t, field_def_t, etc.
+
+// This is your global "g_columns" describing columns from JSON
+// e.g. struct MyColumnDef { std::string name; std::string type_utf8; uint32_t length; ... };
+extern std::vector<MyColumnDef> g_columns;
+
+/**
+ * Example: an expanded "build_table_def_from_json" that sets more details.
+ */
 int build_table_def_from_json(table_def_t* table, const char* tbl_name)
 {
-    // 1) Clear the entire struct
-    memset(table, 0, sizeof(table_def_t));
+    // 1) Zero out "table_def_t"
+    std::memset(table, 0, sizeof(table_def_t));
 
-    // 2) Set table name
+    // 2) Copy the table name
     table->name = strdup(tbl_name);
 
-    // 3) Fill table->fields[] from g_columns
+    // 3) Loop over columns
     unsigned colcount = 0;
     for (size_t i = 0; i < g_columns.size(); i++) {
         if (colcount >= MAX_TABLE_FIELDS) {
@@ -179,71 +205,107 @@ int build_table_def_from_json(table_def_t* table, const char* tbl_name)
         }
 
         field_def_t* fld = &table->fields[colcount];
-        memset(fld, 0, sizeof(*fld));
+        std::memset(fld, 0, sizeof(*fld));
 
-        // Copy the name
+        // (A) Name
         fld->name = strdup(g_columns[i].name.c_str());
 
-        // Decide the "type" (a simplified mapping)
-        // If "int" -> FT_INT; if "char" -> FT_CHAR, etc.:
+        // (B) is_nullable => can_be_null
+        // If the JSON had is_nullable => g_columns[i].nullable, adapt.
+        // Let's assume we store is_nullable in g_columns[i].is_nullable:
+        fld->can_be_null = g_columns[i].is_nullable;
+
+        // (C) If the JSON had "is_unsigned" => store or adapt type
+        // For example, if we see "int" + is_unsigned => FT_UINT
+        bool is_unsigned = g_columns[i].is_unsigned; // e.g. from JSON
+
+        // (D) "type_utf8" => decide the main field type
         if (g_columns[i].type_utf8.find("int") != std::string::npos) {
-            fld->type = FT_INT;
-            fld->fixed_length = 4; // typical for "int"
+            if (is_unsigned) {
+                fld->type = FT_UINT;
+            } else {
+                fld->type = FT_INT;
+            }
+            // 4 bytes typical
+            fld->fixed_length = 4;
+            // For check_fields_sizes => maybe min_length=4, max_length=4
+            fld->min_length = 4;
+            fld->max_length = 4;
+
         } else if (g_columns[i].type_utf8.find("char") != std::string::npos) {
+            // Suppose "char(N)" => fixed_length = N
+            // or "varchar(N)" => fixed_length=0, max_length=N
+            // For a simplistic approach, do:
             fld->type = FT_CHAR;
-            fld->fixed_length = g_columns[i].length; 
-            fld->max_length   = g_columns[i].length;
+            // if we see something like "char(1)", we do:
+            fld->fixed_length = 0; // treat as variable
+            fld->min_length = 0;
+            fld->max_length = g_columns[i].length; 
+            // (If your code wants a truly fixed CHAR(1), you can do that logic.)
+
         } else if (g_columns[i].type_utf8.find("datetime") != std::string::npos) {
+            // Usually datetime is 5 or 8 bytes in "undrop" logic
             fld->type         = FT_DATETIME;
-            // Undrop sometimes sets 5 bytes for 5.6 format with fractional seconds
-            // or 8 bytes for older. Adapt as needed:
-            fld->fixed_length = 5;
+            fld->fixed_length = 5; // or 8
+            // min_length=5, max_length=5 for check_fields_sizes
+            fld->min_length   = 5;
+            fld->max_length   = 5;
+
         } else {
-            // fallback
-            fld->type = FT_CHAR;
-            fld->fixed_length = g_columns[i].length;
+            // fallback => treat as text
+            fld->type = FT_TEXT;
+            fld->fixed_length = 0; 
+            fld->min_length   = 0;
+            // if JSON has "char_length" => we do
             fld->max_length   = g_columns[i].length;
         }
 
-        // Mark "can_be_null" if you like, or get it from JSON
-        fld->can_be_null = true;
+        // (E) Possibly parse numeric precision, scale => decimal_digits, etc.
+        // (F) Possibly parse "char_length" => do above or below.
 
-        // Possibly set min_length, max_length, decimal_digits, etc.
-
+        // done
         colcount++;
     }
 
-    // 4) Possibly add hidden columns if they’re not already in g_columns
-    //    For example, DB_TRX_ID + DB_ROLL_PTR. If you do that in your grammar
-    //    automatically, skip this. Otherwise:
-    if (colcount + 2 < MAX_TABLE_FIELDS) {
+    // 4) Possibly add hidden columns if not already in g_columns
+    // e.g. DB_TRX_ID, DB_ROLL_PTR
+    // For example:
+    if (colcount + 2 <= MAX_TABLE_FIELDS) {
         // DB_TRX_ID
-        field_def_t *trx = &table->fields[colcount++];
-        memset(trx, 0, sizeof(*trx));
-        trx->name          = strdup("DB_TRX_ID");
-        trx->type          = FT_INTERNAL;
-        trx->fixed_length  = 6;
-        trx->can_be_null   = false;
+        field_def_t* trx = &table->fields[colcount++];
+        std::memset(trx, 0, sizeof(*trx));
+        trx->name         = strdup("DB_TRX_ID");
+        trx->type         = FT_INTERNAL;
+        trx->fixed_length = 6;
+        trx->can_be_null  = false;
+        // min_length=6, max_length=6 if you want consistent checks
+        trx->min_length   = 6;
+        trx->max_length   = 6;
 
         // DB_ROLL_PTR
-        field_def_t *roll = &table->fields[colcount++];
-        memset(roll, 0, sizeof(*roll));
-        roll->name         = strdup("DB_ROLL_PTR");
-        roll->type         = FT_INTERNAL;
-        roll->fixed_length = 7;
-        roll->can_be_null  = false;
+        field_def_t* roll = &table->fields[colcount++];
+        std::memset(roll, 0, sizeof(*roll));
+        roll->name        = strdup("DB_ROLL_PTR");
+        roll->type        = FT_INTERNAL;
+        roll->fixed_length= 7;
+        roll->can_be_null = false;
+        roll->min_length  = 7;
+        roll->max_length  = 7;
     }
 
-    // 5) Set the fields_count
+    // 5) fields_count
     table->fields_count = colcount;
 
-    // 6) Optionally compute table->n_nullable if needed by ibrec_init_offsets_new()
-    //    Some code in undrop uses table->n_nullable to help parse the “null bits.”
-    //    Example:
-    //    table->n_nullable = 0;
-    //    for (unsigned i=0; i<colcount; i++) {
-    //       if (table->fields[i].can_be_null) table->n_nullable++;
-    //    }
+    // 6) Optionally compute table->n_nullable
+    table->n_nullable = 0;
+    for (unsigned i = 0; i < colcount; i++) {
+        if (table->fields[i].can_be_null) {
+            table->n_nullable++;
+        }
+    }
+
+    // optionally set data_max_size, data_min_size
+    // or do so in your calling code if you want consistent row checks.
 
     return 0;
 }
