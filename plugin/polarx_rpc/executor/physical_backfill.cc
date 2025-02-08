@@ -458,7 +458,8 @@ void Physical_backfill::normalize_table_name_low(char *norm_name,
   char *db_ptr;
   unsigned long int db_len;
   char *ptr;
-  unsigned long int norm_len;
+  /* Percona warning */
+  //unsigned long int norm_len;
 
 #ifdef _WIN32
   bool set_lower_case = 1;
@@ -494,7 +495,8 @@ void Physical_backfill::normalize_table_name_low(char *norm_name,
 
   db_ptr = ptr + 1;
 
-  norm_len = db_len + name_len + sizeof "/";
+  /* Percona */
+  //norm_len = db_len + name_len + sizeof "/";
   //LIKELY(norm_len < FN_REFLEN - 1);
 
   memcpy(norm_name, db_ptr, db_len);
