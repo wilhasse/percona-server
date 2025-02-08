@@ -869,7 +869,7 @@ int UnqualifiedCountIterator::Read() {
   // If we are outputting to a temporary table, we need to copy the results
   // into it here. It is also used for nonaggregated items, even when there are
   // no temporary tables involved.
-  if (copy_funcs(&m_join->tmp_table_param, m_join->thd)) {
+  if (copy_funcs(m_join->tmp_table_param, m_join->thd)) {
     return 1;
   }
 

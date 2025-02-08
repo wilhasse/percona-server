@@ -33,6 +33,7 @@
 #include "sql/handler.h"
 #include "sql/range_optimizer/range_optimizer.h"
 #include "sql/range_optimizer/rowid_capable_row_iterator.h"
+#include "sql/sql_optimizer.h"
 
 class KEY_PART_INFO;
 class RANGE_OPT_PARAM;

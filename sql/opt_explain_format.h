@@ -93,6 +93,7 @@ enum Extra_tag {
   ET_SKIP_RECORDS_IN_RANGE,
   ET_USING_SECONDARY_ENGINE,
   ET_REMATERIALIZE,
+  ET_PARALLEL_EXE,
   //------------------------------------
   ET_total
 };
@@ -133,7 +134,7 @@ class context;
 }
 
 // Table modification type
-enum enum_mod_type { MT_NONE, MT_INSERT, MT_UPDATE, MT_DELETE, MT_REPLACE };
+enum enum_mod_type { MT_NONE, MT_INSERT, MT_UPDATE, MT_DELETE, MT_REPLACE, MT_GATHER };
 
 /**
   Helper class for table property buffering
@@ -536,6 +537,9 @@ class Explain_format {
     @retval false       Format is not Iterator-based.
   */
   virtual bool is_iterator_based() const { return false; }
+
+  //可能不用加的???
+  virtual bool is_json() const { return false; }
 
   /**
     Send EXPLAIN header item(s) to output stream

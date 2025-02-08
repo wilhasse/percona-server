@@ -63,10 +63,8 @@ class Protocol_classic : public Protocol {
   String convert;
   uint field_pos;
   bool send_metadata;
-#ifndef NDEBUG
   enum enum_field_types *field_types;
   uint count;
-#endif
   uint field_count;
   uint sending_flags;
   ulong input_packet_length;

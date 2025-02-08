@@ -400,8 +400,10 @@ TRUNCATE performance_schema.file_summary_by_event_name;
 eval $hash_join_file_operations;
 SELECT COUNT(*) FROM t2 WHERE (t2.i) IN (SELECT t1.i FROM t1);
 --skip_if_hypergraph  # Does not use weedout, so does not need row ID, and thus does not spill to disk.
-eval $hash_join_file_operations;
-
+if (!$PQ_TEST)
+{
+  eval $hash_join_file_operations;
+}
 DROP TABLE t1, t2;
 SET join_buffer_size = DEFAULT;
 SET optimizer_switch = DEFAULT;

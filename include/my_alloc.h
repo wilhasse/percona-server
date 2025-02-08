@@ -46,6 +46,9 @@
 #include "my_pointer_arithmetic.h"
 #include "mysql/psi/psi_memory.h"
 
+typedef void CallBackFunc(PSI_memory_key key, size_t length, unsigned int id) ;
+const int PQ_MEMORY_USED_BUCKET = 16;
+
 #if defined(MYSQL_SERVER)
 extern "C" void sql_alloc_error_handler();
 #endif
@@ -143,28 +146,7 @@ struct MEM_ROOT {
    *
    * The returned pointer will always be 8-aligned.
    */
-  void *Alloc(size_t length) MY_ATTRIBUTE((malloc)) {
-    length = ALIGN_SIZE(length);
-
-    // Skip the straight path if simulating OOM; it should always fail.
-    DBUG_EXECUTE_IF("simulate_out_of_memory", return AllocSlow(length););
-
-    // Fast path, used in the majority of cases. It would be faster here
-    // (saving one register due to CSE) to instead test
-    //
-    //   m_current_free_start + length <= m_current_free_end
-    //
-    // but it would invoke undefined behavior, and in particular be prone
-    // to wraparound on 32-bit platforms.
-    if (static_cast<size_t>(m_current_free_end - m_current_free_start) >=
-        length) {
-      void *ret = m_current_free_start;
-      m_current_free_start += length;
-      return ret;
-    }
-
-    return AllocSlow(length);
-  }
+  void *Alloc(size_t length) MY_ATTRIBUTE((malloc));
 
   void *Alloc_aligned(size_t length, size_t alignment) MY_ATTRIBUTE((malloc)) {
     void *ptr = Alloc(length + alignment);
@@ -426,6 +408,12 @@ struct MEM_ROOT {
   void (*m_error_handler)(void) = nullptr;
 
   PSI_memory_key m_psi_key = 0;
+
+ public:
+  CallBackFunc *allocCBFunc = nullptr;
+
+  CallBackFunc *freeCBFunc = nullptr;  
+
 };
 
 /**

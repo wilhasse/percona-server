@@ -160,6 +160,7 @@ SELECT SLEEP(0.1);
 # works
 --source include/start_mysqld.inc
 --echo # Check rows which are not modified by parallel load
+--sleep 1
 SELECT col1 FROM dbredoopt.t1 WHERE col1%50=0 AND (col1 < 501 AND col1 > 0 );
 
 --echo # Check rows which are updated by parallel load

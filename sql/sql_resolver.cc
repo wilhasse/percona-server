@@ -190,6 +190,8 @@ bool Query_block::prepare(THD *thd, mem_root_deque<Item *> *insert_field_list) {
 
   Query_expression *const unit = master_query_expression();
 
+  if (has_windows()) saved_windows_elements = m_windows.elements;
+
   if (!m_table_nest.empty()) propagate_nullability(&m_table_nest, false);
 
   /*
@@ -597,6 +599,15 @@ bool Query_block::prepare(THD *thd, mem_root_deque<Item *> *insert_field_list) {
   // in the presence of ROLLUP.
   if (olap == ROLLUP_TYPE && resolve_rollup_wfs(thd))
     return true; /* purecov: inspected */
+
+  if (thd->m_suite_for_pq == PqConditionStatus::ENABLED) {
+    if (group_list.elements > 0)
+      fix_prepare_information_for_order(thd, &group_list,
+                                        &saved_group_list_ptrs);
+    if (order_list.elements > 0)
+      fix_prepare_information_for_order(thd, &order_list,
+                                        &saved_order_list_ptrs);
+  }
 
   assert(!thd->is_error());
   return false;
@@ -4291,9 +4302,17 @@ bool find_order_in_list(THD *thd, Ref_item_array ref_item_array,
     order->in_field_list = true;
     return false;
   }
+
+  // if (thd->parallel_exec && !order->in_field_list) {
+  //   /* Lookup the current GROUP/ORDER field in the SELECT clause. */
+  //   if(find_item_in_list(thd, order_item, fields, &select_item, &counter, &resolution))
+  //     return false;
+  //   return true;
+  // }
+
+  // 这里跟原来的有点不一致, 不知道会不会在什么情况下出现异常
   /* Lookup the current GROUP/ORDER field in the SELECT clause. */
-  if (find_item_in_list(thd, order_item, fields, &select_item, &counter,
-                        &resolution)) {
+  if(find_item_in_list(thd, order_item, fields, &select_item, &counter, &resolution)){
     return true;
   }
 
@@ -4319,7 +4338,7 @@ bool find_order_in_list(THD *thd, Ref_item_array ref_item_array,
          order_item_type == Item::FIELD_ITEM) ||
         order_item_type == Item::REF_ITEM) {
       from_field = find_field_in_tables(thd, (Item_ident *)order_item, tables,
-                                        nullptr, &view_ref, IGNORE_ERRORS, true,
+                                        nullptr, &view_ref, IGNORE_ERRORS, !thd->pq_leader,
                                         // view_ref is a local variable, so
                                         // don't record a change to roll back:
                                         false);

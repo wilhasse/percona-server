@@ -934,7 +934,7 @@ static void debug_sync_remove_action(st_debug_sync_control *ds_control,
   DBUG_TRACE;
   assert(ds_control);
   assert(current_thd == nullptr ||
-         ds_control == current_thd->debug_sync_control);
+         ds_control == current_thd->debug_sync_control || ds_control == current_thd->pq_leader->debug_sync_control);
   assert(action);
   assert(dsp_idx < ds_control->ds_active);
 

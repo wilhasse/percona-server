@@ -10090,6 +10090,25 @@ ER_LOG_NAME_NOT_MATCHING_SEC_LOG_PATH_CLIENT
 # End of Percona Server 8.0 client messages
 #
 
+
+################################################################################
+# Error numbers starting at 7500: server-to-client messages hwsql
+#
+# Start of hwsql error messages (error log).
+#
+
+start-error-number 7500
+
+ER_PARALLEL_FAIL_INIT
+  eng "Failed to parallel execute. this SQL is not supported."
+
+ER_WARN_BAD_PARALLEL_NUM
+  eng "Incorrect number for degree of parallel"
+
+ER_PARALLEL_EXEC_ERROR
+  eng "Parallel execution error"
+
+
 #
 # Start of MyRocks specific messages to be sent to client
 #

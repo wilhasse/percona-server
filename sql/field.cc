@@ -40,6 +40,7 @@
 #include <optional>
 
 #include "decimal.h"
+#include "mem_root_deque.h"
 #include "m_string.h"
 #include "my_alloc.h"
 #include "my_byteorder.h"
@@ -58,6 +59,7 @@
 #include "sql/dd/types/table.h"
 #include "sql/dd_table_share.h"     // dd_get_old_field_type
 #include "sql/derror.h"             // ER_THD
+#include "sql/error_handler.h" 
 #include "sql/filesort.h"           // change_double_for_sort
 #include "sql/gis/rtree_support.h"  // get_mbr_from_store
 #include "sql/gis/srid.h"
@@ -78,13 +80,17 @@
 #include "sql/sql_base.h"
 #include "sql/sql_class.h"              // THD
 #include "sql/sql_exception_handler.h"  // handle_std_exception
+#include "sql/sql_executor.h"
+#include "sql/sql_insert.h"
 #include "sql/sql_lex.h"
+#include "sql/sql_prepare.h"
 #include "sql/sql_time.h"       // str_to_datetime_with_warn
 #include "sql/sql_tmp_table.h"  // create_tmp_field
 #include "sql/srs_fetcher.h"
 #include "sql/stateless_allocator.h"
 #include "sql/strfunc.h"  // find_type2
 #include "sql/system_variables.h"
+#include "sql/table_function.h"
 #include "sql/time_zone_common.h"
 #include "sql/transaction_info.h"
 #include "sql/tztime.h"      // Time_zone
@@ -1905,6 +1911,22 @@ uchar *Field::pack(uchar *to, const uchar *from, size_t max_length) const {
   return to + length;
 }
 
+/*
+ * store extra info. (a.k.a. Aggr.->count) into Field
+ *
+ * @param   extra    the value of Aggr.->count
+ * @param   len      the length of (Aggr.->count), i.e., sizeof(longlong)
+ */
+type_conversion_status Field::store_extra(const uchar *extra, size_t len) {
+  if(len == 0 || extra == nullptr) {
+    return TYPE_OK;
+  }
+  assert(pack_length() >= len);
+  uchar *extra_ptr = ptr + pack_length() - len;
+  memcpy(extra_ptr,extra,len);
+  return TYPE_OK;
+}
+
 /**
    Unpack a field from row data.
 
@@ -2790,7 +2812,9 @@ Field_new_decimal::Field_new_decimal(uint32 len_arg, bool is_nullable_arg,
   bin_size = my_decimal_get_binary_size(precision, dec);
 }
 
-Field *Field_new_decimal::create_from_item(const Item *item) {
+Field *Field_new_decimal::create_from_item(const Item *item, MEM_ROOT *root) {
+  MEM_ROOT *pq_check_root = root ? root : *THR_MALLOC;
+
   uint8 dec = item->decimals;
   uint8 intg = item->decimal_precision() - dec;
   uint32 len = item->max_char_length();
@@ -2826,7 +2850,7 @@ Field *Field_new_decimal::create_from_item(const Item *item) {
       /* Corrected value fits. */
       len = required_length;
   }
-  return new (*THR_MALLOC)
+  return new (pq_check_root)
       Field_new_decimal(len, item->is_nullable(), item->item_name.ptr(), dec,
                         item->unsigned_flag);
 }

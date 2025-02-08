@@ -73,11 +73,10 @@ extern PSI_memory_key key_memory_String_value;
   Don't add new members or virtual methods to this class!
 */
 class Simple_cstring {
- private:
+ public:
   const char *m_str;
   size_t m_length;
 
- public:
   /**
     Initialize from a C string whose length is already known.
   */

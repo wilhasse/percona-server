@@ -279,7 +279,7 @@ inline void ResolveQueryBlock(
   query_block->join->fields = &query_block->fields;
   query_block->join->alloc_func_list();
   SetJoinConditions(query_block->m_table_nest);
-  count_field_types(query_block, &query_block->join->tmp_table_param,
+  count_field_types(query_block, query_block->join->tmp_table_param,
                     query_block->fields, /*reset_with_sum_func=*/false,
                     /*save_sum_fields=*/false);
 

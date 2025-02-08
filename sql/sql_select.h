@@ -209,7 +209,20 @@ class Key_use {
         fanout(0.0),
         read_cost(0.0) {}
 
-  Table_ref *table_ref;  ///< table owning the index
+  Table_ref *table_ref;  ///< table owning the index        
+
+  Key_use *pq_clone(THD *thd) {
+    Key_use *new_key_use = new (thd->pq_mem_root) Key_use(
+        nullptr, nullptr, used_tables, key, keypart, optimize, keypart_map,
+        ref_table_rows, null_rejecting, cond_guard, sj_pred_no);
+    if (new_key_use != nullptr) {
+      new_key_use->bound_keyparts = bound_keyparts;
+      new_key_use->fanout = fanout;
+      new_key_use->read_cost = read_cost;
+    }
+    return new_key_use;
+  }
+
   /**
     Value used for lookup into @c key. It may be an Item_field, a
     constant or any other expression. If @c val contains a field from
@@ -573,6 +586,8 @@ struct POSITION {
     }
     prefix_rowcount *= filter_effect;
   }
+
+  bool pq_copy(THD *thd, POSITION *orig);
 
   void set_suffix_lateral_deps(table_map deps) { m_suffix_lateral_deps = deps; }
 
@@ -986,6 +1001,10 @@ SJ_TMP_TABLE *create_sj_tmp_table(THD *thd, JOIN *join,
   @return key flags.
  */
 uint actual_key_flags(const KEY *key_info);
+
+store_key *get_store_key(THD *thd, Item *val, table_map used_tables,
+                         table_map const_tables, const KEY_PART_INFO *key_part,
+                         uchar *key_buff, uint maybe_null);
 
 /**
   Check if equality can be used to remove sub-clause of GROUP BY/ORDER BY

@@ -484,6 +484,7 @@ SET(SQL_SHARED_SOURCES
   psi_memory_key.cc
   psi_memory_resource.cc
   query_result.cc
+  msg_queue.cc
   raii/targeted_stringstream.cc
   range_optimizer/geometry_index_range_scan.cc
   range_optimizer/group_index_skip_scan.cc
@@ -567,6 +568,10 @@ SET(SQL_SHARED_SOURCES
   sql_locale.cc
   sql_manager.cc
   sql_optimizer.cc
+  sql_parallel.cc
+  pq_condition.cc
+  pq_clone.cc
+  pq_clone_item.cc
   sql_parse.cc
   sql_partition.cc
   sql_partition_admin.cc
@@ -640,6 +645,10 @@ SET(SQL_SHARED_SOURCES
   xa/transaction_cache.cc
   xa/xid_extract.cc
   daemon_proxy_keyring/daemon_proxy_keyring.cc
+  exchange.cc
+  exchange_sort.cc
+  exchange_nosort.cc
+  msg_queue.cc
   )
 
 IF(BUILD_IS_SINGLE_CONFIG)

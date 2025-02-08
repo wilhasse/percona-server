@@ -153,6 +153,9 @@ class Item_row : public Item {
   bool null_inside() override { return with_null; }
   void bring_value() override;
   bool check_function_as_value_generator(uchar *) override { return false; }
+
+  Item *pq_clone(THD *thd, Query_block *select) override;
+  bool pq_copy_from(THD *thd, Query_block *select, Item *item) override;
 };
 
 #endif /* ITEM_ROW_INCLUDED */

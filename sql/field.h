@@ -107,8 +107,11 @@ class Send_field;
 class THD;
 class Time_zone;
 class my_decimal;
+class Item_sum;
 struct TYPELIB;
 struct timeval;
+
+struct Field_raw_data;
 
 /*
   Inside an in-memory data record, memory pointers to pieces of the
@@ -635,7 +638,6 @@ class Field {
     return (auto_flags & (GENERATED_FROM_EXPRESSION | DEFAULT_NOW)) == 0;
   }
 
- protected:
   /// Holds the position to the field in record
   uchar *ptr;
 
@@ -684,6 +686,7 @@ class Field {
   const char *orig_db_name{nullptr};
   /// Pointer to original table name, only non-NULL for a temporary table
   const char *orig_table_name{nullptr};
+  Item_sum *item_sum_ref{nullptr};
   const char **table_name, *field_name;
   LEX_CSTRING comment;
   /* Field is part of the following keys */
@@ -740,9 +743,9 @@ class Field {
   // Length of field. Never write to this member directly; instead, use
   // set_field_length().
   uint32 field_length;
+  uint32 extra_length{0};
   virtual void set_field_length(uint32 length) { field_length = length; }
 
- private:
   uint32 flags{0};
   uint16 m_field_index;  // field number in fields array
 
@@ -938,6 +941,7 @@ class Field {
     return store(nr, false);
   }
   virtual type_conversion_status store_decimal(const my_decimal *d) = 0;
+  virtual type_conversion_status store_extra(const uchar *, size_t);
   /**
     Store MYSQL_TIME value with the given amount of decimal digits
     into a field.
@@ -2170,6 +2174,7 @@ class Field_new_decimal : public Field_num {
     is.
   */
   bool m_keep_precision{false};
+  ulonglong *m_result_count_ptr{nullptr};
   int do_save_field_metadata(uchar *first_byte) const final;
 
  public:
@@ -2213,7 +2218,7 @@ class Field_new_decimal : public Field_num {
   bool zero_pack() const final { return false; }
   void sql_type(String &str) const final;
   uint32 max_display_length() const final { return field_length; }
-  uint32 pack_length() const final { return (uint32)bin_size; }
+  uint32 pack_length() const final { return (uint32)(bin_size + extra_length); }
   uint pack_length_from_metadata(uint field_metadata) const final;
   bool compatible_field_size(uint field_metadata, Relay_log_info *, uint16,
                              int *order_var) const final;
@@ -2223,7 +2228,7 @@ class Field_new_decimal : public Field_num {
     return new (mem_root) Field_new_decimal(*this);
   }
   const uchar *unpack(uchar *to, const uchar *from, uint param_data) final;
-  static Field *create_from_item(const Item *item);
+  static Field *create_from_item(const Item *item, MEM_ROOT *root = nullptr);
   bool send_to_protocol(Protocol *protocol) const final;
   void set_keep_precision(bool arg) { m_keep_precision = arg; }
 };
@@ -2555,7 +2560,7 @@ class Field_double final : public Field_real {
   int cmp(const uchar *, const uchar *) const final;
   using Field_real::make_sort_key;
   size_t make_sort_key(uchar *buff, size_t length) const final;
-  uint32 pack_length() const final { return sizeof(double); }
+  uint32 pack_length() const final { return sizeof(double) + extra_length; }
   void sql_type(String &str) const final;
   Field_double *clone(MEM_ROOT *mem_root) const final {
     assert(type() == MYSQL_TYPE_DOUBLE);
@@ -3607,7 +3612,6 @@ class Field_varstring : public Field_longstr {
   bool is_text_key_type() const final { return binary() ? false : true; }
   uint32 get_length_bytes() const override { return length_bytes; }
 
- private:
   /* Store number of bytes used to store length (1 or 2) */
   uint32 length_bytes;
 
@@ -4699,6 +4703,7 @@ class Copy_field {
   void set(Field *to, Field *from);  // Field to field
 
  private:
+  void do_copy_extra(const Field *, Field *);
   void (*m_do_copy)(Copy_field *, const Field *, Field *);
   void (*m_do_copy2)(Copy_field *, const Field *,
                      Field *);  // Used to handle null values
@@ -4802,4 +4807,13 @@ const char *get_field_name_or_expression(THD *thd, const Field *field);
 */
 bool pre_validate_value_generator_expr(Item *expression, const char *name,
                                        Value_generator_source source);
+// build field raw data from Field
+extern uint32 pq_build_field_raw(Field *field, Field_raw_data *field_raw);
+
+extern void pq_build_mq_fields(Field *field, Field_raw_data *field_raw,
+                            bool *null_array, int &null_num, uint32 &total_bytes);
+
+extern void pq_build_mq_item(Item *item, Field_raw_data *field_raw,
+                            bool *null_array, int &null_num, uint32 &total_bytes);
+
 #endif /* FIELD_INCLUDED */

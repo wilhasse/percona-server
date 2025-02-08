@@ -1,5 +1,9 @@
 --source include/not_hypergraph.inc  # Optimizer hints are not supported.
 
+--disable_query_log
+call mtr.add_suppression("Make worker plan failed");
+--enable_query_log
+
 CREATE TABLE t1(f1 INT);
 
 # Parser tests

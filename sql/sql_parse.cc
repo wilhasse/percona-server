@@ -177,8 +177,10 @@
 #include "sql/table.h"
 #include "sql/table_cache.h"  // table_cache_manager
 #include "sql/thd_raii.h"
+#include "sql/table_function.h"
 #include "sql/transaction.h"  // trans_rollback_implicit
 #include "sql/transaction_info.h"
+#include "sql/pq_condition.h"
 #include "sql/userstat.h"
 #include "sql_string.h"
 #include "template_utils.h"
@@ -3145,6 +3147,8 @@ int mysql_execute_command(THD *thd, bool first_level) {
 
   thd->work_part_info = nullptr;
 
+  set_pq_condition_status(thd);
+
   if (thd->optimizer_switch_flag(OPTIMIZER_SWITCH_SUBQUERY_TO_DERIVED))
     lex->add_statement_options(OPTION_NO_CONST_TABLES);
 
@@ -4980,6 +4984,7 @@ int mysql_execute_command(THD *thd, bool first_level) {
 
       res = lex->m_sql_cmd->execute(thd);
 
+      thd = current_thd;
       break;
     }
     case SQLCOM_ALTER_USER: {
@@ -5468,6 +5473,7 @@ void THD::reset_for_next_command() {
     a grant/revoke or flush.
   */
   thd->security_context()->checkout_access_maps();
+  thd->parallel_exec = false;
 #ifndef NDEBUG
   thd->set_tmp_table_seq_id(1);
 #endif
@@ -5636,6 +5642,8 @@ void dispatch_sql_command(THD *thd, Parser_state *parser_state,
               thd, &src_res_grp, &dest_res_grp, &ticket, &cur_ticket);
 
           error = mysql_execute_command(thd, true);
+
+          thd = current_thd;
 
           if (switched)
             mgr_ptr->restore_original_resource_group(thd, src_res_grp,

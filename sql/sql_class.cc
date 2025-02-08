@@ -100,6 +100,8 @@
 #include "sql/sql_prepare.h"  // Prepared_statement
 #include "sql/sql_profile.h"
 #include "sql/sql_timer.h"  // thd_timer_destroy
+#include "sql/sql_parallel.h"
+#include "sql/sql_table.h"
 #include "sql/table.h"
 #include "sql/table_cache.h"  // table_cache_manager
 #include "sql/tc_log.h"
@@ -601,6 +603,41 @@ const char *THD::proc_info(const System_variables &sysvars) const {
   return ret;
 }
 
+void THD::enter_cond(mysql_cond_t *cond, mysql_mutex_t *mutex,
+                const PSI_stage_info *stage, PSI_stage_info *old_stage,
+                const char *src_function, const char *src_file,
+                int src_line) {
+  DBUG_TRACE;
+  mysql_mutex_assert_owner(mutex);
+  /*
+    Sic: We don't lock LOCK_current_cond here.
+    If we did, we could end up in deadlock with THD::awake()
+    which locks current_mutex while LOCK_current_cond is locked.
+  */
+  current_mutex = mutex;
+  current_cond = cond;
+  enter_stage(stage, old_stage, src_function, src_file, src_line);
+  return;
+}
+
+void THD::exit_cond(const PSI_stage_info *stage, const char *src_function,
+                const char *src_file, int src_line) {
+  DBUG_TRACE;
+  /*
+    current_mutex must be unlocked _before_ LOCK_current_cond is
+    locked (if that would not be the case, you'll get a deadlock if someone
+    does a THD::awake() on you).
+  */
+  mysql_mutex_assert_not_owner(current_mutex.load());
+  mysql_mutex_lock(&LOCK_current_cond);
+  current_mutex = nullptr;
+  current_cond = nullptr;
+  mysql_mutex_unlock(&LOCK_current_cond);
+  enter_stage(stage, nullptr, src_function, src_file, src_line);
+  return;
+}
+
+
 void Open_tables_state::set_open_tables_state(Open_tables_state *state) {
   this->open_tables = state->open_tables;
 
@@ -635,6 +672,16 @@ THD::THD(bool enable_plugins)
       m_dd_client(new dd::cache::Dictionary_client(this)),
       m_query_string(NULL_CSTR),
       m_db(NULL_CSTR),
+      pq_leader(nullptr),
+      parallel_exec(false),
+      pq_threads_running(0),
+      pq_dop(0),
+      no_pq(false),
+      in_sp_trigger(0),
+      locking_clause(0),
+      pq_error(false),
+      pq_check_fields(0),
+      pq_check_reclen(0),
       rli_fake(nullptr),
       rli_slave(nullptr),
       copy_status_var_ptr(nullptr),
@@ -724,6 +771,11 @@ THD::THD(bool enable_plugins)
   main_lex->reset();
   set_psi(nullptr);
   mdl_context.init(this);
+  pq_mem_root = nullptr, pq_mem_root = new MEM_ROOT();
+  init_sql_alloc(key_memory_pq_mem_root, pq_mem_root,
+                 global_system_variables.query_alloc_block_size);
+  pq_mem_root->allocCBFunc = add_pq_memory;
+  pq_mem_root->freeCBFunc = sub_pq_memory;
   stmt_arena = this;
   thread_stack = nullptr;
   m_catalog.str = "std";
@@ -738,6 +790,7 @@ THD::THD(bool enable_plugins)
   num_truncated_fields = 0L;
   m_sent_row_count = 0L;
   current_found_rows = 0;
+  pq_current_found_rows = 0;
   previous_found_rows = 0;
   is_operating_gtid_table_implicitly = false;
   is_operating_substatement_implicitly = false;
@@ -787,12 +840,14 @@ THD::THD(bool enable_plugins)
                    MY_MUTEX_INIT_FAST);
   mysql_mutex_init(key_LOCK_current_cond, &LOCK_current_cond,
                    MY_MUTEX_INIT_FAST);
+  mysql_mutex_init(0, &pq_lock_worker, MY_MUTEX_INIT_FAST);
   mysql_cond_init(key_COND_thr_lock, &COND_thr_lock);
 
   /*Initialize connection delegation mutex and cond*/
   mysql_mutex_init(key_LOCK_group_replication_connection_mutex,
                    &LOCK_group_replication_connection_mutex,
                    MY_MUTEX_INIT_FAST);
+
   mysql_cond_init(key_COND_group_replication_connection_cond_var,
                   &COND_group_replication_connection_cond_var);
 
@@ -1292,7 +1347,10 @@ void THD::cleanup(void) {
 
   /* Protects user_vars. */
   mysql_mutex_lock(&LOCK_thd_data);
-  user_vars.clear();
+  if (!is_worker()) {
+    user_vars.clear();
+  }
+
   mysql_mutex_unlock(&LOCK_thd_data);
 
   /*
@@ -1464,6 +1522,7 @@ THD::~THD() {
   mysql_mutex_destroy(&LOCK_thd_security_ctx);
   mysql_mutex_destroy(&LOCK_current_cond);
   mysql_mutex_destroy(&LOCK_group_replication_connection_mutex);
+  mysql_mutex_destroy(&pq_lock_worker);
 
   mysql_cond_destroy(&COND_thr_lock);
   mysql_cond_destroy(&COND_group_replication_connection_cond_var);
@@ -1490,6 +1549,12 @@ THD::~THD() {
   unregister_replica(this, true, true);
 
   main_mem_root.Clear();
+
+  if (pq_mem_root)
+  {
+    pq_mem_root->Clear();
+    delete pq_mem_root;
+  }
 
   if (m_token_array != nullptr) {
     my_free(m_token_array);
@@ -1585,6 +1650,17 @@ void THD::awake(THD::killed_state state_to_set) {
   if (this->m_server_idle && state_to_set == KILL_QUERY) { /* nothing */
   } else {
     killed = state_to_set;
+  }
+
+  /* Kill the workers if parallel query. */
+  if (parallel_exec) {
+    mysql_mutex_lock(&pq_lock_worker);
+    for (auto pq_worker : pq_workers) {
+      mysql_mutex_lock(&pq_worker->LOCK_thd_data);
+      pq_worker->awake(state_to_set);
+      mysql_mutex_unlock(&pq_worker->LOCK_thd_data);
+    }
+    mysql_mutex_unlock(&pq_lock_worker);
   }
 
   if (state_to_set != THD::KILL_QUERY && state_to_set != THD::KILL_TIMEOUT) {
@@ -1967,6 +2043,26 @@ void THD::cleanup_after_query() {
   if (rli_slave) rli_slave->cleanup_after_query();
   // Set the default "cute" mode for the execution environment:
   check_for_truncated_fields = CHECK_FIELD_IGNORE;
+
+  if (in_sp_trigger == 0) {
+    // cleanup for parallel query
+    if (pq_threads_running > 0) {
+      release_pq_running_threads(pq_threads_running);
+      pq_threads_running = 0;
+    }
+    if(pq_mem_root)
+      pq_mem_root->Clear();
+    pq_dop = 0;
+    no_pq = false;
+    locking_clause = 0;
+    pq_error = false;
+    pq_workers.clear();
+    pq_explain.clear();
+
+    if (killed == THD::KILL_PQ_QUERY)
+     killed.store(THD::NOT_KILLED); // restore killed for next query
+  }
+
 }
 
 /*
@@ -2034,6 +2130,23 @@ void THD::update_charset() {
       !String::needs_conversion(0, variables.character_set_client,
                                 variables.character_set_filesystem, &not_used);
 }
+
+/**
+ * Record a transient change to a pointer to an Item whitin another Item.
+ */
+void THD::change_item_tree(Item **place, Item *new_value) {
+  /* TODO: check for OOM condition here */
+  if (!stmt_arena->is_regular() && lex->is_exec_started()) {
+    DBUG_PRINT("info", ("change_item_tree place %p old_value %p new_value %p",
+                        place, *place, new_value));
+    nocheck_register_item_tree_change(place, new_value);
+  }
+  if (new_value != nullptr && new_value != *place) {
+    new_value->origin_item = *place;
+  }
+  *place = new_value;
+}
+
 
 int THD::send_explain_fields(Query_result *result) {
   mem_root_deque<Item *> field_list(current_thd->mem_root);
@@ -2164,16 +2277,18 @@ void THD::rollback_item_tree_changes() {
 }
 
 void Query_arena::add_item(Item *item) {
+  item->pq_alloc_item = true;
   item->next_free = m_item_list;
   m_item_list = item;
 }
 
-void Query_arena::free_items() {
+void Query_arena::free_items(bool parallel_exec MY_ATTRIBUTE((unused))) {
   Item *next;
   DBUG_TRACE;
   /* This works because items are allocated with (*THR_MALLOC)->Alloc() */
   for (; m_item_list; m_item_list = next) {
     next = m_item_list->next_free;
+    assert(!parallel_exec || (parallel_exec && m_item_list->pq_alloc_item));
     m_item_list->delete_self();
   }
   /* Postcondition: free_list is 0 */
@@ -2329,7 +2444,8 @@ void THD::send_kill_message() const {
       assuming it's come as far as the execution stage, so that the user
       can look at the execution plan and statistics so far.
     */
-    if (!running_explain_analyze) {
+    if ((pq_leader != nullptr && !pq_leader->running_explain_analyze) || 
+        (pq_leader == nullptr && !running_explain_analyze)) {
       my_error(err, MYF(ME_FATALERROR));
     }
   }

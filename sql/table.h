@@ -114,6 +114,7 @@ struct TABLE;
 struct TABLE_SHARE;
 struct handlerton;
 struct Name_resolution_context;
+struct Field_raw_data;
 using plan_idx = int;
 
 namespace dd {
@@ -286,6 +287,7 @@ struct ORDER {
 
   ORDER *next{nullptr};
 
+ public:
   /**
     The initial ordering expression. Usually substituted during resolving
     and must not be used during optimization and execution.
@@ -2264,6 +2266,10 @@ struct TABLE {
   bool should_binlog_drop_if_temp_flag{false};
 
  public:
+
+  /** copy table property from orig table */
+  bool pq_copy(THD *thd, void *select, TABLE *orig);
+
   /**
     Does this table have any columns that can be updated using partial update
     in the current row?
@@ -3586,13 +3592,14 @@ class Table_ref {
 
   bool is_derived_unfinished_materialization() const;
 
- private:
+ public:
   /**
     The members below must be kept aligned so that (1 << m_tableno) == m_map.
     A table that takes part in a join operation must be assigned a unique
     table number.
   */
   uint m_tableno{0};   ///< Table number within query block
+ private:
   table_map m_map{0};  ///< Table map, derived from m_tableno
   /**
      If this table or join nest is the Y in "X [LEFT] JOIN Y ON C", this
@@ -3675,7 +3682,6 @@ class Table_ref {
    */
   AccessPath *access_path_for_derived{nullptr};
 
- private:
   /**
      This field is set to non-null for derived tables and views. It points
      to the Query_expression representing the derived table/view.
@@ -3684,6 +3690,7 @@ class Table_ref {
   */
   Query_expression *derived{nullptr}; /* Query_expression of derived table */
 
+ private:
   /// If non-NULL, the CTE which this table is derived from.
   Common_table_expr *m_common_table_expr{nullptr};
   /**
@@ -3781,9 +3788,9 @@ class Table_ref {
   ulonglong view_suid{0};   ///< view is suid (true by default)
   ulonglong with_check{0};  ///< WITH CHECK OPTION
 
- private:
   /// The view algorithm that is actually used, if this is a view.
   enum_view_algorithm effective_algorithm{VIEW_ALGORITHM_UNDEFINED};
+ private:
   Lock_descriptor m_lock_descriptor;
 
  public:

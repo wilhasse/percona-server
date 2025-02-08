@@ -62,6 +62,7 @@
 #include "sql/item_func.h"  // Item_func
 #include "sql/item_sum.h"   // Item_sum
 #include "sql/key.h"
+#include "sql/key_spec.h"
 #include "sql/mem_root_allocator.h"
 #include "sql/mem_root_array.h"     // Mem_root_array
 #include "sql/mysqld.h"             // heap_hton
@@ -81,6 +82,7 @@
 #include "sql/sql_plugin.h"  // plugin_unlock
 #include "sql/sql_plugin_ref.h"
 #include "sql/sql_select.h"
+#include "sql/sql_table.h"
 #include "sql/system_variables.h"
 #include "sql/table.h"
 #include "sql/temp_table_param.h"
@@ -187,8 +189,10 @@ static bool alloc_record_buffers(THD *thd, TABLE *table);
 
 Field *create_tmp_field_from_field(THD *thd, const Field *org_field,
                                    const char *name, TABLE *table,
-                                   Item_field *item) {
-  Field *new_field = org_field->new_field(thd->mem_root, table);
+                                   Item_field *item, MEM_ROOT *root) {
+  MEM_ROOT *pq_check_root = root ? root : thd->mem_root;
+  Field *new_field = org_field->new_field(pq_check_root, table);
+
   if (new_field == nullptr) return nullptr;
 
   new_field->init(table);
@@ -228,18 +232,19 @@ Field *create_tmp_field_from_field(THD *thd, const Field *org_field,
     new_created field
 */
 
-static Field *create_tmp_field_from_item(Item *item, TABLE *table) {
+static Field *create_tmp_field_from_item(Item *item, TABLE *table, MEM_ROOT *root) {
   bool maybe_null = item->is_nullable();
   Field *new_field = nullptr;
+  MEM_ROOT *pq_check_root = root ? root : *THR_MALLOC;
 
   switch (item->result_type()) {
     case REAL_RESULT:
       if (item->data_type() == MYSQL_TYPE_FLOAT) {
-        new_field = new (*THR_MALLOC)
+        new_field = new (pq_check_root)
             Field_float(item->max_length, maybe_null, item->item_name.ptr(),
                         item->decimals, false);
       } else {
-        new_field = new (*THR_MALLOC)
+        new_field = new (pq_check_root)
             Field_double(item->max_length, maybe_null, item->item_name.ptr(),
                          item->decimals, false, true);
       }
@@ -252,11 +257,11 @@ static Field *create_tmp_field_from_item(Item *item, TABLE *table) {
         Field_long : make them Field_longlong.
       */
       if (item->max_length >= (MY_INT32_NUM_DECIMAL_DIGITS - 1))
-        new_field = new (*THR_MALLOC)
+        new_field = new (pq_check_root)
             Field_longlong(item->max_length, maybe_null, item->item_name.ptr(),
                            item->unsigned_flag);
       else
-        new_field = new (*THR_MALLOC)
+        new_field = new (pq_check_root)
             Field_long(item->max_length, maybe_null, item->item_name.ptr(),
                        item->unsigned_flag);
       break;
@@ -269,14 +274,16 @@ static Field *create_tmp_field_from_item(Item *item, TABLE *table) {
       */
       if (item->is_temporal() || item->data_type() == MYSQL_TYPE_GEOMETRY ||
           item->data_type() == MYSQL_TYPE_JSON) {
-        new_field = item->tmp_table_field_from_field_type(table, true);
+        new_field = item->tmp_table_field_from_field_type(table, true, root);
       } else {
-        new_field = item->make_string_field(table);
+        new_field = item->make_string_field(table, root);
       }
-      new_field->set_derivation(item->collation.derivation);
+      if (new_field != nullptr) {
+        new_field->set_derivation(item->collation.derivation);
+      }
       break;
     case DECIMAL_RESULT:
-      new_field = Field_new_decimal::create_from_item(item);
+      new_field = Field_new_decimal::create_from_item(item, root);
       break;
     case ROW_RESULT:
     default:
@@ -306,15 +313,17 @@ static Field *create_tmp_field_from_item(Item *item, TABLE *table) {
     new_created field
 */
 
-static Field *create_tmp_field_for_schema(const Item *item, TABLE *table) {
+Field *create_tmp_field_for_schema(Item *item, TABLE *table, MEM_ROOT *root) {
+  MEM_ROOT *pq_check_root = root ? root : *THR_MALLOC;
+
   if (item->data_type() == MYSQL_TYPE_VARCHAR) {
     Field *field;
     if (item->max_length > MAX_FIELD_VARCHARLENGTH)
-      field = new (*THR_MALLOC)
+      field = new (pq_check_root)
           Field_blob(item->max_length, item->is_nullable(),
                      item->item_name.ptr(), item->collation.collation, false);
     else {
-      field = new (*THR_MALLOC) Field_varstring(
+      field = new (pq_check_root) Field_varstring(
           item->max_length, item->is_nullable(), item->item_name.ptr(),
           table->s, item->collation.collation);
       table->s->db_create_options |= HA_OPTION_PACK_RECORD;
@@ -322,7 +331,7 @@ static Field *create_tmp_field_for_schema(const Item *item, TABLE *table) {
     if (field) field->init(table);
     return field;
   }
-  return item->tmp_table_field_from_field_type(table, false);
+  return item->tmp_table_field_from_field_type(table, false, root);
 }
 
 /**
@@ -360,8 +369,9 @@ static Field *create_tmp_field_for_schema(const Item *item, TABLE *table) {
 Field *create_tmp_field(THD *thd, TABLE *table, Item *item, Item::Type type,
                         Func_ptr_array *copy_func, Field **from_field,
                         Field **default_field, bool group, bool modify_item,
-                        bool table_cant_handle_bit_fields,
-                        bool make_copy_field) {
+                        bool table_cant_handle_bit_fields, bool make_copy_field,
+                        bool copy_result_field, MEM_ROOT *root) {
+
   DBUG_TRACE;
   Field *result = nullptr;
   Item::Type orig_type = type;
@@ -397,10 +407,10 @@ Field *create_tmp_field(THD *thd, TABLE *table, Item *item, Item::Type type,
       if (item_field->is_nullable() &&
           !(item_field->field->is_nullable() ||
             item_field->field->table->is_nullable())) {
-        result = create_tmp_field_from_item(item_field, table);
+        result = create_tmp_field_from_item(item_field, table, root);
       } else if (table_cant_handle_bit_fields &&
                  item_field->field->type() == MYSQL_TYPE_BIT) {
-        result = create_tmp_field_from_item(item_field, table);
+        result = create_tmp_field_from_item(item_field, table, root);
         /*
           If the item is a function, a pointer to the item is stored in
           copy_func. We separate fields from functions by checking if the
@@ -416,7 +426,7 @@ Field *create_tmp_field(THD *thd, TABLE *table, Item *item, Item::Type type,
                       : item_field->item_name.ptr(),
             table,
             (modify_item && orig_type != Item::REF_ITEM) ? item_field
-                                                         : nullptr);
+                                                         : nullptr, root);
       }
       if (result == nullptr) return nullptr;
       if (modify_item) {
@@ -449,7 +459,7 @@ Field *create_tmp_field(THD *thd, TABLE *table, Item *item, Item::Type type,
 
         result = create_tmp_field_from_field(thd, sp_result_field,
                                              item_func_sp->item_name.ptr(),
-                                             table, nullptr);
+                                             table, nullptr, root);
         if (!result) break;
         if (modify_item) item_func_sp->set_result_field(result);
         if (!make_copy_field) {
@@ -478,7 +488,7 @@ Field *create_tmp_field(THD *thd, TABLE *table, Item *item, Item::Type type,
     case Item::SUM_FUNC_ITEM:
       if (type == Item::SUM_FUNC_ITEM && !is_wf) {
         Item_sum *item_sum = down_cast<Item_sum *>(item);
-        result = item_sum->create_tmp_field(group, table);
+        result = item_sum->create_tmp_field(group, table, root);
         if (!result) my_error(ER_OUT_OF_RESOURCES, MYF(ME_FATALERROR));
       } else {
         if (make_copy_field) {
@@ -486,7 +496,7 @@ Field *create_tmp_field(THD *thd, TABLE *table, Item *item, Item::Type type,
           assert(*from_field);
         }
 
-        result = create_tmp_field_from_item(item, table);
+        result = create_tmp_field_from_item(item, table, root);
         if (result == nullptr) return nullptr;
         if (modify_item) item->set_result_field(result);
         if (copy_func && !make_copy_field && item->is_result_field()) {
@@ -497,11 +507,15 @@ Field *create_tmp_field(THD *thd, TABLE *table, Item *item, Item::Type type,
     case Item::TYPE_HOLDER:
     case Item::VALUES_COLUMN_ITEM:
       result = down_cast<Item_aggregate_type *>(item)->make_field_by_type(
-          table, thd->is_strict_mode());
+          table, thd->is_strict_mode(), root);
       break;
     default:  // Doesn't have to be stored
       assert(false);
       break;
+  }
+
+  if (result != nullptr && thd->parallel_exec) {
+    result->extra_length = item->pq_extra_len(group);
   }
 
   /* Make sure temporary fields are never compressed */
@@ -846,6 +860,27 @@ inline void relocate_field(Field *field, uchar *pos, uchar *null_flags,
   field->reset();
 }
 
+void Temp_table_param::pq_copy(Temp_table_param *orig)
+{
+  end_write_records = orig->end_write_records;
+  // field_count = orig->field_count;
+  func_count = orig->func_count;
+  sum_func_count = orig->sum_func_count;
+  hidden_field_count = orig->hidden_field_count;
+  group_parts = orig->group_parts;
+  group_length = orig->group_length;
+  group_null_parts = orig->group_null_parts;
+  outer_sum_func_count = orig->outer_sum_func_count;
+  using_outer_summary_function = orig->using_outer_summary_function;
+  schema_table = orig->schema_table;
+  precomputed_group_by = orig->precomputed_group_by;
+  force_copy_fields = orig->force_copy_fields;
+  skip_create_table = orig->skip_create_table;
+  bit_fields_as_long = orig->bit_fields_as_long;
+  can_use_pk_for_unique = orig->can_use_pk_for_unique;
+  // m_window_short_circuit = orig->m_window_short_circuit;
+}
+
 /**
   Create a temp table according to a field list.
 
@@ -887,7 +922,9 @@ TABLE *create_tmp_table(THD *thd, Temp_table_param *param,
                         const mem_root_deque<Item *> &fields, ORDER *group,
                         bool distinct, bool save_sum_fields,
                         ulonglong select_options, ha_rows rows_limit,
-                        const char *table_alias) {
+                        const char *table_alias, bool force_disk_table,
+                        bool parallel_query) {
+
   DBUG_TRACE;
   if (!param->allow_group_via_temp_table)
     group = nullptr;  // Can't use group key
@@ -1062,6 +1099,18 @@ TABLE *create_tmp_table(THD *thd, Temp_table_param *param,
           store_column = false;
       }
 
+      if (item->const_item()) {
+        if ((int)hidden_field_count <= 0) {
+          // mark this item and then we can identify it without sending a message to MQ.
+          item->skip_create_tmp_table = true;
+          continue;  // We don't have to store this
+        }
+        if (parallel_query) {
+          item->skip_create_tmp_table = true;
+          goto HIDDEN;
+        }
+      }
+
       if (hidden_field_count <= 0) {
         if (thd->lex->current_query_block()->is_implicitly_grouped() &&
             (item->used_tables() & ~(RAND_TABLE_BIT | INNER_TABLE_BIT)) == 0) {
@@ -1095,6 +1144,12 @@ TABLE *create_tmp_table(THD *thd, Temp_table_param *param,
               modify_items, false, false);
           from_item[fieldnr] = arg;
           if (new_field == nullptr) return nullptr;  // Should be OOM
+          if (thd->parallel_exec) {
+            new_field->item_sum_ref = sum_item;
+            new_field->extra_length = sum_item->sum_func() == Item_sum::AVG_FUNC
+                                          ? sizeof(longlong)
+                                          : 0;
+          }
           new_field->set_field_index(fieldnr);
           reg_field[fieldnr++] = new_field;
           share->reclength += new_field->pack_length();
@@ -1168,8 +1223,16 @@ TABLE *create_tmp_table(THD *thd, Temp_table_param *param,
         But only for the group-by table. So do not set result_field if this is
         a tmp table for UNION or derived table materialization.
       */
-      if (modify_items && type == Item::SUM_FUNC_ITEM)
+      if (modify_items && type == Item::SUM_FUNC_ITEM) {
+        new_field->item_sum_ref = ((Item_sum *)item);
         down_cast<Item_sum *>(item)->set_result_field(new_field);
+      }
+      if (item->type() == Item::FIELD_AVG_ITEM) {
+        Item_avg_field *item_avg_field= static_cast<Item_avg_field*>(item->real_item());
+        Item_sum_avg *item_avg= item_avg_field->avg_item;
+        new_field->item_sum_ref= item_avg;
+      }
+
       share->reclength += new_field->pack_length();
       if (!new_field->is_flag_set(NOT_NULL_FLAG)) null_count++;
       if (new_field->type() == MYSQL_TYPE_BIT)
@@ -1213,6 +1276,7 @@ TABLE *create_tmp_table(THD *thd, Temp_table_param *param,
       }
     }
 
+  HIDDEN:
     hidden_field_count--;
     if (hidden_field_count == 0) {
       /*
@@ -1436,7 +1500,7 @@ TABLE *create_tmp_table(THD *thd, Temp_table_param *param,
     table->hash_field = field;
   }
 
-  if (setup_tmp_table_handler(thd, table, select_options, false,
+  if (setup_tmp_table_handler(thd, table, select_options, force_disk_table,
                               param->schema_table))
     return nullptr; /* purecov: inspected */
 

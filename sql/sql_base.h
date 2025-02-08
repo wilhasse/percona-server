@@ -223,7 +223,7 @@ bool setup_fields(THD *thd, Access_bitmask want_privilege, bool allow_sum_func,
                   bool split_sum_funcs, bool column_update,
                   const mem_root_deque<Item *> *typed_items,
                   mem_root_deque<Item *> *fields,
-                  Ref_item_array ref_item_array);
+                  Ref_item_array ref_item_array, bool skip_check_grant = false);
 bool fill_record(THD *thd, TABLE *table, const mem_root_deque<Item *> &fields,
                  const mem_root_deque<Item *> &values, MY_BITMAP *bitmap,
                  MY_BITMAP *insert_into_fields_bitmap,

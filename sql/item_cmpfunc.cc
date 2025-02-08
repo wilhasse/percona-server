@@ -89,6 +89,7 @@
 #include "sql/sql_select.h"
 #include "sql/sql_time.h"  // str_to_datetime
 #include "sql/system_variables.h"
+#include "sql/table_function.h"
 #include "sql/thd_raii.h"
 
 using std::max;
@@ -6877,6 +6878,7 @@ bool Item_equal::fix_fields(THD *thd, Item **) {
   not_null_tables_cache = used_tables_cache = 0;
   bool nullable = false;
   while ((item = li++)) {
+    if (!item->fixed && item->fix_fields(thd, &item)) return true;
     used_tables_cache |= item->used_tables();
     not_null_tables_cache |= item->not_null_tables();
     nullable |= item->is_nullable();
@@ -7034,10 +7036,10 @@ longlong Item_equal::val_int() {
   return 1;
 }
 
-Item_equal::~Item_equal() {
-  destroy(eval_item);
-  eval_item = nullptr;
-}
+// Item_equal::~Item_equal() {
+//   destroy(eval_item);
+//   eval_item = nullptr;
+// }
 
 bool Item_equal::resolve_type(THD *thd) {
   Item *item;

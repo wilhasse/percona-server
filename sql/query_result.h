@@ -34,6 +34,7 @@
 #include "my_sys.h"
 #include "mysql/components/services/bits/my_io_bits.h"  // File
 #include "mysqld_error.h"                               // ER_*
+#include "sql/item.h"
 #include "sql/sql_list.h"
 
 class Item;
@@ -42,10 +43,17 @@ class PT_select_var;
 class Query_expression;
 class Query_term_set_op;
 class Server_side_cursor;
+struct TABLE;
+class Temp_table_param;
 class THD;
 struct CHARSET_INFO;
 template <class Element_type>
 class mem_root_deque;
+class Table_ref;
+class JOIN;
+class MQueue_handle;
+struct Field_raw_data;
+class handler;
 
 /*
   This is used to get result from a query
@@ -66,6 +74,8 @@ class Query_result {
     Valid only for materialized derived tables/views.
   */
   double estimated_cost;
+
+  virtual MQueue_handle *get_mq_handler () { return nullptr; }
 
   Query_result() : unit(nullptr), estimated_rowcount(0), estimated_cost(0) {}
   virtual ~Query_result() = default;
@@ -180,6 +190,49 @@ class Query_result_interceptor : public Query_result {
     return false;
   }
   bool is_interceptor() const final { return true; }
+};
+
+class Query_result_mq : public Query_result {
+ public:
+  Query_result_mq () : Query_result(), m_table(nullptr),
+                       m_param(nullptr),
+                       m_handler(nullptr),
+                       m_join(nullptr),                    
+                       send_fields(nullptr),
+                       send_fields_size(0),
+                       mq_fields_data(nullptr),
+                       mq_fields_null_array(nullptr),
+                       mq_fields_null_flag(nullptr),
+                       m_file(nullptr),
+                       m_stable_output(false)
+                       {}
+
+  Query_result_mq (JOIN *join, MQueue_handle *msg_handler,
+    handler *file=nullptr, bool stab_output=false);
+  ~Query_result_mq() override {}
+  bool send_result_set_metadata(THD *thd, const mem_root_deque<Item *> &list,
+                                  uint flags) override;
+  bool send_data(THD *thd, const mem_root_deque<Item *> &items) override;
+  bool send_eof(THD *thd MY_ATTRIBUTE((unused))) override;
+  bool check_supports_cursor() const override { return false; }
+  void cleanup() override;
+  MQueue_handle *get_mq_handler() override { return m_handler; }
+
+  TABLE *m_table{nullptr};
+  Temp_table_param *m_param{nullptr};
+  MQueue_handle *m_handler{nullptr};
+
+private:
+  JOIN *m_join{nullptr};
+  mem_root_deque<Item *> *send_fields{nullptr};
+  uint send_fields_size{0};
+  Field_raw_data *mq_fields_data{nullptr};
+  bool *mq_fields_null_array{nullptr};
+  char *mq_fields_null_flag{nullptr};
+
+  //for stable output
+  handler *m_file;
+  bool m_stable_output;
 };
 
 class Query_result_send : public Query_result {

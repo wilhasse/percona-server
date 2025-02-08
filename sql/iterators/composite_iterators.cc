@@ -188,7 +188,7 @@ AggregateIterator::AggregateIterator(
 }
 
 bool AggregateIterator::Init() {
-  assert(!m_join->tmp_table_param.precomputed_group_by);
+  assert(!m_join->tmp_table_param->precomputed_group_by);
 
   // Disable any leftover rollup items used in children.
   m_current_rollup_position = -1;
@@ -1596,6 +1596,7 @@ class TemptableAggregateIterator final : public TableRowIterator {
 
   bool Init() override;
   int Read() override;
+  
   void SetNullRowFlag(bool is_null_row) override {
     m_table_iterator->SetNullRowFlag(is_null_row);
   }

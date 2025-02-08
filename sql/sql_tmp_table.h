@@ -56,7 +56,8 @@ TABLE *create_tmp_table(THD *thd, Temp_table_param *param,
                         const mem_root_deque<Item *> &fields, ORDER *group,
                         bool distinct, bool save_sum_fields,
                         ulonglong select_options, ha_rows rows_limit,
-                        const char *table_alias);
+                        const char *table_alias, bool force_disk_table = false,
+                        bool parallel_query = false);
 bool open_tmp_table(TABLE *table);
 TABLE *create_tmp_table_from_fields(THD *thd, List<Create_field> &field_list,
                                     bool is_virtual = true,
@@ -76,12 +77,19 @@ bool instantiate_tmp_table(THD *thd, TABLE *table);
 Field *create_tmp_field(THD *thd, TABLE *table, Item *item, Item::Type type,
                         Func_ptr_array *copy_func, Field **from_field,
                         Field **default_field, bool group, bool modify_item,
-                        bool table_cant_handle_bit_fields,
-                        bool make_copy_field);
+                        bool table_cant_handle_bit_fields, bool make_copy_field,
+                        bool copy_result_field = false, MEM_ROOT *root = nullptr);
+
 Field *create_tmp_field_from_field(THD *thd, const Field *org_field,
                                    const char *name, TABLE *table,
-                                   Item_field *item);
+                                   Item_field *item, MEM_ROOT *root = nullptr);
 
+Field *create_tmp_field_from_item(Item *item, TABLE *table,
+                                  Func_ptr_array *copy_func, bool modify_item,
+                                  MEM_ROOT *root = nullptr);
+
+Field *create_tmp_field_for_schema(Item *item, TABLE *table,
+                                   MEM_ROOT *root = nullptr);
 /**
   Get the minimum of max_key_length and max_key_part_length between
   HEAP engine and internal_tmp_disk_storage_engine.

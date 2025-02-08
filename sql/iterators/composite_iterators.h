@@ -51,10 +51,12 @@
 #include "my_base.h"
 #include "my_inttypes.h"
 #include "my_table_map.h"
+#include "sql/item_func.h"
 #include "sql/iterators/row_iterator.h"
 #include "sql/join_type.h"
 #include "sql/mem_root_array.h"
 #include "sql/pack_rows.h"
+#include "sql/sql_lex.h"
 #include "sql/table.h"
 #include "sql_string.h"
 
@@ -209,6 +211,7 @@ class AggregateIterator final : public RowIterator {
 
   bool Init() override;
   int Read() override;
+
   void SetNullRowFlag(bool is_null_row) override {
     m_source->SetNullRowFlag(is_null_row);
   }

@@ -1547,7 +1547,14 @@ INSERT INTO t4 (companynr, companyname) VALUES (00,'Unknown');
 --sorted_result
 select STRAIGHT_JOIN t2.companynr,companyname from t4,t2 where t2.companynr=t4.companynr group by t2.companynr;
 
-select SQL_SMALL_RESULT t2.companynr,companyname from t4,t2 where t2.companynr=t4.companynr group by t2.companynr;
+if ($PQ_TEST)
+{
+  select SQL_SMALL_RESULT t2.companynr,companyname from t4,t2 where t2.companynr=t4.companynr group by t2.companynr order by t2.companynr;
+}
+if (!$PQ_TEST)
+{
+  select SQL_SMALL_RESULT t2.companynr,companyname from t4,t2 where t2.companynr=t4.companynr group by t2.companynr;
+}
 
 #
 # Full join (same alias)
@@ -1651,7 +1658,14 @@ select fld3 from t2 where (((fld3 like "_%L%" ) or (fld3 like "%ok%")) and ( fld
 #
 
 select count(*) from t1;
-select companynr,count(*),sum(fld1) from t2 group by companynr;
+if ($PQ_TEST)
+{
+  select companynr,count(*),sum(fld1) from t2 group by companynr order by companynr;
+}
+if (!$PQ_TEST)
+{
+  select companynr,count(*),sum(fld1) from t2 group by companynr;
+}
 select companynr,count(*) from t2 group by companynr order by companynr desc limit 5;
 select count(*),min(fld4),max(fld4),sum(fld1),avg(fld1),std(fld1),variance(fld1) from t2 where companynr = 34 and fld4<>"";
 --replace_column 10 # 11 #
@@ -1660,12 +1674,26 @@ select companynr,count(*),min(fld4),max(fld4),sum(fld1),avg(fld1),std(fld1),vari
 select companynr,t2nr,count(price),sum(price),min(price),max(price),avg(price) from t3 where companynr = 37 group by companynr,t2nr order by companynr,t2nr limit 10;
 select /*! SQL_SMALL_RESULT */
 companynr,t2nr,count(price),sum(price),min(price),max(price),avg(price) from t3 where companynr = 37 group by companynr, t2nr order by companynr,t2nr limit 10;
-select companynr,count(price),sum(price),min(price),max(price),avg(price) from t3 group by companynr ;
+if ($PQ_TEST)
+{
+  select companynr,count(price),sum(price),min(price),max(price),avg(price) from t3 group by companynr order by companynr;
+}
+if (!$PQ_TEST)
+{
+  select companynr,count(price),sum(price),min(price),max(price),avg(price) from t3 group by companynr ;
+}
 select distinct mod(companynr,10) from t4 group by companynr;
 select distinct 1 from t4 group by companynr;
 select count(distinct fld1) from t2;
 select companynr,count(distinct fld1) from t2 group by companynr;
-select companynr,count(*) from t2 group by companynr;
+if ($PQ_TEST)
+{
+  select companynr,count(*) from t2 group by companynr order by companynr;
+}
+if (!$PQ_TEST)
+{
+  select companynr,count(*) from t2 group by companynr;
+}
 select companynr,count(distinct concat(fld1,repeat(65,1000))) from t2 group by companynr;
 select companynr,count(distinct concat(fld1,repeat(65,200))) from t2 group by companynr;
 select companynr,count(distinct floor(fld1/100)) from t2 group by companynr;
@@ -1699,7 +1727,14 @@ select t2.fld1,count(*) from t2,t3 where t2.fld1=158402 and t3.name=t2.fld3 grou
 #
 
 select sum(Period)/count(*) from t1;
-select companynr,count(price) as "count",sum(price) as "sum" ,abs(sum(price)/count(price)-avg(price)) as "diff",(0+count(price))*companynr as func from t3 group by companynr;
+if ($PQ_TEST)
+{
+  select companynr,count(price) as "count",sum(price) as "sum" ,abs(sum(price)/count(price)-avg(price)) as "diff",(0+count(price))*companynr as func from t3 group by companynr order by companynr;
+}
+if (!$PQ_TEST)
+{
+  select companynr,count(price) as "count",sum(price) as "sum" ,abs(sum(price)/count(price)-avg(price)) as "diff",(0+count(price))*companynr as func from t3 group by companynr;
+}
 select companynr,sum(price)/count(price) as avg from t3 group by companynr having avg > 70000000 order by avg;
 
 #
@@ -1710,7 +1745,14 @@ select companynr,sum(price)/count(price) as avg from t3 group by companynr havin
 
 select companynr,count(*) from t2 group by companynr order by 2 desc;
 select companynr,count(*) from t2 where companynr > 40 group by companynr order by 2 desc;
-select t2.fld4,t2.fld1,count(price),sum(price),min(price),max(price),avg(price) from t3,t2 where t3.companynr = 37 and t2.fld1 = t3.t2nr group by fld1,t2.fld4;
+if ($PQ_TEST)
+{
+  select t2.fld4,t2.fld1,count(price),sum(price),min(price),max(price),avg(price) from t3,t2 where t3.companynr = 37 and t2.fld1 = t3.t2nr group by fld1,t2.fld4 order by fld1;
+}
+if (!$PQ_TEST)
+{
+  select t2.fld4,t2.fld1,count(price),sum(price),min(price),max(price),avg(price) from t3,t2 where t3.companynr = 37 and t2.fld1 = t3.t2nr group by fld1,t2.fld4;
+}
 
 #
 # group by with many tables
@@ -1720,8 +1762,17 @@ select t2.fld4,t2.fld1,count(price),sum(price),min(price),max(price),avg(price) 
 #	    send rows
 #
 
-select t3.companynr,fld3,sum(price) from t3,t2 where t2.fld1 = t3.t2nr and t3.companynr = 512 group by companynr,fld3;
-select t2.companynr,count(*),min(fld3),max(fld3),sum(price),avg(price) from t2,t3 where t3.companynr >= 30 and t3.companynr <= 58 and t3.t2nr = t2.fld1 and 1+1=2 group by t2.companynr;
+if ($PQ_TEST)
+{
+  select t3.companynr,fld3,sum(price) from t3,t2 where t2.fld1 = t3.t2nr and t3.companynr = 512 group by companynr,fld3 order by fld3;
+  select t2.companynr,count(*),min(fld3),max(fld3),sum(price),avg(price) from t2,t3 where t3.companynr >= 30 and t3.companynr <= 58 and t3.t2nr = t2.fld1 and 1+1=2 group by t2.companynr order by companynr;
+}
+if (!$PQ_TEST)
+{
+  select t3.companynr,fld3,sum(price) from t3,t2 where t2.fld1 = t3.t2nr and t3.companynr = 512 group by companynr,fld3;
+  select t2.companynr,count(*),min(fld3),max(fld3),sum(price),avg(price) from t2,t3 where t3.companynr >= 30 and t3.companynr <= 58 and t3.t2nr = t2.fld1 and 1+1=2 group by t2.companynr;
+}
+
 
 #
 # group with many tables and long group on many tables. group on formula
@@ -1761,7 +1812,14 @@ select companynr,fld1 from t2 HAVING fld1=250501 or fld1=250502;
 select companynr,fld1 from t2 WHERE fld1>=250501 HAVING fld1<=250502;
 select companynr,count(*) as count,sum(fld1) as sum from t2 group by companynr having count > 40 and sum/count >= 120000;
 select companynr from t2 group by companynr having count(*) > 40 and sum(fld1)/count(*) >= 120000 ;
-select t2.companynr,companyname,count(*) from t2,t4 where t2.companynr=t4.companynr group by companyname having t2.companynr >= 40;
+if ($PQ_TEST)
+{
+  select t2.companynr,companyname,count(*) from t2,t4 where t2.companynr=t4.companynr group by companyname having t2.companynr >= 40 order by t2.companynr;
+}
+if (!$PQ_TEST)
+{
+  select t2.companynr,companyname,count(*) from t2,t4 where t2.companynr=t4.companynr group by companyname having t2.companynr >= 40;
+}
 
 #
 # MIN(), MAX() and COUNT() optimizing
@@ -1784,7 +1842,14 @@ select min(fld1),max(fld1),count(*) from t2;
 --enable_ps_protocol
 select min(t2nr),max(t2nr) from t3 where t2nr=2115 and price2=823742;
 select count(*),min(t2nr),max(t2nr) from t3 where name='spates' and companynr=78;
-select t2nr,count(*) from t3 where name='gems' group by t2nr limit 20;
+if ($PQ_TEST)
+{
+  select t2nr,count(*) from t3 where name='gems' group by t2nr order by t2nr limit 20;
+}
+if (!$PQ_TEST)
+{
+  select t2nr,count(*) from t3 where name='gems' group by t2nr limit 20;
+}
 select max(t2nr) from t3 where price=983543950;
 
 #

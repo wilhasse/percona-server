@@ -266,7 +266,6 @@ void trace_quick_description(const AccessPath *path, Opt_trace_context *trace) {
   add_info_string(path, &range_info);
   range_trace.add_utf8("used_index", range_info.ptr(), range_info.length());
 }
-
 QUICK_RANGE::QUICK_RANGE()
     : min_key(nullptr),
       max_key(nullptr),

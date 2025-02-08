@@ -663,6 +663,16 @@ struct System_variables {
   */
   uint select_into_disk_sync_delay;
 
+  bool force_parallel_execute;
+
+  ulong parallel_cost_threshold;
+
+  ulong parallel_default_dop;
+
+  ulong parallel_queue_timeout;
+
+  bool pq_copy_from(System_variables leader);
+
   /**
     @sa Sys_terminology_use_previous
   */
@@ -791,6 +801,9 @@ struct System_status_var {
   */
   double last_query_cost;
   ulonglong last_query_partial_plans;
+
+  bool reset{false};
+  bool pq_merge_status(System_status_var worker);
 
   /** fragmentation statistics */
   fragmentation_stats_t fragmentation_stats;

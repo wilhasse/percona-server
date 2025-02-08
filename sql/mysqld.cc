@@ -888,6 +888,8 @@ MySQL clients support the protocol:
 #include "thr_mutex.h"
 #include "typelib.h"
 #include "violite.h"
+#include "sql/sql_parallel.h"
+
 
 #ifdef WITH_PERFSCHEMA_STORAGE_ENGINE
 #include "storage/perfschema/pfs_server.h"
@@ -1140,6 +1142,8 @@ static PSI_mutex_key key_LOCK_authentication_policy;
 static PSI_mutex_key key_LOCK_global_conn_mem_limit;
 static PSI_rwlock_key key_rwlock_LOCK_server_shutting_down;
 #endif /* HAVE_PSI_INTERFACE */
+static PSI_mutex_key key_LOCK_pq_threads_running;
+static PSI_cond_key key_COND_pq_threads_running;
 
 /**
   Statement instrumentation key for replication.
@@ -2854,6 +2858,9 @@ static void clean_up_mutexes() {
   mysql_mutex_destroy(&LOCK_authentication_policy);
   mysql_mutex_destroy(&LOCK_global_conn_mem_limit);
   mysql_rwlock_destroy(&LOCK_server_shutting_down);
+  mysql_mutex_destroy(&LOCK_pq_threads_running);
+  mysql_cond_destroy(&COND_pq_threads_running);
+
 }
 
 /****************************************************************************
@@ -5668,6 +5675,9 @@ static int init_thread_environment() {
                    MY_MUTEX_INIT_FAST);
   mysql_rwlock_init(key_rwlock_LOCK_server_shutting_down,
                     &LOCK_server_shutting_down);
+  mysql_mutex_init(key_LOCK_pq_threads_running, &LOCK_pq_threads_running, MY_MUTEX_INIT_FAST);
+  mysql_cond_init(key_COND_pq_threads_running, &COND_pq_threads_running);
+
   return 0;
 }
 
@@ -9822,6 +9832,14 @@ static int show_net_compression(THD *thd, SHOW_VAR *var, char *buff) {
   return 0;
 }
 
+static int show_pq_memory(THD *, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_INT;
+  var->value = buff;
+  unsigned int *value = reinterpret_cast<unsigned int *>(buff);
+  *value = get_pq_memory_total();
+  return 0;
+}
+
 static int show_net_compression_algorithm(THD *thd, SHOW_VAR *var, char *buff) {
   const char *s = thd->get_protocol()->get_compression_algorithm();
   var->type = SHOW_CHAR;
@@ -10430,6 +10448,13 @@ SHOW_VAR status_vars[] = {
      SHOW_SCOPE_GLOBAL},
     {"Replica_open_temp_tables", (char *)&show_replica_open_temp_tables,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"PQ_threads_refused", (char*)&parallel_threads_refused, SHOW_INT, 
+     SHOW_SCOPE_GLOBAL},
+    {"PQ_memory_refused", (char*)&parallel_memory_refused, SHOW_INT, 
+     SHOW_SCOPE_GLOBAL},
+    {"PQ_threads_running", (char*)&parallel_threads_running, SHOW_INT, 
+     SHOW_SCOPE_GLOBAL},
+    {"PQ_memory_used", (char*)&show_pq_memory, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
 #ifndef NDEBUG
     {"Replica_rows_last_search_algorithm_used",
      (char *)&show_replica_rows_last_search_algorithm_used, SHOW_FUNC,
@@ -12628,7 +12653,9 @@ static PSI_mutex_info all_server_mutexes[]=
   { &key_LOCK_delegate_connection_mutex, "LOCK_delegate_connection_mutex", PSI_FLAG_SINGLETON, 0, PSI_DOCUMENT_ME},
   { &key_LOCK_group_replication_connection_mutex, "LOCK_group_replication_connection_mutex", PSI_FLAG_SINGLETON, 0, PSI_DOCUMENT_ME},
 { &key_LOCK_authentication_policy, "LOCK_authentication_policy", PSI_FLAG_SINGLETON, 0, "A lock to ensure execution of CREATE USER or ALTER USER sql and SET @@global.authentication_policy variable are serialized"},
-  { &key_LOCK_global_conn_mem_limit, "LOCK_global_conn_mem_limit", PSI_FLAG_SINGLETON, 0, PSI_DOCUMENT_ME}
+  { &key_LOCK_global_conn_mem_limit, "LOCK_global_conn_mem_limit", PSI_FLAG_SINGLETON, 0, PSI_DOCUMENT_ME},
+  { &key_LOCK_pq_threads_running, "LOCK_pq_threads_running", PSI_FLAG_SINGLETON, 0, PSI_DOCUMENT_ME}
+
 };
 /* clang-format on */
 
@@ -12745,7 +12772,8 @@ static PSI_cond_info all_server_conds[]=
   { &key_cond_slave_worker_hash, "Relay_log_info::replica_worker_hash_cond", 0, 0, PSI_DOCUMENT_ME},
   { &key_monitor_info_run_cond, "Source_IO_monitor::run_cond", 0, 0, PSI_DOCUMENT_ME},
   { &key_COND_delegate_connection_cond_var, "THD::COND_delegate_connection_cond_var", 0, 0, PSI_DOCUMENT_ME},
-  { &key_COND_group_replication_connection_cond_var, "THD::COND_group_replication_connection_cond_var", 0, 0, PSI_DOCUMENT_ME}
+  { &key_COND_group_replication_connection_cond_var, "THD::COND_group_replication_connection_cond_var", 0, 0, PSI_DOCUMENT_ME},
+  { &key_COND_pq_threads_running, "COND_pq_threads_running", PSI_FLAG_SINGLETON, 0, PSI_DOCUMENT_ME}
 };
 /* clang-format on */
 
@@ -12755,6 +12783,7 @@ PSI_thread_key key_thread_one_connection;
 PSI_thread_key key_thread_compress_gtid_table;
 PSI_thread_key key_thread_parser_service;
 PSI_thread_key key_thread_handle_con_admin_sockets;
+PSI_thread_key key_thread_parallel_query;
 
 /* clang-format off */
 static PSI_thread_info all_server_threads[]=
@@ -12774,6 +12803,7 @@ PSI_FLAG_USER | PSI_FLAG_NO_SEQNUM, 0, PSI_DOCUMENT_ME},
   { &key_thread_compress_gtid_table, "compress_gtid_table", "gtid_zip", PSI_FLAG_SINGLETON, 0, PSI_DOCUMENT_ME},
   { &key_thread_parser_service, "parser_service", "parser_srv", PSI_FLAG_SINGLETON, 0, PSI_DOCUMENT_ME},
   { &key_thread_handle_con_admin_sockets, "admin_interface", "con_admin", PSI_FLAG_USER, 0, PSI_DOCUMENT_ME},
+  { &key_thread_parallel_query, "parallel_query", "parallel_query", PSI_FLAG_SINGLETON, 0, PSI_DOCUMENT_ME},
 };
 /* clang-format on */
 

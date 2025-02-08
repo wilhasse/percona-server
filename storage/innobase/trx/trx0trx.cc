@@ -2387,6 +2387,17 @@ ReadView *trx_clone_read_view(trx_t *trx, trx_t *from_trx) {
   return (trx->read_view);
 }
 
+ReadView *trx_clone_read_view(trx_t *trx, ReadView *snapshot) /*!< in/out: active transaction */
+{
+  // trx->read_view = UT_NEW_NOKEY(ReadView());
+  trx->read_view = ut::new_withkey<ReadView>(UT_NEW_THIS_FILE_PSI_KEY);
+  if (trx->read_view != nullptr) {
+    trx->read_view->Copy_readView(*snapshot);
+    trx->read_view->skip_view_list = true;
+  }
+  return (trx->read_view);
+}
+
 /** Prepares a transaction for commit/rollback. */
 void trx_commit_or_rollback_prepare(trx_t *trx) /*!< in/out: transaction */
 {

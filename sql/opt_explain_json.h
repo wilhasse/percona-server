@@ -65,6 +65,7 @@ class Explain_format_JSON : public Explain_format {
  private:
   opt_explain_json_namespace::context *current_context;  ///< current tree node
   FormatVersion m_version;
+  bool is_json() const override { return true; }
 };
 
 #endif  // OPT_EXPLAIN_FORMAT_JSON_INCLUDED

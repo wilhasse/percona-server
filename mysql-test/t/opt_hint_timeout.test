@@ -1,5 +1,9 @@
 --echo # WL#8017 Infrastructure for Optimizer Hints
 
+--disable_query_log
+call mtr.add_suppression("Make worker plan failed");
+--enable_query_log
+
 --echo # MAX_EXECUTION_TIME hint testing
 --source include/have_statement_timeout.inc
 

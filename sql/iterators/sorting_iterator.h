@@ -86,6 +86,7 @@ class SortingIterator final : public RowIterator {
   bool Init() override;
 
   int Read() override { return m_result_iterator->Read(); }
+  
 
   void SetNullRowFlag(bool is_null_row) override;
 
