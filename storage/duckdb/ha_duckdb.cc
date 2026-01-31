@@ -45,6 +45,7 @@
 #include "sql/sql_optimizer.h"
 #include "sql/visible_fields.h"
 #include "scope_guard.h"
+#include "storage/duckdb/duckdb_compat.h"
 #include "sql/field.h"
 #include "sql/table.h"
 #include "sql_string.h"
@@ -170,13 +171,6 @@ bool ensure_duckdb_file(const std::string &path) {
   my_delete(path.c_str(), MYF(0));
   my_delete((path + ".wal").c_str(), MYF(0));
   return true;
-}
-
-std::string normalize_query_for_duckdb(std::string sql) {
-  for (char &ch : sql) {
-    if (ch == '`') ch = '"';
-  }
-  return sql;
 }
 
 bool is_ident_char(char ch) {
@@ -469,9 +463,17 @@ static bool OptimizeSecondaryEngine(THD *thd, LEX *lex) {
   }
 
   const LEX_CSTRING &query = thd->query();
-  ctx->sql = normalize_query_for_duckdb(
-      std::string(query.str, query.length));
-  ctx->sql = rewrite_qualified_table(std::move(ctx->sql), ctx->db, ctx->table);
+  duckdb_se::DuckdbRewriteResult rewrite =
+      duckdb_se::RewriteForDuckdb(std::string(query.str, query.length));
+  if (!rewrite.ok) {
+    ctx->fail_reason = rewrite.reason.empty()
+                           ? "DuckDB compatibility rewrite failed"
+                           : rewrite.reason;
+    thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
+    return true;
+  }
+  ctx->sql =
+      rewrite_qualified_table(std::move(rewrite.sql), ctx->db, ctx->table);
 
   try {
     duckdb::DBConfig config(true);

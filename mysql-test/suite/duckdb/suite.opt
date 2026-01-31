@@ -1,0 +1,2 @@
+$DUCKDB_PLUGIN_OPT
+--secondary-engine-cost-threshold=0

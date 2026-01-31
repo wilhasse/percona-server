@@ -1,0 +1,36 @@
+--source include/have_duckdb_plugin.inc
+
+--let $duckdb_installed=0
+--let $duckdb_plugin_present=`SELECT COUNT(*) FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_NAME='DUCKDB'`
+--if ($duckdb_plugin_present == 0) {
+  --eval INSTALL PLUGIN duckdb SONAME '$DUCKDB_PLUGIN';
+  --let $duckdb_installed=1
+}
+
+SET @save_use_secondary_engine = @@session.use_secondary_engine;
+SET @save_threshold = @@session.secondary_engine_cost_threshold;
+SET @@session.secondary_engine_cost_threshold = 0;
+SET @@session.use_secondary_engine = FORCED;
+
+CREATE DATABASE duckdb_compat;
+USE duckdb_compat;
+
+CREATE TABLE t1 (id INT, val VARCHAR(20)) ENGINE=InnoDB SECONDARY_ENGINE=DUCKDB;
+ALTER TABLE t1 SECONDARY_LOAD;
+
+INSERT INTO t1 VALUES (1,NULL),(2,'foo'),(3,'bar');
+
+SELECT id FROM t1 WHERE IFNULL(val,'') = '' ORDER BY id;
+SELECT id FROM t1 WHERE LOCATE('ar', val) > 0 ORDER BY id;
+SELECT id FROM t1 ORDER BY id LIMIT 1,1;
+
+ALTER TABLE t1 SECONDARY_UNLOAD;
+DROP TABLE t1;
+DROP DATABASE duckdb_compat;
+
+SET @@session.use_secondary_engine = @save_use_secondary_engine;
+SET @@session.secondary_engine_cost_threshold = @save_threshold;
+
+--if ($duckdb_installed == 1) {
+  UNINSTALL PLUGIN duckdb;
+}
