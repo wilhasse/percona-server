@@ -380,8 +380,7 @@ static bool DuckdbExecuteQuery(JOIN *join, Query_result *query_result) {
           field->set_notnull();
           std::string text;
           const auto physical = value.type().InternalType();
-          if (physical == duckdb::PhysicalType::VARCHAR ||
-              physical == duckdb::PhysicalType::BLOB) {
+          if (physical == duckdb::PhysicalType::VARCHAR) {
             text = duckdb::StringValue::Get(value);
           } else {
             text = value.ToString();

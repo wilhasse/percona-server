@@ -74,6 +74,15 @@ struct MySQLTableDef {
   std::string ddl_sql;
 };
 
+struct Gtid {
+  std::string value;
+};
+
+struct TableId {
+  std::string schema;
+  std::string table;
+};
+
 struct DDLChange {
   enum class Type {
     kUnknown,
@@ -90,15 +99,6 @@ struct DDLChange {
   TableId new_table;
   MySQLTableDef new_def;
   bool copy_ddl{false};
-};
-
-struct Gtid {
-  std::string value;
-};
-
-struct TableId {
-  std::string schema;
-  std::string table;
 };
 
 struct Cell {
