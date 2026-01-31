@@ -47,6 +47,9 @@ if(NOT WITHOUT_DUCKDB_SE_STORAGE_ENGINE)
     set(ENABLE_SANITIZER OFF CACHE BOOL "" FORCE)
     set(ENABLE_UBSAN OFF CACHE BOOL "" FORCE)
     set(ENABLE_THREAD_SANITIZER OFF CACHE BOOL "" FORCE)
+    # Force C++17 to override DuckDB's default of C++11
+    set(CMAKE_CXX_STANDARD 17 CACHE STRING "" FORCE)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON CACHE BOOL "" FORCE)
     add_subdirectory(${DUCKDB_SOURCE_DIR} ${CMAKE_BINARY_DIR}/duckdb EXCLUDE_FROM_ALL)
   else()
     message(FATAL_ERROR "DuckDB submodule not found at ${DUCKDB_SOURCE_DIR}")
@@ -57,14 +60,14 @@ if(NOT WITHOUT_DUCKDB_SE_STORAGE_ENGINE)
       STORAGE_ENGINE
       DEFAULT
       MODULE_OUTPUT_NAME ha_duckdb
-      LINK_LIBRARIES duckdb_static
+      LINK_LIBRARIES duckdb_static dummy_static_extension_loader extra::rapidjson
       )
   else()
     MYSQL_ADD_PLUGIN(duckdb_se ha_duckdb.cc
       STORAGE_ENGINE
       MODULE_ONLY
       MODULE_OUTPUT_NAME ha_duckdb
-      LINK_LIBRARIES duckdb_static
+      LINK_LIBRARIES duckdb_static dummy_static_extension_loader extra::rapidjson
       )
   endif()
 

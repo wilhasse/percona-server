@@ -39,6 +39,7 @@
 #include "sql/mysqld.h"
 #include "sql/sql_class.h"
 #include "scope_guard.h"
+#include "sql/field.h"
 #include "sql/table.h"
 #include "sql_string.h"
 #include "template_utils.h"
@@ -440,7 +441,7 @@ static int duckdb_deinit_func(void *) {
 struct st_mysql_storage_engine duckdb_storage_engine = {
     MYSQL_HANDLERTON_INTERFACE_VERSION};
 
-mysql_declare_plugin(duckdb){
+mysql_declare_plugin(duckdb_se){
     MYSQL_STORAGE_ENGINE_PLUGIN,
     &duckdb_storage_engine,
     "DUCKDB",
