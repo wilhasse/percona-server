@@ -1,0 +1,76 @@
+# Copyright (c) 2026, Percona LLC and/or its affiliates.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License, version 2.0,
+# as published by the Free Software Foundation.
+#
+# This program is designed to work with certain software (including
+# but not limited to OpenSSL) that is licensed under separate terms,
+# as designated in a particular file or component or in included license
+# documentation.  The authors of MySQL hereby grant you an additional
+# permission to link the program and your derivative works with the
+# separately licensed software that they have either included with
+# the program or referenced in the documentation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License, version 2.0, for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+
+DISABLE_MISSING_PROFILE_WARNING()
+ADD_DEFINITIONS(-DMYSQL_SERVER)
+
+if(DEFINED WITH_DUCKDB_STORAGE_ENGINE AND NOT DEFINED WITH_DUCKDB_SE_STORAGE_ENGINE)
+  set(WITH_DUCKDB_SE_STORAGE_ENGINE ${WITH_DUCKDB_STORAGE_ENGINE} CACHE BOOL "" FORCE)
+endif()
+if(DEFINED WITHOUT_DUCKDB_STORAGE_ENGINE AND NOT DEFINED WITHOUT_DUCKDB_SE_STORAGE_ENGINE)
+  set(WITHOUT_DUCKDB_SE_STORAGE_ENGINE ${WITHOUT_DUCKDB_STORAGE_ENGINE} CACHE BOOL "" FORCE)
+endif()
+
+if(NOT WITHOUT_DUCKDB_SE_STORAGE_ENGINE)
+  set(DUCKDB_SOURCE_DIR ${CMAKE_SOURCE_DIR}/extra/duckdb)
+  if(EXISTS ${DUCKDB_SOURCE_DIR}/CMakeLists.txt)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+    set(BUILD_MAIN_DUCKDB_LIBRARY ON CACHE BOOL "" FORCE)
+    set(BUILD_UNITTESTS OFF CACHE BOOL "" FORCE)
+    set(ENABLE_UNITTEST_CPP_TESTS OFF CACHE BOOL "" FORCE)
+    set(BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+    set(BUILD_SHELL OFF CACHE BOOL "" FORCE)
+    set(DISABLE_EXTENSION_LOAD ON CACHE BOOL "" FORCE)
+    set(DISABLE_BUILTIN_EXTENSIONS ON CACHE BOOL "" FORCE)
+    set(ENABLE_EXTENSION_AUTOINSTALL OFF CACHE BOOL "" FORCE)
+    set(ENABLE_EXTENSION_AUTOLOADING OFF CACHE BOOL "" FORCE)
+    set(ENABLE_SANITIZER OFF CACHE BOOL "" FORCE)
+    set(ENABLE_UBSAN OFF CACHE BOOL "" FORCE)
+    set(ENABLE_THREAD_SANITIZER OFF CACHE BOOL "" FORCE)
+    add_subdirectory(${DUCKDB_SOURCE_DIR} ${CMAKE_BINARY_DIR}/duckdb EXCLUDE_FROM_ALL)
+  else()
+    message(FATAL_ERROR "DuckDB submodule not found at ${DUCKDB_SOURCE_DIR}")
+  endif()
+
+  if(WITH_DUCKDB_SE_STORAGE_ENGINE)
+    MYSQL_ADD_PLUGIN(duckdb_se ha_duckdb.cc
+      STORAGE_ENGINE
+      DEFAULT
+      MODULE_OUTPUT_NAME ha_duckdb
+      LINK_LIBRARIES duckdb_static
+      )
+  else()
+    MYSQL_ADD_PLUGIN(duckdb_se ha_duckdb.cc
+      STORAGE_ENGINE
+      MODULE_ONLY
+      MODULE_OUTPUT_NAME ha_duckdb
+      LINK_LIBRARIES duckdb_static
+      )
+  endif()
+
+  if(TARGET duckdb_se)
+    target_include_directories(duckdb_se PRIVATE
+      ${DUCKDB_SOURCE_DIR}/src/include
+      )
+  endif()
+endif()
