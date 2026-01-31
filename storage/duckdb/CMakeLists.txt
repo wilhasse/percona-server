@@ -56,14 +56,14 @@ if(NOT WITHOUT_DUCKDB_SE_STORAGE_ENGINE)
   endif()
 
   if(WITH_DUCKDB_SE_STORAGE_ENGINE)
-    MYSQL_ADD_PLUGIN(duckdb_se ha_duckdb.cc duckdb_adapter.cc
+    MYSQL_ADD_PLUGIN(duckdb_se ha_duckdb.cc duckdb_adapter.cc duckdb_binlog_applier.cc
       STORAGE_ENGINE
       DEFAULT
       MODULE_OUTPUT_NAME ha_duckdb
       LINK_LIBRARIES duckdb_static dummy_static_extension_loader extra::rapidjson
       )
   else()
-    MYSQL_ADD_PLUGIN(duckdb_se ha_duckdb.cc duckdb_adapter.cc
+    MYSQL_ADD_PLUGIN(duckdb_se ha_duckdb.cc duckdb_adapter.cc duckdb_binlog_applier.cc
       STORAGE_ENGINE
       MODULE_ONLY
       MODULE_OUTPUT_NAME ha_duckdb
