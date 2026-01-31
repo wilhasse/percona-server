@@ -23,7 +23,10 @@
 
 #include "storage/duckdb/duckdb_adapter.h"
 
+#include <cctype>
+#include <chrono>
 #include <sstream>
+#include <unordered_set>
 
 namespace duckdb_se {
 namespace {
@@ -31,6 +34,23 @@ namespace {
 bool IsMissingTableError(const std::string &error, const std::string &table) {
   return error.find("does not exist") != std::string::npos &&
          error.find(table) != std::string::npos;
+}
+
+bool StartsWithCI(const std::string &input, const char *prefix) {
+  size_t i = 0;
+  while (i < input.size() && std::isspace(static_cast<unsigned char>(input[i]))) {
+    ++i;
+  }
+  size_t j = 0;
+  while (prefix[j] != '\0') {
+    if (i >= input.size()) return false;
+    const char lhs = static_cast<char>(
+        std::toupper(static_cast<unsigned char>(input[i++])));
+    const char rhs = static_cast<char>(
+        std::toupper(static_cast<unsigned char>(prefix[j++])));
+    if (lhs != rhs) return false;
+  }
+  return true;
 }
 
 }  // namespace
@@ -70,6 +90,28 @@ Status DuckDBAdapter::EnsureInitialized() const {
   return Status::Ok();
 }
 
+Status DuckDBAdapter::ExecuteDDLOn(duckdb::Connection &conn,
+                                   const std::string &sql) {
+  if (sql.empty()) {
+    return Status::Error(StatusCode::kInvalid, "Empty DDL statement");
+  }
+  try {
+    auto result = conn.Query(sql);
+    if (result->HasError()) {
+      return Status::Error(StatusCode::kDuckDBError, result->GetError());
+    }
+  } catch (const std::exception &ex) {
+    return Status::Error(StatusCode::kDuckDBError, ex.what());
+  }
+  return Status::Ok();
+}
+
+Status DuckDBAdapter::ExecuteDDL(const std::string &sql) {
+  auto st = EnsureInitialized();
+  if (!st.ok()) return st;
+  return ExecuteDDLOn(*conn_, sql);
+}
+
 std::string DuckDBAdapter::QuoteIdent(const std::string &name) const {
   std::string out;
   out.reserve(name.size() + 2);
@@ -95,6 +137,30 @@ std::string DuckDBAdapter::EscapeLiteral(const std::string &value) const {
     out.push_back(ch);
   }
   return out;
+}
+
+std::string DuckDBAdapter::NormalizeDDL(const std::string &sql) const {
+  std::string out;
+  out.reserve(sql.size());
+  for (char ch : sql) {
+    out.push_back(ch == '`' ? '"' : ch);
+  }
+  if (StartsWithCI(out, "CREATE TABLE")) {
+    const auto pos = out.rfind(')');
+    if (pos != std::string::npos) {
+      out.resize(pos + 1);
+    }
+  }
+  return out;
+}
+
+DDLChange::Type DuckDBAdapter::InferDDLType(const std::string &sql) const {
+  if (StartsWithCI(sql, "CREATE TABLE")) return DDLChange::Type::kCreate;
+  if (StartsWithCI(sql, "DROP TABLE")) return DDLChange::Type::kDrop;
+  if (StartsWithCI(sql, "ALTER TABLE")) return DDLChange::Type::kAlter;
+  if (StartsWithCI(sql, "RENAME TABLE")) return DDLChange::Type::kRename;
+  if (StartsWithCI(sql, "TRUNCATE TABLE")) return DDLChange::Type::kTruncate;
+  return DDLChange::Type::kUnknown;
 }
 
 Status DuckDBAdapter::CreateTable(MySQLTableDef def) {
@@ -129,22 +195,8 @@ Status DuckDBAdapter::CreateTable(MySQLTableDef def) {
 }
 
 Status DuckDBAdapter::AlterTable(DDLChange change) {
-  auto st = EnsureInitialized();
-  if (!st.ok()) return st;
-  if (change.sql.empty()) {
-    return Status::Error(StatusCode::kInvalid, "Empty ALTER TABLE SQL");
-  }
-
-  try {
-    auto result = conn_->Query(change.sql);
-    if (result->HasError()) {
-      return Status::Error(StatusCode::kDuckDBError, result->GetError());
-    }
-  } catch (const std::exception &ex) {
-    return Status::Error(StatusCode::kDuckDBError, ex.what());
-  }
-
-  return Status::Ok();
+  change.type = DDLChange::Type::kAlter;
+  return ApplyDDL(std::move(change));
 }
 
 Status DuckDBAdapter::DropTable(std::string schema, std::string table) {
@@ -164,6 +216,241 @@ Status DuckDBAdapter::DropTable(std::string schema, std::string table) {
   }
 
   return Status::Ok();
+}
+
+Status DuckDBAdapter::RenameTable(TableId from, TableId to) {
+  auto st = EnsureInitialized();
+  if (!st.ok()) return st;
+  if (from.table.empty() || to.table.empty()) {
+    return Status::Error(StatusCode::kInvalid, "Missing table name for rename");
+  }
+  if (!from.schema.empty() && !to.schema.empty() && from.schema != to.schema) {
+    return Status::Error(StatusCode::kInvalid,
+                         "Cross-schema rename not supported");
+  }
+  if (from.schema.empty()) {
+    from.schema = to.schema;
+  }
+  const std::string sql = "ALTER TABLE " + QualifiedName(from) +
+                          " RENAME TO " + QuoteIdent(to.table);
+  return ExecuteDDL(sql);
+}
+
+Status DuckDBAdapter::TruncateTable(TableId table) {
+  auto st = EnsureInitialized();
+  if (!st.ok()) return st;
+  if (table.table.empty()) {
+    return Status::Error(StatusCode::kInvalid, "Missing table name to truncate");
+  }
+  const std::string sql = "DELETE FROM " + QualifiedName(table);
+  return ExecuteDDL(sql);
+}
+
+Status DuckDBAdapter::GetTableColumns(TableId table,
+                                      std::vector<std::string> *columns) {
+  if (!columns) {
+    return Status::Error(StatusCode::kInvalid, "Columns output is null");
+  }
+  columns->clear();
+
+  auto st = EnsureInitialized();
+  if (!st.ok()) return st;
+
+  const std::string qualified = QualifiedName(table);
+  const std::string sql =
+      "PRAGMA table_info('" + EscapeLiteral(qualified) + "')";
+
+  try {
+    auto result = conn_->Query(sql);
+    if (result->HasError()) {
+      return Status::Error(StatusCode::kDuckDBError, result->GetError());
+    }
+    while (true) {
+      auto chunk = result->Fetch();
+      if (!chunk || chunk->size() == 0) {
+        break;
+      }
+      for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
+        auto name = chunk->GetValue(1, row);
+        if (!name.IsNull()) {
+          columns->push_back(name.ToString());
+        }
+      }
+    }
+  } catch (const std::exception &ex) {
+    return Status::Error(StatusCode::kDuckDBError, ex.what());
+  }
+
+  return Status::Ok();
+}
+
+Status DuckDBAdapter::CopyTable(TableId source,
+                                const MySQLTableDef &target_def) {
+  auto st = EnsureInitialized();
+  if (!st.ok()) return st;
+  if (source.table.empty()) {
+    return Status::Error(StatusCode::kInvalid, "Missing source table");
+  }
+  if (target_def.name.empty()) {
+    return Status::Error(StatusCode::kInvalid, "Missing target table name");
+  }
+
+  std::string target_schema = target_def.schema.empty() ? source.schema
+                                                        : target_def.schema;
+  if (!target_schema.empty() && !source.schema.empty() &&
+      target_schema != source.schema) {
+    return Status::Error(StatusCode::kInvalid,
+                         "Copy DDL across schemas not supported");
+  }
+
+  const auto suffix = std::to_string(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+  const std::string temp_name = target_def.name + "__duckdb_tmp_" + suffix;
+  const std::string backup_name = source.table + "__duckdb_old_" + suffix;
+
+  st = ExecuteDDLOn(*conn_, "BEGIN TRANSACTION");
+  if (!st.ok()) return st;
+  bool committed = false;
+
+  auto rollback = [&]() {
+    if (!committed) {
+      ExecuteDDLOn(*conn_, "ROLLBACK");
+    }
+  };
+
+  MySQLTableDef temp_def = target_def;
+  temp_def.schema = target_schema;
+  temp_def.name = temp_name;
+
+  st = CreateTable(std::move(temp_def));
+  if (!st.ok()) {
+    rollback();
+    return st;
+  }
+
+  std::vector<std::string> old_cols;
+  st = GetTableColumns(source, &old_cols);
+  if (!st.ok()) {
+    rollback();
+    return st;
+  }
+
+  std::unordered_set<std::string> old_set(old_cols.begin(), old_cols.end());
+  std::vector<std::string> copy_cols;
+  if (!target_def.columns.empty()) {
+    for (const auto &col : target_def.columns) {
+      if (old_set.find(col.name) != old_set.end()) {
+        copy_cols.push_back(col.name);
+      }
+    }
+  } else {
+    copy_cols = old_cols;
+  }
+
+  if (!copy_cols.empty()) {
+    std::string cols_sql;
+    for (size_t i = 0; i < copy_cols.size(); ++i) {
+      cols_sql += QuoteIdent(copy_cols[i]);
+      if (i + 1 < copy_cols.size()) cols_sql += ", ";
+    }
+    TableId temp_table{target_schema, temp_name};
+    const std::string insert_sql =
+        "INSERT INTO " + QualifiedName(temp_table) + " (" + cols_sql + ") " +
+        "SELECT " + cols_sql + " FROM " + QualifiedName(source);
+    st = ExecuteDDLOn(*conn_, insert_sql);
+    if (!st.ok()) {
+      rollback();
+      return st;
+    }
+  }
+
+  TableId backup{source.schema, backup_name};
+  st = RenameTable(source, backup);
+  if (!st.ok()) {
+    rollback();
+    return st;
+  }
+
+  TableId temp_table{target_schema, temp_name};
+  TableId final_table{target_schema, target_def.name};
+  st = RenameTable(temp_table, final_table);
+  if (!st.ok()) {
+    rollback();
+    return st;
+  }
+
+  st = DropTable(backup.schema, backup.table);
+  if (!st.ok()) {
+    rollback();
+    return st;
+  }
+
+  st = ExecuteDDLOn(*conn_, "COMMIT");
+  if (!st.ok()) {
+    rollback();
+    return st;
+  }
+  committed = true;
+  return Status::Ok();
+}
+
+Status DuckDBAdapter::ApplyDDL(DDLChange change) {
+  auto st = EnsureInitialized();
+  if (!st.ok()) return st;
+
+  auto type = change.type;
+  if (type == DDLChange::Type::kUnknown && !change.sql.empty()) {
+    type = InferDDLType(change.sql);
+  }
+
+  switch (type) {
+    case DDLChange::Type::kCreate:
+      if (!change.new_def.name.empty()) {
+        return CreateTable(std::move(change.new_def));
+      }
+      if (change.sql.empty()) {
+        return Status::Error(StatusCode::kInvalid, "Missing CREATE TABLE SQL");
+      }
+      return ExecuteDDL(NormalizeDDL(change.sql));
+    case DDLChange::Type::kDrop:
+      if (!change.table.table.empty()) {
+        return DropTable(change.table.schema, change.table.table);
+      }
+      if (change.sql.empty()) {
+        return Status::Error(StatusCode::kInvalid, "Missing DROP TABLE SQL");
+      }
+      return ExecuteDDL(NormalizeDDL(change.sql));
+    case DDLChange::Type::kAlter:
+      if (change.copy_ddl) {
+        return CopyTable(change.table, change.new_def);
+      }
+      if (change.sql.empty()) {
+        return Status::Error(StatusCode::kInvalid, "Missing ALTER TABLE SQL");
+      }
+      return ExecuteDDL(NormalizeDDL(change.sql));
+    case DDLChange::Type::kRename:
+      if (!change.table.table.empty() && !change.new_table.table.empty()) {
+        return RenameTable(change.table, change.new_table);
+      }
+      if (change.sql.empty()) {
+        return Status::Error(StatusCode::kInvalid, "Missing RENAME TABLE SQL");
+      }
+      return ExecuteDDL(NormalizeDDL(change.sql));
+    case DDLChange::Type::kTruncate:
+      if (!change.table.table.empty()) {
+        return TruncateTable(change.table);
+      }
+      if (change.sql.empty()) {
+        return Status::Error(StatusCode::kInvalid, "Missing TRUNCATE TABLE SQL");
+      }
+      return ExecuteDDL(NormalizeDDL(change.sql));
+    case DDLChange::Type::kUnknown:
+    default:
+      if (change.sql.empty()) {
+        return Status::Error(StatusCode::kInvalid, "Missing DDL SQL");
+      }
+      return ExecuteDDL(NormalizeDDL(change.sql));
+  }
 }
 
 ApplyTxn DuckDBAdapter::BeginApplyTxn(Gtid gtid) {

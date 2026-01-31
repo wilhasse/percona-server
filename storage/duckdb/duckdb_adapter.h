@@ -75,7 +75,21 @@ struct MySQLTableDef {
 };
 
 struct DDLChange {
+  enum class Type {
+    kUnknown,
+    kCreate,
+    kDrop,
+    kAlter,
+    kRename,
+    kTruncate
+  };
+
+  Type type{Type::kUnknown};
   std::string sql;
+  TableId table;
+  TableId new_table;
+  MySQLTableDef new_def;
+  bool copy_ddl{false};
 };
 
 struct Gtid {
@@ -136,6 +150,7 @@ class DuckDBAdapter {
   Status CreateTable(MySQLTableDef def);
   Status AlterTable(DDLChange change);
   Status DropTable(std::string schema, std::string table);
+  Status ApplyDDL(DDLChange change);
 
   ApplyTxn BeginApplyTxn(Gtid gtid);
   Status AppendRows(ApplyTxn &txn, TableId table, RowBatch batch);
@@ -150,9 +165,17 @@ class DuckDBAdapter {
 
  private:
   Status EnsureInitialized() const;
+  Status ExecuteDDL(const std::string &sql);
+  Status ExecuteDDLOn(duckdb::Connection &conn, const std::string &sql);
+  Status RenameTable(TableId from, TableId to);
+  Status TruncateTable(TableId table);
+  Status GetTableColumns(TableId table, std::vector<std::string> *columns);
+  Status CopyTable(TableId source, const MySQLTableDef &target_def);
   std::string QuoteIdent(const std::string &name) const;
   std::string QualifiedName(const TableId &table) const;
   std::string EscapeLiteral(const std::string &value) const;
+  std::string NormalizeDDL(const std::string &sql) const;
+  DDLChange::Type InferDDLType(const std::string &sql) const;
 
   std::string db_path_;
   DuckDBConfig cfg_{};
