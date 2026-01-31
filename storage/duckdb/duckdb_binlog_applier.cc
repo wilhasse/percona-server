@@ -302,14 +302,15 @@ Status DuckDBBinlogApplier::ApplyWatermark() {
   }
 
   const std::string create_sql =
-      "CREATE TABLE IF NOT EXISTS __duckdb_replication_watermark ("
-      "id INTEGER PRIMARY KEY, "
-      "gtid VARCHAR)";
+      "CREATE TABLE IF NOT EXISTS __repl_watermark ("
+      "gtid VARCHAR PRIMARY KEY, "
+      "commit_ts TIMESTAMP)";
   const std::string delete_sql =
-      "DELETE FROM __duckdb_replication_watermark";
+      "DELETE FROM __repl_watermark WHERE gtid = '" +
+      EscapeLiteral(current_gtid_.value) + "'";
   const std::string insert_sql =
-      "INSERT INTO __duckdb_replication_watermark (id, gtid) VALUES (1, '" +
-      EscapeLiteral(current_gtid_.value) + "')";
+      "INSERT INTO __repl_watermark (gtid, commit_ts) VALUES ('" +
+      EscapeLiteral(current_gtid_.value) + "', CURRENT_TIMESTAMP)";
 
   try {
     auto result = apply_txn_.conn->Query(create_sql);

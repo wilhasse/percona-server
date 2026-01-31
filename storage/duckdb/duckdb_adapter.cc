@@ -26,6 +26,14 @@
 #include <sstream>
 
 namespace duckdb_se {
+namespace {
+
+bool IsMissingTableError(const std::string &error, const std::string &table) {
+  return error.find("does not exist") != std::string::npos &&
+         error.find(table) != std::string::npos;
+}
+
+}  // namespace
 
 Status DuckDBAdapter::Init(std::string db_path, DuckDBConfig cfg) {
   if (initialized_) {
@@ -77,6 +85,16 @@ std::string DuckDBAdapter::QuoteIdent(const std::string &name) const {
 std::string DuckDBAdapter::QualifiedName(const TableId &table) const {
   if (table.schema.empty()) return QuoteIdent(table.table);
   return QuoteIdent(table.schema) + "." + QuoteIdent(table.table);
+}
+
+std::string DuckDBAdapter::EscapeLiteral(const std::string &value) const {
+  std::string out;
+  out.reserve(value.size() + 4);
+  for (char ch : value) {
+    if (ch == '\'') out.push_back('\'');
+    out.push_back(ch);
+  }
+  return out;
 }
 
 Status DuckDBAdapter::CreateTable(MySQLTableDef def) {
@@ -313,6 +331,79 @@ QueryResult DuckDBAdapter::ExecuteQuery(std::string mysql_sql,
 
   result.ok = true;
   return result;
+}
+
+Status DuckDBAdapter::GetLatestWatermark(Gtid *gtid) {
+  if (!gtid) {
+    return Status::Error(StatusCode::kInvalid, "GTID output is null");
+  }
+  gtid->value.clear();
+
+  auto st = EnsureInitialized();
+  if (!st.ok()) return st;
+
+  try {
+    auto result = conn_->Query(
+        "SELECT gtid FROM __repl_watermark "
+        "ORDER BY commit_ts DESC LIMIT 1");
+    if (result->HasError()) {
+      if (IsMissingTableError(result->GetError(), "__repl_watermark")) {
+        return Status::Ok();
+      }
+      return Status::Error(StatusCode::kDuckDBError, result->GetError());
+    }
+    auto chunk = result->Fetch();
+    if (!chunk || chunk->size() == 0) {
+      return Status::Ok();
+    }
+    auto val = chunk->GetValue(0, 0);
+    if (!val.IsNull()) {
+      gtid->value = val.ToString();
+    }
+  } catch (const std::exception &ex) {
+    return Status::Error(StatusCode::kDuckDBError, ex.what());
+  }
+
+  return Status::Ok();
+}
+
+Status DuckDBAdapter::GetAppliedGtids(std::vector<Gtid> *gtids) {
+  if (!gtids) {
+    return Status::Error(StatusCode::kInvalid, "GTID list output is null");
+  }
+  gtids->clear();
+
+  auto st = EnsureInitialized();
+  if (!st.ok()) return st;
+
+  try {
+    auto result = conn_->Query(
+        "SELECT gtid FROM __repl_watermark ORDER BY commit_ts");
+    if (result->HasError()) {
+      if (IsMissingTableError(result->GetError(), "__repl_watermark")) {
+        return Status::Ok();
+      }
+      return Status::Error(StatusCode::kDuckDBError, result->GetError());
+    }
+    while (true) {
+      auto chunk = result->Fetch();
+      if (!chunk || chunk->size() == 0) {
+        break;
+      }
+      for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
+        auto val = chunk->GetValue(0, row);
+        if (!val.IsNull()) {
+          Gtid entry;
+          entry.value = val.ToString();
+          gtids->push_back(std::move(entry));
+        }
+      }
+    }
+  } catch (const std::exception &ex) {
+    return Status::Error(StatusCode::kDuckDBError, ex.what());
+  }
+
+  return Status::Ok();
 }
 
 }  // namespace duckdb_se

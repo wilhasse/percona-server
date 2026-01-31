@@ -145,11 +145,14 @@ class DuckDBAdapter {
   Status RollbackApplyTxn(ApplyTxn &txn);
 
   QueryResult ExecuteQuery(std::string mysql_sql, SessionCtx ctx);
+  Status GetLatestWatermark(Gtid *gtid);
+  Status GetAppliedGtids(std::vector<Gtid> *gtids);
 
  private:
   Status EnsureInitialized() const;
   std::string QuoteIdent(const std::string &name) const;
   std::string QualifiedName(const TableId &table) const;
+  std::string EscapeLiteral(const std::string &value) const;
 
   std::string db_path_;
   DuckDBConfig cfg_{};
