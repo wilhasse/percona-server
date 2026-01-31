@@ -34,16 +34,18 @@
 
 namespace duckdb_se {
 
+struct BinlogApplierOptions {
+  size_t max_rows = 50000;
+  size_t max_bytes = 64 * 1024 * 1024;
+  std::chrono::milliseconds max_delay = std::chrono::milliseconds(200);
+};
+
 class DuckDBBinlogApplier {
  public:
-  struct Options {
-    size_t max_rows{50000};
-    size_t max_bytes{64 * 1024 * 1024};
-    std::chrono::milliseconds max_delay{200};
-  };
+  using Options = BinlogApplierOptions;
 
   explicit DuckDBBinlogApplier(DuckDBAdapter *adapter,
-                               Options options = Options());
+                               Options options = Options{});
 
   Status BeginTransaction(Gtid gtid);
   Status AppendInsert(TableId table, Row row);
