@@ -141,9 +141,17 @@ std::string resolve_duckdb_path(const TABLE_SHARE *share) {
 }
 
 bool ensure_duckdb_file(const std::string &path) {
-  File file = my_open(path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, MYF(MY_WME));
-  if (file < 0) return false;
-  my_close(file, MYF(0));
+  // Check if directory exists; DuckDB will create the file itself
+  MY_STAT stat_buf;
+  std::string dir = path.substr(0, path.rfind(FN_LIBCHAR));
+  if (my_stat(dir.c_str(), &stat_buf, MYF(0)) == nullptr) {
+    return false;  // Directory doesn't exist
+  }
+  // Remove existing database file and WAL file - DuckDB needs to create fresh
+  // This handles cases where an empty/corrupt file was left behind, or
+  // a WAL file from a previous failed attempt exists
+  my_delete(path.c_str(), MYF(0));
+  my_delete((path + ".wal").c_str(), MYF(0));
   return true;
 }
 
