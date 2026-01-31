@@ -23,11 +23,13 @@
 
 #include "storage/duckdb/ha_duckdb.h"
 
+#include <cctype>
 #include <cstring>
 #include <map>
 #include <mutex>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "duckdb.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -37,7 +39,11 @@
 #include "mysqld_error.h"
 #include "mysql/plugin.h"
 #include "sql/mysqld.h"
+#include "sql/query_result.h"
 #include "sql/sql_class.h"
+#include "sql/sql_lex.h"
+#include "sql/sql_optimizer.h"
+#include "sql/visible_fields.h"
 #include "scope_guard.h"
 #include "sql/field.h"
 #include "sql/table.h"
@@ -87,6 +93,17 @@ class LoadedTables {
 };
 
 LoadedTables *loaded_tables{nullptr};
+
+class Duckdb_execution_context : public Secondary_engine_execution_context {
+ public:
+  std::string db;
+  std::string table;
+  std::string db_path;
+  std::string sql;
+  std::string fail_reason;
+  TABLE *base_table{nullptr};
+  bool eligible{false};
+};
 
 std::string quote_ident(const char *name, size_t length) {
   std::string out;
@@ -153,6 +170,354 @@ bool ensure_duckdb_file(const std::string &path) {
   my_delete(path.c_str(), MYF(0));
   my_delete((path + ".wal").c_str(), MYF(0));
   return true;
+}
+
+std::string normalize_query_for_duckdb(std::string sql) {
+  for (char &ch : sql) {
+    if (ch == '`') ch = '"';
+  }
+  return sql;
+}
+
+bool is_ident_char(char ch) {
+  return (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') ||
+         (ch >= 'a' && ch <= 'z') || ch == '_';
+}
+
+bool match_ci(const std::string &sql, size_t pos, const std::string &token) {
+  if (pos + token.size() > sql.size()) return false;
+  for (size_t i = 0; i < token.size(); ++i) {
+    const char lhs = static_cast<char>(
+        std::toupper(static_cast<unsigned char>(sql[pos + i])));
+    const char rhs = static_cast<char>(
+        std::toupper(static_cast<unsigned char>(token[i])));
+    if (lhs != rhs) return false;
+  }
+  return true;
+}
+
+std::string rewrite_qualified_table(std::string sql, const std::string &db,
+                                    const std::string &table) {
+  if (db.empty() || table.empty()) return sql;
+
+  const std::string quoted_table = quote_ident(table.c_str(), table.size());
+  const std::string quoted_db = quote_ident(db.c_str(), db.size());
+  const std::string quoted_pattern = quoted_db + "." + quoted_table;
+
+  std::string out;
+  out.reserve(sql.size());
+  const size_t len = sql.size();
+  for (size_t i = 0; i < len;) {
+    const char ch = sql[i];
+    if (ch == '\'') {
+      out.push_back(ch);
+      ++i;
+      while (i < len) {
+        out.push_back(sql[i]);
+        if (sql[i] == '\'') {
+          ++i;
+          if (i < len && sql[i] == '\'') {
+            out.push_back(sql[i]);
+            ++i;
+            continue;
+          }
+          break;
+        }
+        ++i;
+      }
+      continue;
+    }
+
+    if (match_ci(sql, i, quoted_pattern)) {
+      out.append(quoted_table);
+      i += quoted_pattern.size();
+      continue;
+    }
+
+    if (match_ci(sql, i, db)) {
+      const size_t db_end = i + db.size();
+      if (db_end < len && sql[db_end] == '.' &&
+          match_ci(sql, db_end + 1, table)) {
+        const size_t table_end = db_end + 1 + table.size();
+        const bool left_ok = (i == 0) || !is_ident_char(sql[i - 1]);
+        const bool right_ok =
+            (table_end >= len) || !is_ident_char(sql[table_end]);
+        if (left_ok && right_ok) {
+          out.append(table);
+          i = table_end;
+          continue;
+        }
+      }
+    }
+
+    out.push_back(ch);
+    ++i;
+  }
+  return out;
+}
+
+bool is_simple_select(LEX *lex, Table_ref **base_table,
+                      std::string *reason) {
+  if (lex == nullptr || base_table == nullptr) return false;
+  *base_table = nullptr;
+
+  if (lex->sql_command != SQLCOM_SELECT) {
+    if (reason) *reason = "Only SELECT statements are supported";
+    return false;
+  }
+  if (!lex->unit->is_simple() || !lex->is_single_level_stmt()) {
+    if (reason)
+      *reason = "Subqueries, unions, or derived tables are not supported";
+    return false;
+  }
+  if (lex->param_list.elements != 0) {
+    if (reason) *reason = "Prepared statements are not supported";
+    return false;
+  }
+
+  int base_count = 0;
+  for (Table_ref *tl = lex->query_tables; tl != nullptr; tl = tl->next_global) {
+    if (tl->is_placeholder()) continue;
+    if (tl->is_view_or_derived()) {
+      if (reason) *reason = "Views or derived tables are not supported";
+      return false;
+    }
+    if (tl->schema_table != nullptr) {
+      if (reason) *reason = "Schema tables are not supported";
+      return false;
+    }
+    *base_table = tl;
+    ++base_count;
+  }
+
+  if (base_count != 1) {
+    if (reason) *reason = "Only single-table SELECT is supported";
+    return false;
+  }
+
+  return true;
+}
+
+bool uses_only_field_items(const mem_root_deque<Item *> &fields,
+                           TABLE *base_table, std::string *reason) {
+  for (Item *item : VisibleFields(fields)) {
+    Item *real = item->real_item();
+    if (real->type() != Item::FIELD_ITEM) {
+      if (reason) *reason = "Only direct column projections are supported";
+      return false;
+    }
+    auto *field_item = down_cast<Item_field *>(real);
+    if (field_item->field == nullptr ||
+        field_item->field->table != base_table) {
+      if (reason) *reason = "Columns from a single base table are required";
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool DuckdbExecuteQuery(JOIN *join, Query_result *query_result) {
+  if (join == nullptr || query_result == nullptr) return true;
+  THD *thd = join->thd;
+  if (join->fields == nullptr) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "DuckDB select list not available");
+    return true;
+  }
+  auto *ctx = down_cast<Duckdb_execution_context *>(
+      thd->lex->secondary_engine_execution_context());
+  if (ctx == nullptr) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "DuckDB execution context missing");
+    return true;
+  }
+
+  try {
+    duckdb::DBConfig config(true);
+    duckdb::DuckDB db(ctx->db_path, &config);
+    duckdb::Connection conn(db);
+    auto result = conn.SendQuery(ctx->sql);
+    if (!result || result->HasError()) {
+      const std::string err =
+          result ? result->GetError() : "DuckDB query failed";
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), err.c_str());
+      return true;
+    }
+
+    const size_t field_count = CountVisibleFields(*join->fields);
+    if (result->ColumnCount() != field_count) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               "DuckDB result column count mismatch");
+      return true;
+    }
+
+    std::vector<Field *> out_fields;
+    out_fields.reserve(field_count);
+    for (Item *item : VisibleFields(*join->fields)) {
+      Item *real = item->real_item();
+      if (real->type() != Item::FIELD_ITEM) {
+        my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+                 "Unsupported SELECT list for DuckDB offload");
+        return true;
+      }
+      auto *field_item = down_cast<Item_field *>(real);
+      out_fields.push_back(field_item->field);
+    }
+
+    ha_rows sent = 0;
+    while (true) {
+      auto chunk = result->Fetch();
+      if (!chunk || chunk->size() == 0) break;
+
+      for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
+        for (duckdb::idx_t col = 0; col < chunk->ColumnCount(); ++col) {
+          Field *field = out_fields[col];
+          const duckdb::Value value = chunk->GetValue(col, row);
+          if (value.IsNull()) {
+            field->set_null();
+            continue;
+          }
+          field->set_notnull();
+          std::string text;
+          const auto physical = value.type().InternalType();
+          if (physical == duckdb::PhysicalType::VARCHAR ||
+              physical == duckdb::PhysicalType::BLOB) {
+            text = duckdb::StringValue::Get(value);
+          } else {
+            text = value.ToString();
+          }
+          field->store(text.data(), text.size(), field->charset());
+        }
+
+        if (query_result->send_data(thd, *join->fields)) return true;
+        ++sent;
+      }
+    }
+    join->send_records = sent;
+  } catch (const std::exception &ex) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), ex.what());
+    return true;
+  }
+
+  return false;
+}
+
+static bool PrepareSecondaryEngine(THD *thd, LEX *lex) {
+  auto *ctx = new (thd->mem_root) Duckdb_execution_context;
+  if (ctx == nullptr) return true;
+  lex->set_secondary_engine_execution_context(ctx);
+
+  Table_ref *base_table = nullptr;
+  std::string reason;
+  if (!is_simple_select(lex, &base_table, &reason)) {
+    ctx->eligible = false;
+    ctx->fail_reason = reason.empty() ? "Query not eligible for DuckDB" : reason;
+    return false;
+  }
+
+  if (base_table == nullptr || base_table->table == nullptr ||
+      base_table->table->s == nullptr) {
+    ctx->eligible = false;
+    ctx->fail_reason = "Base table not available for DuckDB offload";
+    return false;
+  }
+
+  if (base_table->db != nullptr && base_table->db_length > 0) {
+    ctx->db.assign(base_table->db, base_table->db_length);
+  } else {
+    ctx->db.clear();
+  }
+  if (base_table->table_name != nullptr && base_table->table_name_length > 0) {
+    ctx->table.assign(base_table->table_name, base_table->table_name_length);
+  } else {
+    ctx->table.clear();
+  }
+  ctx->db_path = resolve_duckdb_path(base_table->table->s);
+  ctx->base_table = base_table->table;
+  ctx->eligible = true;
+
+  lex->add_statement_options(OPTION_NO_CONST_TABLES |
+                             OPTION_NO_SUBQUERY_DURING_OPTIMIZATION);
+  return false;
+}
+
+static bool OptimizeSecondaryEngine(THD *thd, LEX *lex) {
+  auto *ctx = down_cast<Duckdb_execution_context *>(
+      lex->secondary_engine_execution_context());
+  if (ctx == nullptr) return false;
+
+  Query_block *qb = lex->unit->first_query_block();
+  if (qb == nullptr || qb->join == nullptr || qb->join->fields == nullptr) {
+    ctx->fail_reason = "DuckDB offload requires a simple SELECT plan";
+    thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
+    return true;
+  }
+
+  if (!ctx->eligible) {
+    thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
+    return true;
+  }
+  if (ctx->base_table == nullptr) {
+    ctx->fail_reason = "DuckDB offload base table missing";
+    thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
+    return true;
+  }
+
+  if (!uses_only_field_items(*qb->join->fields, ctx->base_table,
+                             &ctx->fail_reason)) {
+    thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
+    return true;
+  }
+
+  const LEX_CSTRING &query = thd->query();
+  ctx->sql = normalize_query_for_duckdb(
+      std::string(query.str, query.length));
+  ctx->sql = rewrite_qualified_table(std::move(ctx->sql), ctx->db, ctx->table);
+
+  try {
+    duckdb::DBConfig config(true);
+    duckdb::DuckDB db(ctx->db_path, &config);
+    duckdb::Connection conn(db);
+    auto prepared = conn.Prepare(ctx->sql);
+    if (prepared->HasError()) {
+      ctx->fail_reason = prepared->GetError();
+      thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
+      return true;
+    }
+    const size_t field_count = CountVisibleFields(*qb->join->fields);
+    if (prepared->ColumnCount() != field_count) {
+      ctx->fail_reason = "DuckDB result column count mismatch";
+      thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
+      return true;
+    }
+  } catch (const std::exception &ex) {
+    ctx->fail_reason = ex.what();
+    thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
+    return true;
+  }
+
+  for (Query_block *block = lex->unit->first_query_block(); block != nullptr;
+       block = block->next_query_block()) {
+    if (block->join != nullptr) {
+      block->join->override_executor_func = DuckdbExecuteQuery;
+    }
+  }
+
+  return false;
+}
+
+static const char *DuckdbGetOffloadFailReason(THD *thd) {
+  auto *ctx = down_cast<Duckdb_execution_context *>(
+      thd->lex->secondary_engine_execution_context());
+  if (ctx == nullptr || ctx->fail_reason.empty()) return nullptr;
+  return ctx->fail_reason.c_str();
+}
+
+static void DuckdbSetOffloadFailReason(THD *thd, const char *reason) {
+  auto *ctx = down_cast<Duckdb_execution_context *>(
+      thd->lex->secondary_engine_execution_context());
+  if (ctx == nullptr) return;
+  ctx->fail_reason = reason ? reason : "";
 }
 
 }  // namespace
@@ -435,6 +800,14 @@ static int duckdb_init_func(void *p) {
   duckdb_hton->state = SHOW_OPTION_YES;
   duckdb_hton->flags = HTON_IS_SECONDARY_ENGINE;
   duckdb_hton->db_type = DB_TYPE_UNKNOWN;
+  duckdb_hton->prepare_secondary_engine = PrepareSecondaryEngine;
+  duckdb_hton->optimize_secondary_engine = OptimizeSecondaryEngine;
+  duckdb_hton->get_secondary_engine_offload_or_exec_fail_reason =
+      DuckdbGetOffloadFailReason;
+  duckdb_hton->set_secondary_engine_offload_fail_reason =
+      DuckdbSetOffloadFailReason;
+  duckdb_hton->secondary_engine_flags = MakeSecondaryEngineFlags(
+      SecondaryEngineFlag::USE_EXTERNAL_EXECUTOR);
   return 0;
 }
 
