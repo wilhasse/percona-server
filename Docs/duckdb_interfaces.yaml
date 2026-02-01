@@ -1,0 +1,106 @@
+version: 1
+components:
+  secondary_engine_framework:
+    description: MySQL core entrypoints for secondary engines.
+    hooks:
+      prepare_secondary_engine:
+        input: [THD, LEX]
+        output: bool # true on error
+      optimize_secondary_engine:
+        input: [THD, LEX]
+        output: bool # true on error
+      get_offload_fail_reason:
+        input: [THD]
+        output: string|null
+      set_offload_fail_reason:
+        input: [THD, reason]
+        output: void
+
+  duckdb_se_plugin:
+    description: DuckDB secondary engine offload coordinator.
+    context:
+      fields: [db, table, db_path, sql, fail_reason, eligible]
+    interfaces:
+      rewrite_sql:
+        input: [sql]
+        output: {ok, sql, reason}
+      execute_query:
+        input: [JOIN, Query_result]
+        output: bool # true on error
+
+  duckdb_adapter:
+    description: DuckDB DDL/DML and apply transaction API.
+    interfaces:
+      init:
+        input: [db_path, read_only]
+        output: Status
+      shutdown:
+        input: []
+        output: void
+      create_table:
+        input: [MySQLTableDef]
+        output: Status
+      apply_ddl:
+        input: [DDLChange]
+        output: Status
+      drop_table:
+        input: [schema, table]
+        output: Status
+      begin_apply_txn:
+        input: [Gtid]
+        output: ApplyTxn
+      append_rows:
+        input: [ApplyTxn, TableId, RowBatch]
+        output: Status
+      apply_updates:
+        input: [ApplyTxn, TableId, UpdateBatch]
+        output: Status
+      apply_deletes:
+        input: [ApplyTxn, TableId, DeleteBatch]
+        output: Status
+      commit_apply_txn:
+        input: [ApplyTxn]
+        output: Status
+      rollback_apply_txn:
+        input: [ApplyTxn]
+        output: Status
+      get_latest_watermark:
+        input: [Gtid*]
+        output: Status
+
+  duckdb_binlog_applier:
+    description: Micro-batching applier for row events.
+    interfaces:
+      begin_transaction:
+        input: [Gtid]
+        output: Status
+      append_insert:
+        input: [TableId, Row]
+        output: Status
+      append_insert_batch:
+        input: [TableId, RowBatch]
+        output: Status
+      add_update_statement:
+        input: [TableId, sql]
+        output: Status
+      add_delete_statement:
+        input: [TableId, sql]
+        output: Status
+      commit_transaction:
+        input: []
+        output: Status
+      rollback_transaction:
+        input: []
+        output: Status
+
+schemas:
+  TableId:
+    fields: [schema, table]
+  Row:
+    fields: [Cell...]
+  RowBatch:
+    fields: [TableId, rows]
+  DDLChange:
+    fields: [type, sql, table, new_table, new_def, copy_ddl]
+  Status:
+    fields: [code, message]
