@@ -45,10 +45,18 @@
 #include <unistd.h>
 #endif
 
+#include "sql/my_decimal.h"
+
 #include "storage/duckdb/duckdb_adapter.h"
 #include "storage/duckdb/duckdb_binlog_applier.h"
 #include "storage/duckdb/duckdb_binlog_streamer.h"
 #include "storage/duckdb/duckdb_row_decoder.h"
+
+// Stubs for symbols required by binlogevents_static and my_decimal
+// These are normally provided by mysqld but not available in standalone tools
+int my_decimal::check_result(uint, int result) const { return result; }
+typedef unsigned int PSI_memory_key;
+PSI_memory_key key_memory_log_event = 0;
 
 namespace {
 
