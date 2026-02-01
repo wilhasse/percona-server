@@ -347,8 +347,12 @@ std::string MakeLoadingTableName(const std::string &base) {
 
 std::string QualifiedDuckdbName(const std::string &schema,
                                 const std::string &table) {
-  if (schema.empty()) return QuoteDuckdbIdent(table);
-  return QuoteDuckdbIdent(schema) + "." + QuoteDuckdbIdent(table);
+  // Always use just table name (main schema) since:
+  // 1. MySQL ha_duckdb creates tables without schema prefix
+  // 2. Schema separation is handled at DuckDB file level (<schema>.duckdb)
+  // 3. Binlog applier expects tables in main schema
+  (void)schema;  // Schema is implicit via DuckDB file
+  return QuoteDuckdbIdent(table);
 }
 
 bool ExecQuery(MYSQL *mysql, const std::string &sql) {
@@ -369,9 +373,12 @@ bool ExecQuery(MYSQL *mysql, const std::string &sql) {
 bool DuckdbTableExists(DuckDBAdapter &adapter, const std::string &schema,
                        const std::string &table, bool *exists) {
   if (!exists) return false;
+  // Look for table in 'main' schema since that's where MySQL SE creates them.
+  // The schema parameter is used for DuckDB file selection, not DuckDB schema.
+  (void)schema;
   const std::string sql =
-      "SELECT 1 FROM information_schema.tables WHERE table_schema = " +
-      QuoteDuckdbLiteral(schema) + " AND table_name = " +
+      "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main'"
+      " AND table_name = " +
       QuoteDuckdbLiteral(table) + " LIMIT 1";
   auto result = adapter.ExecuteQuery(sql, {});
   if (!result.ok) {
@@ -570,14 +577,11 @@ bool FetchTableDef(MYSQL *mysql, const std::string &schema,
 }
 
 bool EnsureDuckdbSchema(DuckDBAdapter &adapter, const std::string &schema) {
-  if (schema.empty()) return true;
-  const std::string sql =
-      "CREATE SCHEMA IF NOT EXISTS " + QuoteDuckdbIdent(schema);
-  auto result = adapter.ExecuteQuery(sql, {});
-  if (!result.ok) {
-    std::cerr << "DuckDB schema create failed: " << result.error << "\n";
-    return false;
-  }
+  // No-op: We use main schema only. Schema separation is handled at the
+  // DuckDB file level (<schema>.duckdb), not via DuckDB schemas.
+  // This matches how MySQL ha_duckdb creates tables.
+  (void)adapter;
+  (void)schema;
   return true;
 }
 

@@ -412,8 +412,11 @@ std::string DuckDBAdapter::QuoteIdent(const std::string &name) const {
 }
 
 std::string DuckDBAdapter::QualifiedName(const TableId &table) const {
-  if (table.schema.empty()) return QuoteIdent(table.table);
-  return QuoteIdent(table.schema) + "." + QuoteIdent(table.table);
+  // Always use just table name (main schema) since:
+  // 1. MySQL ha_duckdb creates tables without schema prefix
+  // 2. Schema separation is handled at DuckDB file level (<schema>.duckdb)
+  // 3. Binlog applier creates per-schema DuckDB instances
+  return QuoteIdent(table.table);
 }
 
 std::string DuckDBAdapter::EscapeLiteral(const std::string &value) const {
@@ -923,15 +926,10 @@ Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
   if (!st.ok()) return st;
 
   try {
-    TableId delta{table.schema, DeltaTableName(table)};
+    // Use main schema only - schema separation is at DuckDB file level
+    const std::string delta_name = DeltaTableName(table);
     std::unique_ptr<duckdb::Appender> appender;
-    if (delta.schema.empty()) {
-      appender = std::make_unique<duckdb::Appender>(*txn.conn, delta.table);
-    } else {
-      appender =
-          std::make_unique<duckdb::Appender>(*txn.conn, delta.schema,
-                                             delta.table);
-    }
+    appender = std::make_unique<duckdb::Appender>(*txn.conn, delta_name);
 
     for (const auto &row : batch.old_rows) {
       appender->BeginRow();
@@ -971,22 +969,22 @@ Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
     }
 
     const std::string target = QualifiedName(table);
-    const std::string delta_name = QualifiedName(delta);
+    const std::string delta_quoted = QuoteIdent(delta_name);
 
     std::string join_sql;
     for (size_t i = 0; i < columns.size(); ++i) {
       if (i > 0) join_sql += " AND ";
       const std::string col = QuoteIdent(columns[i]);
-      join_sql += target + "." + col + " IS NOT DISTINCT FROM " + delta_name +
+      join_sql += target + "." + col + " IS NOT DISTINCT FROM " + delta_quoted +
                   "." + col;
     }
 
     const std::string delete_sql =
-        "DELETE FROM " + target + " USING " + delta_name + " WHERE " + join_sql;
+        "DELETE FROM " + target + " USING " + delta_quoted + " WHERE " + join_sql;
     st = ExecuteDDLOn(*txn.conn, delete_sql);
     if (!st.ok()) return st;
 
-    const std::string cleanup_sql = "DELETE FROM " + delta_name;
+    const std::string cleanup_sql = "DELETE FROM " + delta_quoted;
     st = ExecuteDDLOn(*txn.conn, cleanup_sql);
     if (!st.ok()) return st;
 
@@ -1015,15 +1013,10 @@ Status DuckDBAdapter::ApplyBulkDeletes(ApplyTxn &txn, TableId table,
   if (!st.ok()) return st;
 
   try {
-    TableId delta{table.schema, DeltaTableName(table)};
+    // Use main schema only - schema separation is at DuckDB file level
+    const std::string delta_name = DeltaTableName(table);
     std::unique_ptr<duckdb::Appender> appender;
-    if (delta.schema.empty()) {
-      appender = std::make_unique<duckdb::Appender>(*txn.conn, delta.table);
-    } else {
-      appender =
-          std::make_unique<duckdb::Appender>(*txn.conn, delta.schema,
-                                             delta.table);
-    }
+    appender = std::make_unique<duckdb::Appender>(*txn.conn, delta_name);
 
     for (const auto &row : batch.old_rows) {
       appender->BeginRow();
@@ -1057,22 +1050,22 @@ Status DuckDBAdapter::ApplyBulkDeletes(ApplyTxn &txn, TableId table,
     }
 
     const std::string target = QualifiedName(table);
-    const std::string delta_name = QualifiedName(delta);
+    const std::string delta_quoted = QuoteIdent(delta_name);
 
     std::string join_sql;
     for (size_t i = 0; i < columns.size(); ++i) {
       if (i > 0) join_sql += " AND ";
       const std::string col = QuoteIdent(columns[i]);
-      join_sql += target + "." + col + " IS NOT DISTINCT FROM " + delta_name +
+      join_sql += target + "." + col + " IS NOT DISTINCT FROM " + delta_quoted +
                   "." + col;
     }
 
     const std::string delete_sql =
-        "DELETE FROM " + target + " USING " + delta_name + " WHERE " + join_sql;
+        "DELETE FROM " + target + " USING " + delta_quoted + " WHERE " + join_sql;
     st = ExecuteDDLOn(*txn.conn, delete_sql);
     if (!st.ok()) return st;
 
-    const std::string cleanup_sql = "DELETE FROM " + delta_name;
+    const std::string cleanup_sql = "DELETE FROM " + delta_quoted;
     st = ExecuteDDLOn(*txn.conn, cleanup_sql);
     if (!st.ok()) return st;
   } catch (const std::exception &ex) {

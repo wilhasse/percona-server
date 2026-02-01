@@ -712,14 +712,28 @@ Status DecodeUpdateRowsInternal(
     size_t before_consumed = 0;
     st = DecodeRow(columns_info, columns_before, ptr, end, &before,
                    &before_consumed);
-    if (!st.ok()) return st;
+    if (!st.ok()) {
+      // If we've decoded at least one row pair and remaining looks like padding
+      const size_t remaining = static_cast<size_t>(end - ptr);
+      if (!before_rows->empty() && remaining <= 4 && *ptr == 0) {
+        break;
+      }
+      return st;
+    }
     ptr += before_consumed;
 
     Row after;
     size_t after_consumed = 0;
     st =
         DecodeRow(columns_info, columns_after, ptr, end, &after, &after_consumed);
-    if (!st.ok()) return st;
+    if (!st.ok()) {
+      // Handle padding after before-row but before after-row
+      const size_t remaining = static_cast<size_t>(end - ptr);
+      if (!before_rows->empty() && remaining <= 4 && *ptr == 0) {
+        break;
+      }
+      return st;
+    }
     ptr += after_consumed;
 
     before_rows->push_back(std::move(before));
@@ -729,7 +743,9 @@ Status DecodeUpdateRowsInternal(
     return Status::Error(StatusCode::kInvalid,
                          "Update row counts do not match");
   }
-  if (ptr != end) {
+  // Allow small amounts of trailing padding (common in binlog events)
+  const size_t trailing = static_cast<size_t>(end - ptr);
+  if (trailing > 4) {
     return Status::Error(StatusCode::kInvalid,
                          "Update payload length mismatch");
   }
