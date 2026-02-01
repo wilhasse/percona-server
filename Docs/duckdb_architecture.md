@@ -23,7 +23,7 @@
               v
 +---------------------------+
 | DuckDB Embedded Database  |
-| (per-table .duckdb files) |
+| (per-schema .duckdb files)|
 +---------------------------+
 
 See `Docs/duckdb_dual_storage.md` for a dual-storage overview and query flow.
@@ -58,7 +58,8 @@ Replication path:
   and streaming back to MySQL protocol.
 - DuckDB Adapter: authoritative API for DDL/DML and apply transactions.
 - Binlog Applier: batching and ordering for replication apply.
-- DuckDB Embedded DB: per-table storage files, read-only for offload path.
+- DuckDB Embedded DB: per-schema storage files (default), read-only for
+  offload path.
 
 ## Dependency Graph
 - Offload coordinator -> Compatibility rewrite
@@ -75,7 +76,7 @@ Replication path:
   See `Docs/duckdb_ddl_support.md` for the unsupported DDL list.
 - Crash consistency: watermark table updated in same DuckDB transaction as
   applied changes; verify on restart.
-- Performance regressions: micro-batching for apply, per-table DB files,
+- Performance regressions: micro-batching for apply, per-schema DB files,
   and cost threshold gating for offload.
 - Type mapping drift: keep adapter mapping centralized and add tests for
   common types (NULL handling, binary, JSON, etc.). See
@@ -84,7 +85,8 @@ Replication path:
   documented in `Docs/duckdb_operations.md`.
 
 ## Milestone Plan
-- M1: Read-only secondary engine and per-table DuckDB files (done).
+- M1: Read-only secondary engine and per-schema DuckDB files (default; legacy
+  per-table files via SECONDARY_ENGINE_ATTRIBUTE).
 - M2: Binlog applier + micro-batching + watermarks (done).
 - M3: DDL support with copy DDL fallback (done).
 - M4: Query offload + deterministic compatibility rewrites (done).

@@ -4,8 +4,8 @@
 MySQL's Secondary Engine framework enables dual storage between InnoDB
 (primary) and DuckDB (secondary) without the handlers calling each other
 in normal query execution. MySQL orchestrates eligibility and execution,
-while DuckDB provides read-optimized analytics over a per-table `.duckdb`
-file.
+while DuckDB provides read-optimized analytics over a per-schema `.duckdb`
+database file (default).
 
 ## Architecture
 ```
@@ -23,7 +23,7 @@ file.
                     | InnoDB  |             | DuckDB  |
                     |primary  |             |secondary|
                     +---------+             +---------+
-                      t1.ibd                  t1.duckdb
+                      t1.ibd               <schema>.duckdb
 ```
 
 ## Key Handlerton Hooks
@@ -81,7 +81,7 @@ Prepares the rewritten SQL in DuckDB to validate it, then wires
 `DuckdbExecuteQuery` as the external executor when eligible.
 
 ### Step 3: DuckdbExecuteQuery()
-Opens the per-table DuckDB file, executes the query, and streams rows back
+Opens the per-schema DuckDB database file, executes the query, and streams rows back
 through the MySQL result pipeline.
 
 ## Data Sync (SECONDARY_LOAD)
@@ -98,8 +98,14 @@ while (primary->ha_rnd_next(record) == 0) {
 }
 ```
 
-After the initial load, the DuckDB binlog applier keeps the `.duckdb` table
-in sync with changes on the primary.
+After the initial load, the DuckDB binlog applier keeps the tables inside the
+schema-level `.duckdb` database in sync with changes on the primary.
+
+## Legacy Per-table Layout
+If you need to keep existing per-table DuckDB files, set
+`SECONDARY_ENGINE_ATTRIBUTE` to an explicit `.duckdb` path when creating or
+altering the table. This forces the handler to use that file instead of the
+default per-schema database.
 
 ## Key Files
 - `storage/duckdb/ha_duckdb.cc` - DuckDB handler and secondary engine hooks

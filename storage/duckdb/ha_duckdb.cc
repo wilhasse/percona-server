@@ -501,10 +501,8 @@ std::string build_where_clause(const std::vector<Field *> &fields,
 std::string default_duckdb_path(const TABLE_SHARE *share) {
   std::string dir = mysql_real_data_home;
   if (!dir.empty() && dir.back() != FN_LIBCHAR) dir.push_back(FN_LIBCHAR);
-  dir.append(share->db.str, share->db.length);
-  dir.push_back(FN_LIBCHAR);
   std::string file;
-  file.append(share->table_name.str, share->table_name.length);
+  file.append(share->db.str, share->db.length);
   file.append(".duckdb");
   return dir + file;
 }
@@ -524,11 +522,10 @@ bool ensure_duckdb_file(const std::string &path) {
   if (my_stat(dir.c_str(), &stat_buf, MYF(0)) == nullptr) {
     return false;  // Directory doesn't exist
   }
-  // Remove existing database file and WAL file - DuckDB needs to create fresh
-  // This handles cases where an empty/corrupt file was left behind, or
-  // a WAL file from a previous failed attempt exists
-  my_delete(path.c_str(), MYF(0));
-  my_delete((path + ".wal").c_str(), MYF(0));
+  if (my_stat(path.c_str(), &stat_buf, MYF(0)) == nullptr) {
+    // If DB doesn't exist, remove any stale WAL before DuckDB creates it.
+    my_delete((path + ".wal").c_str(), MYF(0));
+  }
   return true;
 }
 
@@ -1016,12 +1013,10 @@ int ha_duckdb::create(const char *, TABLE *table_arg, HA_CREATE_INFO *,
     return HA_ERR_GENERIC;
   }
 
-  if (my_stat(path.c_str(), &stat_buf, MYF(0)) != nullptr) {
-    my_error(ER_TABLE_EXISTS_ERROR, MYF(0), table_arg->s->table_name.str);
-    return HA_ERR_TABLE_EXIST;
+  const bool file_exists = (my_stat(path.c_str(), &stat_buf, MYF(0)) != nullptr);
+  if (!file_exists) {
+    my_delete((path + ".wal").c_str(), MYF(0));
   }
-
-  my_delete((path + ".wal").c_str(), MYF(0));
 
   try {
     duckdb::DBConfig config(false);
@@ -1047,8 +1042,14 @@ int ha_duckdb::create(const char *, TABLE *table_arg, HA_CREATE_INFO *,
 
     auto result = conn.Query(create_sql);
     if (result->HasError()) {
+      const std::string err = result->GetError();
+      if (err.find("already exists") != std::string::npos ||
+          err.find("ALREADY EXISTS") != std::string::npos) {
+        my_error(ER_TABLE_EXISTS_ERROR, MYF(0), table_arg->s->table_name.str);
+        return HA_ERR_TABLE_EXIST;
+      }
       my_error(ER_CANT_CREATE_TABLE, MYF(0), table_arg->s->table_name.str,
-               HA_ERR_GENERIC, result->GetError().c_str());
+               HA_ERR_GENERIC, err.c_str());
       return HA_ERR_GENERIC;
     }
   } catch (const std::exception &ex) {
@@ -1073,7 +1074,7 @@ int ha_duckdb::open(const char *, int, unsigned int, const dd::Table *) {
     MY_STAT stat_buf;
     if (my_stat(path.c_str(), &stat_buf, MYF(0)) == nullptr) {
       my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-               "DuckDB table file not found");
+               "DuckDB database file not found");
       return HA_ERR_GENERIC;
     }
     loaded_tables->add(table_share->db.str, table_share->table_name.str, path);

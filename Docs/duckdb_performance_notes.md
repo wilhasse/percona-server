@@ -12,8 +12,8 @@ DuckDB secondary-engine workloads.
 - **Offload eligibility**: Queries must be simple single-table SELECTs;
   SELECT lists may include expressions/functions/aggregates if DuckDB
   supports them, otherwise they fall back.
-- **Disk contention**: Per-table DuckDB files can amplify IO when many
-  tables are loaded at once.
+- **Disk contention**: Per-schema DuckDB files can amplify IO when many
+  tables in the same schema are loaded at once.
 
 ## Tuning Knobs
 - `DuckDBBinlogApplier::Options`:
