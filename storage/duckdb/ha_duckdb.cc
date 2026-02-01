@@ -536,8 +536,9 @@ bool backup_stale_wal(const std::string &path) {
   oss << wal << ".bak." << static_cast<ulonglong>(my_micro_time());
   const std::string backup = oss.str();
   if (my_rename(wal.c_str(), backup.c_str(), MYF(0)) != 0) {
+    char errbuf[MYSYS_STRERROR_SIZE];
     sql_print_warning("DuckDB WAL backup failed for %s (%s)", wal.c_str(),
-                      my_strerror(0, my_errno()));
+                      my_strerror(errbuf, sizeof(errbuf), my_errno()));
     return false;
   }
   sql_print_warning("DuckDB WAL moved aside to %s before creating %s",
