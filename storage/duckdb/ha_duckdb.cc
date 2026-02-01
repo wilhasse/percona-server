@@ -179,6 +179,26 @@ duckdb::Value field_value(Field *field) {
   return duckdb::Value(std::string(tmp.ptr(), tmp.length()));
 }
 
+std::string value_to_sql(const duckdb::Value &val) {
+  if (val.IsNull()) return "NULL";
+  // Use DuckDB's ToString which properly escapes values
+  const auto &type = val.type();
+  if (type.id() == duckdb::LogicalTypeId::VARCHAR ||
+      type.id() == duckdb::LogicalTypeId::BLOB) {
+    std::string str = val.ToString();
+    std::string escaped;
+    escaped.reserve(str.size() + 4);
+    escaped.push_back('\'');
+    for (char ch : str) {
+      if (ch == '\'') escaped.push_back('\'');
+      escaped.push_back(ch);
+    }
+    escaped.push_back('\'');
+    return escaped;
+  }
+  return val.ToString();
+}
+
 std::vector<Field *> collect_fields(TABLE *table, const MY_BITMAP *bitmap) {
   std::vector<Field *> fields;
   if (table == nullptr || table->s == nullptr) return fields;
@@ -213,24 +233,28 @@ std::vector<duckdb::Value> collect_values(TABLE *table, const uchar *record,
   return values;
 }
 
-std::string build_set_clause(const std::vector<Field *> &fields) {
+std::string build_set_clause(const std::vector<Field *> &fields,
+                             const std::vector<duckdb::Value> &values) {
   std::string sql;
   for (size_t i = 0; i < fields.size(); ++i) {
     if (i > 0) sql.append(", ");
     const char *name = fields[i]->field_name;
     sql.append(quote_ident(name, std::strlen(name)));
-    sql.append(" = ?");
+    sql.append(" = ");
+    sql.append(value_to_sql(values[i]));
   }
   return sql;
 }
 
-std::string build_where_clause(const std::vector<Field *> &fields) {
+std::string build_where_clause(const std::vector<Field *> &fields,
+                               const std::vector<duckdb::Value> &values) {
   std::string sql;
   for (size_t i = 0; i < fields.size(); ++i) {
     if (i > 0) sql.append(" AND ");
     const char *name = fields[i]->field_name;
     sql.append(quote_ident(name, std::strlen(name)));
-    sql.append(" IS NOT DISTINCT FROM ?");
+    sql.append(" IS NOT DISTINCT FROM ");
+    sql.append(value_to_sql(values[i]));
   }
   return sql;
 }
@@ -887,33 +911,23 @@ int ha_duckdb::update_row(const uchar *old_data, uchar *new_data) {
       collect_fields(table, table->read_set);
   if (set_fields.empty() || where_fields.empty()) return HA_ERR_GENERIC;
 
-  std::vector<duckdb::Value> params =
+  std::vector<duckdb::Value> set_values =
       collect_values(table, new_data, set_fields);
   std::vector<duckdb::Value> where_values =
       collect_values(table, old_data, where_fields);
-  params.reserve(params.size() + where_values.size());
-  for (auto &val : where_values) {
-    params.push_back(std::move(val));
-  }
 
   std::string sql = "UPDATE ";
   sql += quote_ident(m_table_name.c_str(), m_table_name.size());
   sql += " SET ";
-  sql += build_set_clause(set_fields);
+  sql += build_set_clause(set_fields, set_values);
   sql += " WHERE ";
-  sql += build_where_clause(where_fields);
+  sql += build_where_clause(where_fields, where_values);
 
   try {
     duckdb::DBConfig config(false);
     duckdb::DuckDB db(m_table_path, &config);
     duckdb::Connection conn(db);
-    auto prepared = conn.Prepare(sql);
-    if (prepared->HasError()) {
-      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-               prepared->GetError().c_str());
-      return HA_ERR_GENERIC;
-    }
-    auto result = prepared->Execute(params);
+    auto result = conn.Query(sql);
     if (result->HasError()) {
       my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), result->GetError().c_str());
       return HA_ERR_GENERIC;
@@ -941,25 +955,19 @@ int ha_duckdb::delete_row(const uchar *buf) {
       collect_fields(table, table->read_set);
   if (where_fields.empty()) return HA_ERR_GENERIC;
 
-  std::vector<duckdb::Value> params =
+  std::vector<duckdb::Value> where_values =
       collect_values(table, buf, where_fields);
 
   std::string sql = "DELETE FROM ";
   sql += quote_ident(m_table_name.c_str(), m_table_name.size());
   sql += " WHERE ";
-  sql += build_where_clause(where_fields);
+  sql += build_where_clause(where_fields, where_values);
 
   try {
     duckdb::DBConfig config(false);
     duckdb::DuckDB db(m_table_path, &config);
     duckdb::Connection conn(db);
-    auto prepared = conn.Prepare(sql);
-    if (prepared->HasError()) {
-      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-               prepared->GetError().c_str());
-      return HA_ERR_GENERIC;
-    }
-    auto result = prepared->Execute(params);
+    auto result = conn.Query(sql);
     if (result->HasError()) {
       my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), result->GetError().c_str());
       return HA_ERR_GENERIC;
