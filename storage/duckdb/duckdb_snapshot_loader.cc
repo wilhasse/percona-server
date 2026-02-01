@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -33,6 +34,12 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 #include "storage/duckdb/duckdb_adapter.h"
 
@@ -84,6 +91,14 @@ void PrintUsage(const char *argv0) {
          "  --overwrite              Drop table if it exists\n"
          "  --verbose                Verbose output\n"
          "  --help                   Show this help\n";
+}
+
+int GetPid() {
+#ifdef _WIN32
+  return _getpid();
+#else
+  return ::getpid();
+#endif
 }
 
 bool StartsWith(const std::string &value, const std::string &prefix) {
@@ -286,6 +301,19 @@ std::string QuoteDuckdbLiteral(const std::string &value) {
   return "'" + escaped + "'";
 }
 
+std::string MakeLoadingTableName(const std::string &base) {
+  const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+  std::ostringstream oss;
+  oss << "__loading_" << base << "_" << GetPid() << "_" << now;
+  return oss.str();
+}
+
+std::string QualifiedDuckdbName(const std::string &schema,
+                                const std::string &table) {
+  if (schema.empty()) return QuoteDuckdbIdent(table);
+  return QuoteDuckdbIdent(schema) + "." + QuoteDuckdbIdent(table);
+}
+
 bool ExecQuery(MYSQL *mysql, const std::string &sql) {
   if (mysql_real_query(mysql, sql.c_str(), sql.size()) != 0) {
     std::cerr << "MySQL query failed: " << mysql_error(mysql) << "\n";
@@ -298,6 +326,23 @@ bool ExecQuery(MYSQL *mysql, const std::string &sql) {
     return false;
   }
   mysql_free_result(res);
+  return true;
+}
+
+bool DuckdbTableExists(DuckDBAdapter &adapter, const std::string &schema,
+                       const std::string &table, bool *exists) {
+  if (!exists) return false;
+  const std::string sql =
+      "SELECT 1 FROM information_schema.tables WHERE table_schema = " +
+      QuoteDuckdbLiteral(schema) + " AND table_name = " +
+      QuoteDuckdbLiteral(table) + " LIMIT 1";
+  auto result = adapter.ExecuteQuery(sql, {});
+  if (!result.ok) {
+    std::cerr << "DuckDB table check failed: " << result.error << "\n";
+    return false;
+  }
+  auto chunk = result.result->Fetch();
+  *exists = (chunk && chunk->size() > 0);
   return true;
 }
 
@@ -460,13 +505,49 @@ bool StoreSnapshotGtid(DuckDBAdapter &adapter, const std::string &gtid) {
   return true;
 }
 
+bool SwapInTable(DuckDBAdapter &adapter, const std::string &schema,
+                 const std::string &temp_table,
+                 const std::string &real_table) {
+  const std::string qualified_temp = QualifiedDuckdbName(schema, temp_table);
+  const std::string qualified_real = QualifiedDuckdbName(schema, real_table);
+
+  auto begin = adapter.ExecuteQuery("BEGIN TRANSACTION", {});
+  if (!begin.ok) {
+    std::cerr << "DuckDB begin transaction failed: " << begin.error << "\n";
+    return false;
+  }
+  auto drop = adapter.ExecuteQuery("DROP TABLE IF EXISTS " + qualified_real, {});
+  if (!drop.ok) {
+    std::cerr << "DuckDB drop failed: " << drop.error << "\n";
+    adapter.ExecuteQuery("ROLLBACK", {});
+    return false;
+  }
+  const std::string rename_sql =
+      "ALTER TABLE " + qualified_temp + " RENAME TO " +
+      QuoteDuckdbIdent(real_table);
+  auto rename = adapter.ExecuteQuery(rename_sql, {});
+  if (!rename.ok) {
+    std::cerr << "DuckDB rename failed: " << rename.error << "\n";
+    adapter.ExecuteQuery("ROLLBACK", {});
+    return false;
+  }
+  auto commit = adapter.ExecuteQuery("COMMIT", {});
+  if (!commit.ok) {
+    std::cerr << "DuckDB commit failed: " << commit.error << "\n";
+    adapter.ExecuteQuery("ROLLBACK", {});
+    return false;
+  }
+  return true;
+}
+
 bool StreamTable(MYSQL *mysql, DuckDBAdapter &adapter,
-                 const std::string &schema, const std::string &table,
+                 const std::string &schema, const std::string &source_table,
+                 const std::string &dest_table,
                  const std::vector<bool> &blob_flags, size_t batch_rows,
                  size_t *row_count) {
   if (row_count) *row_count = 0;
   const std::string sql = "SELECT * FROM " + QuoteMySQLIdent(schema) + "." +
-                          QuoteMySQLIdent(table);
+                          QuoteMySQLIdent(source_table);
   if (mysql_real_query(mysql, sql.c_str(), sql.size()) != 0) {
     std::cerr << "MySQL query failed: " << mysql_error(mysql) << "\n";
     return false;
@@ -487,7 +568,8 @@ bool StreamTable(MYSQL *mysql, DuckDBAdapter &adapter,
     }
   }
 
-  ApplyTxn txn = adapter.BeginApplyTxn(Gtid{"snapshot:" + schema + "." + table});
+  ApplyTxn txn =
+      adapter.BeginApplyTxn(Gtid{"snapshot:" + schema + "." + dest_table});
   if (!txn.status.ok()) {
     std::cerr << "DuckDB begin transaction failed: " << txn.status.message
               << "\n";
@@ -495,7 +577,7 @@ bool StreamTable(MYSQL *mysql, DuckDBAdapter &adapter,
     return false;
   }
 
-  TableId table_id{schema, table};
+  TableId table_id{schema, dest_table};
   RowBatch batch;
   batch.table = table_id;
   batch.rows.reserve(batch_rows);
@@ -688,6 +770,22 @@ int main(int argc, char **argv) {
       std::cerr << "Loading " << opts.schema << "." << table << "...\n";
     }
 
+    bool target_exists = false;
+    if (!DuckdbTableExists(adapter, opts.schema, table, &target_exists)) {
+      adapter.Shutdown();
+      mysql_close(mysql);
+      mysql_library_end();
+      return 1;
+    }
+    if (target_exists && !opts.overwrite) {
+      std::cerr << "DuckDB table " << opts.schema << "." << table
+                << " already exists. Use --overwrite to replace.\n";
+      adapter.Shutdown();
+      mysql_close(mysql);
+      mysql_library_end();
+      return 1;
+    }
+
     MySQLTableDef def;
     std::vector<bool> blob_flags;
     if (!FetchTableDef(mysql, opts.schema, table, &def, &blob_flags)) {
@@ -699,13 +797,13 @@ int main(int argc, char **argv) {
       return 1;
     }
 
-    if (opts.overwrite) {
-      adapter.DropTable(opts.schema, table);
-    }
+    const std::string temp_table = MakeLoadingTableName(table);
+    adapter.DropTable(opts.schema, temp_table);
+    def.name = temp_table;
     st = adapter.CreateTable(def);
     if (!st.ok()) {
       std::cerr << "DuckDB create table failed for " << opts.schema << "."
-                << table << ": " << st.message << "\n";
+                << temp_table << ": " << st.message << "\n";
       adapter.Shutdown();
       mysql_close(mysql);
       mysql_library_end();
@@ -713,8 +811,15 @@ int main(int argc, char **argv) {
     }
 
     size_t rows = 0;
-    if (!StreamTable(mysql, adapter, opts.schema, table, blob_flags,
+    if (!StreamTable(mysql, adapter, opts.schema, table, temp_table, blob_flags,
                      opts.batch_rows, &rows)) {
+      adapter.Shutdown();
+      mysql_close(mysql);
+      mysql_library_end();
+      return 1;
+    }
+
+    if (!SwapInTable(adapter, opts.schema, temp_table, table)) {
       adapter.Shutdown();
       mysql_close(mysql);
       mysql_library_end();
