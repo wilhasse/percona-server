@@ -715,7 +715,8 @@ Status DecodeUpdateRowsInternal(
     if (!st.ok()) {
       // If we've decoded at least one row pair and remaining looks like padding
       const size_t remaining = static_cast<size_t>(end - ptr);
-      if (!before_rows->empty() && remaining <= 4 && *ptr == 0) {
+      if (!before_rows->empty() && remaining > 0 && remaining <= 4 &&
+          *ptr == 0) {
         break;
       }
       return st;
@@ -729,7 +730,8 @@ Status DecodeUpdateRowsInternal(
     if (!st.ok()) {
       // Handle padding after before-row but before after-row
       const size_t remaining = static_cast<size_t>(end - ptr);
-      if (!before_rows->empty() && remaining <= 4 && *ptr == 0) {
+      if (!before_rows->empty() && remaining > 0 && remaining <= 4 &&
+          *ptr == 0) {
         break;
       }
       return st;

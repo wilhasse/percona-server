@@ -374,19 +374,42 @@ bool DuckdbTableExists(DuckDBAdapter &adapter, const std::string &schema,
                        const std::string &table, bool *exists) {
   if (!exists) return false;
   // Look for table in 'main' schema since that's where MySQL SE creates them.
-  // The schema parameter is used for DuckDB file selection, not DuckDB schema.
-  (void)schema;
-  const std::string sql =
+  const std::string main_sql =
       "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main'"
       " AND table_name = " +
       QuoteDuckdbLiteral(table) + " LIMIT 1";
-  auto result = adapter.ExecuteQuery(sql, {});
+  auto result = adapter.ExecuteQuery(main_sql, {});
   if (!result.ok) {
     std::cerr << "DuckDB table check failed: " << result.error << "\n";
     return false;
   }
   auto chunk = result.result->Fetch();
-  *exists = (chunk && chunk->size() > 0);
+  if (chunk && chunk->size() > 0) {
+    *exists = true;
+    return true;
+  }
+
+  // Backward compatibility: older builds may have schema-qualified tables.
+  if (!schema.empty()) {
+    const std::string schema_sql =
+        "SELECT 1 FROM information_schema.tables WHERE table_schema = " +
+        QuoteDuckdbLiteral(schema) + " AND table_name = " +
+        QuoteDuckdbLiteral(table) + " LIMIT 1";
+    result = adapter.ExecuteQuery(schema_sql, {});
+    if (!result.ok) {
+      std::cerr << "DuckDB table check failed: " << result.error << "\n";
+      return false;
+    }
+    chunk = result.result->Fetch();
+    if (chunk && chunk->size() > 0) {
+      std::cerr << "DuckDB table exists in schema '" << schema
+                << "' (legacy layout). Use --overwrite to rebuild in main.\n";
+      *exists = true;
+      return true;
+    }
+  }
+
+  *exists = false;
   return true;
 }
 

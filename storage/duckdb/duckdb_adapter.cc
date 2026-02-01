@@ -842,29 +842,12 @@ Status DuckDBAdapter::AppendRows(ApplyTxn &txn, TableId table, RowBatch batch) {
   }
 
   try {
-    // MySQL DuckDB SE creates tables without schema prefix (main schema).
-    // Try main schema first, then fall back to specified schema.
-    std::unique_ptr<duckdb::Appender> appender;
-    try {
-      // First try without schema (main schema, where MySQL creates tables)
-      appender = std::make_unique<duckdb::Appender>(*txn.conn, table.table);
-    } catch (const duckdb::Exception &) {
-      // If that fails and we have a schema, try with schema
-      if (!table.schema.empty()) {
-        // Ensure schema exists
-        std::string create_schema_sql =
-            "CREATE SCHEMA IF NOT EXISTS " + QuoteIdent(table.schema);
-        auto res = txn.conn->Query(create_schema_sql);
-        if (res->HasError()) {
-          return Status::Error(StatusCode::kInvalid,
-                               "Failed to create schema: " + res->GetError());
-        }
-        appender = std::make_unique<duckdb::Appender>(*txn.conn, table.schema,
-                                                      table.table);
-      } else {
-        throw;
-      }
+    // Always use main schema; schema separation is at the DuckDB file level.
+    if (table.table.empty()) {
+      return Status::Error(StatusCode::kInvalid, "Missing table name");
     }
+    std::unique_ptr<duckdb::Appender> appender =
+        std::make_unique<duckdb::Appender>(*txn.conn, table.table);
 
     for (const auto &row : batch.rows) {
       appender->BeginRow();
