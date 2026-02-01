@@ -27,6 +27,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -69,6 +70,8 @@ struct Options {
   size_t batch_rows{1000};
   bool overwrite{false};
   bool verbose{false};
+  bool validate{false};
+  bool validate_sum{false};
   bool show_help{false};
 };
 
@@ -89,6 +92,8 @@ void PrintUsage(const char *argv0) {
          "  --duckdb-dir <dir>       Directory for per-schema DuckDB file\n"
          "  --batch <rows>           Appender batch size (default 1000)\n"
          "  --overwrite              Drop table if it exists\n"
+         "  --validate               Validate row counts after load\n"
+         "  --validate-sum           Validate SUM() for up to 3 numeric columns\n"
          "  --verbose                Verbose output\n"
          "  --help                   Show this help\n";
 }
@@ -193,6 +198,15 @@ bool ParseArgs(int argc, char **argv, Options *opts) {
     }
     if (arg == "--verbose") {
       opts->verbose = true;
+      continue;
+    }
+    if (arg == "--validate") {
+      opts->validate = true;
+      continue;
+    }
+    if (arg == "--validate-sum") {
+      opts->validate = true;
+      opts->validate_sum = true;
       continue;
     }
 
@@ -369,6 +383,50 @@ bool QuerySingleValue(MYSQL *mysql, const std::string &sql,
   return true;
 }
 
+bool ParseLongLong(const std::string &value, long long *out) {
+  if (!out) return false;
+  if (value.empty()) return false;
+  errno = 0;
+  char *end = nullptr;
+  long long parsed = std::strtoll(value.c_str(), &end, 10);
+  if (errno != 0 || end == value.c_str() || *end != '\0') return false;
+  *out = parsed;
+  return true;
+}
+
+bool ParseLongDouble(const std::string &value, long double *out) {
+  if (!out) return false;
+  if (value.empty()) return false;
+  errno = 0;
+  char *end = nullptr;
+  long double parsed = std::strtold(value.c_str(), &end);
+  if (errno != 0 || end == value.c_str() || *end != '\0') return false;
+  *out = parsed;
+  return true;
+}
+
+bool DuckdbQuerySingleValue(DuckDBAdapter &adapter, const std::string &sql,
+                            std::string *out) {
+  if (!out) return false;
+  auto result = adapter.ExecuteQuery(sql, {});
+  if (!result.ok) {
+    std::cerr << "DuckDB query failed: " << result.error << "\n";
+    return false;
+  }
+  auto chunk = result.result->Fetch();
+  if (!chunk || chunk->size() == 0) {
+    out->clear();
+    return true;
+  }
+  auto val = chunk->GetValue(0, 0);
+  if (val.IsNull()) {
+    out->clear();
+  } else {
+    *out = val.ToString();
+  }
+  return true;
+}
+
 bool ListTables(MYSQL *mysql, const std::string &schema,
                 std::vector<std::string> *tables) {
   if (!tables) return false;
@@ -394,6 +452,27 @@ bool ListTables(MYSQL *mysql, const std::string &schema,
   }
   mysql_free_result(res);
   return true;
+}
+
+std::string UpperAscii(std::string input) {
+  for (char &ch : input) {
+    ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+  }
+  return input;
+}
+
+std::string BaseType(const std::string &type) {
+  std::string upper = UpperAscii(type);
+  const size_t end = upper.find_first_of(" (");
+  return end == std::string::npos ? upper : upper.substr(0, end);
+}
+
+bool IsNumericType(const std::string &type) {
+  const std::string base = BaseType(type);
+  return base == "TINYINT" || base == "SMALLINT" || base == "MEDIUMINT" ||
+         base == "INT" || base == "INTEGER" || base == "BIGINT" ||
+         base == "DECIMAL" || base == "NUMERIC" || base == "FLOAT" ||
+         base == "DOUBLE" || base == "REAL" || base == "YEAR";
 }
 
 bool IsBlobTypeString(const std::string &type) {
@@ -501,6 +580,91 @@ bool StoreSnapshotGtid(DuckDBAdapter &adapter, const std::string &gtid) {
   if (!upsert.ok) {
     std::cerr << "DuckDB __repl_state upsert failed: " << upsert.error << "\n";
     return false;
+  }
+  return true;
+}
+
+bool ValidateRowCount(MYSQL *mysql, DuckDBAdapter &adapter,
+                      const std::string &schema, const std::string &table,
+                      bool *ok) {
+  if (!ok) return false;
+  *ok = false;
+  const std::string mysql_sql =
+      "SELECT COUNT(*) FROM " + QuoteMySQLIdent(schema) + "." +
+      QuoteMySQLIdent(table);
+  std::string mysql_val;
+  if (!QuerySingleValue(mysql, mysql_sql, &mysql_val)) return false;
+  const std::string duckdb_sql =
+      "SELECT COUNT(*) FROM " + QualifiedDuckdbName(schema, table);
+  std::string duckdb_val;
+  if (!DuckdbQuerySingleValue(adapter, duckdb_sql, &duckdb_val)) return false;
+  long long mysql_count = 0;
+  long long duckdb_count = 0;
+  if (!ParseLongLong(mysql_val, &mysql_count) ||
+      !ParseLongLong(duckdb_val, &duckdb_count)) {
+    std::cerr << "Validation count parse failed for " << schema << "." << table
+              << "\n";
+    return false;
+  }
+  if (mysql_count != duckdb_count) {
+    std::cerr << "Validation mismatch for " << schema << "." << table
+              << " count: mysql=" << mysql_count
+              << " duckdb=" << duckdb_count << "\n";
+    return true;
+  }
+  *ok = true;
+  return true;
+}
+
+bool ValidateSums(MYSQL *mysql, DuckDBAdapter &adapter,
+                  const std::string &schema, const MySQLTableDef &def,
+                  bool *ok) {
+  if (!ok) return false;
+  *ok = true;
+  const size_t max_cols = 3;
+  size_t checked = 0;
+  for (const auto &col : def.columns) {
+    if (!IsNumericType(col.type)) continue;
+    const std::string mysql_sql =
+        "SELECT SUM(" + QuoteMySQLIdent(col.name) + ") FROM " +
+        QuoteMySQLIdent(schema) + "." + QuoteMySQLIdent(def.name);
+    const std::string duckdb_sql =
+        "SELECT SUM(" + QuoteDuckdbIdent(col.name) + ") FROM " +
+        QualifiedDuckdbName(schema, def.name);
+    std::string mysql_val;
+    std::string duckdb_val;
+    if (!QuerySingleValue(mysql, mysql_sql, &mysql_val)) return false;
+    if (!DuckdbQuerySingleValue(adapter, duckdb_sql, &duckdb_val)) return false;
+    if (mysql_val.empty() && duckdb_val.empty()) {
+      ++checked;
+      continue;
+    }
+    if (mysql_val.empty() || duckdb_val.empty()) {
+      std::cerr << "Validation mismatch for " << schema << "." << def.name
+                << "." << col.name << " sum: mysql=" << mysql_val
+                << " duckdb=" << duckdb_val << "\n";
+      *ok = false;
+      ++checked;
+      continue;
+    }
+    long double mysql_sum = 0.0;
+    long double duckdb_sum = 0.0;
+    if (!ParseLongDouble(mysql_val, &mysql_sum) ||
+        !ParseLongDouble(duckdb_val, &duckdb_sum)) {
+      std::cerr << "Validation sum parse failed for " << schema << "."
+                << def.name << "." << col.name << "\n";
+      return false;
+    }
+    const long double diff = std::fabsl(mysql_sum - duckdb_sum);
+    const long double tol = 1e-6L;
+    if (diff > tol) {
+      std::cerr << "Validation mismatch for " << schema << "." << def.name
+                << "." << col.name << " sum: mysql=" << mysql_val
+                << " duckdb=" << duckdb_val << "\n";
+      *ok = false;
+    }
+    ++checked;
+    if (checked >= max_cols) break;
   }
   return true;
 }
@@ -765,6 +929,7 @@ int main(int argc, char **argv) {
   }
 
   size_t total_rows = 0;
+  bool validation_ok = true;
   for (const auto &table : tables) {
     if (opts.verbose) {
       std::cerr << "Loading " << opts.schema << "." << table << "...\n";
@@ -799,8 +964,9 @@ int main(int argc, char **argv) {
 
     const std::string temp_table = MakeLoadingTableName(table);
     adapter.DropTable(opts.schema, temp_table);
-    def.name = temp_table;
-    st = adapter.CreateTable(def);
+    MySQLTableDef temp_def = def;
+    temp_def.name = temp_table;
+    st = adapter.CreateTable(temp_def);
     if (!st.ok()) {
       std::cerr << "DuckDB create table failed for " << opts.schema << "."
                 << temp_table << ": " << st.message << "\n";
@@ -825,6 +991,32 @@ int main(int argc, char **argv) {
       mysql_library_end();
       return 1;
     }
+    if (opts.validate) {
+      bool count_ok = false;
+      bool sums_ok = true;
+      if (!ValidateRowCount(mysql, adapter, opts.schema, table, &count_ok)) {
+        adapter.Shutdown();
+        mysql_close(mysql);
+        mysql_library_end();
+        return 1;
+      }
+      if (!count_ok) validation_ok = false;
+      if (opts.validate_sum) {
+        sums_ok = false;
+        if (!ValidateSums(mysql, adapter, opts.schema, def, &sums_ok)) {
+          adapter.Shutdown();
+          mysql_close(mysql);
+          mysql_library_end();
+          return 1;
+        }
+        if (!sums_ok) validation_ok = false;
+      }
+      const bool table_ok =
+          count_ok && (!opts.validate_sum || sums_ok);
+      if (opts.verbose && table_ok) {
+        std::cerr << "Validation OK for " << opts.schema << "." << table << "\n";
+      }
+    }
     total_rows += rows;
     if (opts.verbose) {
       std::cerr << "Loaded " << rows << " rows from " << opts.schema << "."
@@ -836,9 +1028,17 @@ int main(int argc, char **argv) {
   if (opts.verbose) {
     std::cerr << "Total rows loaded: " << total_rows << "\n";
   }
+  if (opts.validate) {
+    if (validation_ok) {
+      std::cerr << "Snapshot validation OK\n";
+    } else {
+      std::cerr << "Snapshot validation FAILED\n";
+    }
+  }
 
   adapter.Shutdown();
   mysql_close(mysql);
   mysql_library_end();
+  if (opts.validate && !validation_ok) return 2;
   return 0;
 }
