@@ -70,6 +70,7 @@ Replication path:
   compatibility matrix, and fall back to primary engine when unsupported.
 - DDL unsupported by DuckDB: use copy DDL fallback; guard with schema
   validation and swap/rollback on failure.
+  See `Docs/duckdb_ddl_support.md` for the unsupported DDL list.
 - Crash consistency: watermark table updated in same DuckDB transaction as
   applied changes; verify on restart.
 - Performance regressions: micro-batching for apply, per-table DB files,

@@ -24,6 +24,7 @@
 #include "storage/duckdb/duckdb_binlog_applier.h"
 
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <ctime>
 #include <iomanip>
@@ -44,6 +45,24 @@ size_t EstimateRowBytes(const Row &row) {
     bytes += cell.value.size();
   }
   return bytes;
+}
+
+std::string GetCurrentTimestampString() {
+  auto now = std::chrono::system_clock::now();
+  auto time_t_now = std::chrono::system_clock::to_time_t(now);
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now.time_since_epoch()) %
+            1000;
+  std::tm tm_buf{};
+#ifdef _WIN32
+  gmtime_s(&tm_buf, &time_t_now);
+#else
+  gmtime_r(&time_t_now, &tm_buf);
+#endif
+  std::ostringstream oss;
+  oss << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S") << '.'
+      << std::setfill('0') << std::setw(3) << ms.count();
+  return oss.str();
 }
 
 uint64_t HashRow(const Row &row) {
@@ -852,7 +871,8 @@ Status DuckDBBinlogApplier::ApplyWatermark() {
       EscapeLiteral(current_gtid_.value) + "'";
   const std::string insert_sql =
       "INSERT INTO __repl_watermark (gtid, commit_ts) VALUES ('" +
-      EscapeLiteral(current_gtid_.value) + "', CURRENT_TIMESTAMP)";
+      EscapeLiteral(current_gtid_.value) + "', '" +
+      GetCurrentTimestampString() + "')";
 
   try {
     auto result = apply_txn_.conn->Query(create_sql);

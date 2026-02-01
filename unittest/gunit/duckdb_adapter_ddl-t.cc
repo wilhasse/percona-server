@@ -242,4 +242,71 @@ TEST(DuckDBAdapterDDLTest, CopyDDLReordersColumns) {
   CleanupDuckdbFiles(path);
 }
 
+TEST(DuckDBAdapterDDLTest, UnsupportedAlterUsesCopyFallback) {
+  const std::string path = MakeTempPath("duckdb_ddl_fallback");
+  CleanupDuckdbFiles(path);
+
+  DuckDBAdapter adapter;
+  DuckDBConfig cfg;
+  cfg.read_only = false;
+  ExpectOk(adapter.Init(path, cfg));
+
+  ExpectOk(adapter.CreateTable(MakeBaseTable("t")));
+
+  auto txn = adapter.BeginApplyTxn(Gtid{"gtid:ddl3"});
+  ExpectOk(txn.status);
+  RowBatch batch;
+  batch.table = TableId{"", "t"};
+  batch.rows.push_back(MakeRow("1", "alpha"));
+  TableId table_id = batch.table;  // Copy before move to avoid UB
+  ExpectOk(adapter.AppendRows(txn, std::move(table_id), std::move(batch)));
+  ExpectOk(adapter.CommitApplyTxn(txn));
+
+  MySQLTableDef new_def;
+  new_def.name = "t";
+  new_def.columns.push_back({"val", "VARCHAR", false});
+  new_def.columns.push_back({"id", "INTEGER", true});
+  new_def.columns.push_back({"extra", "VARCHAR", false});
+
+  DDLChange alter;
+  alter.type = DDLChange::Type::kAlter;
+  alter.sql = "ALTER TABLE t MODIFY COLUMN val VARCHAR FIRST";
+  alter.table = TableId{"", "t"};
+  alter.new_def = std::move(new_def);
+  ExpectOk(adapter.ApplyDDL(alter));
+
+  auto cols = ColumnNames(adapter, "t");
+  ASSERT_EQ(3u, cols.size());
+  EXPECT_EQ("val", cols[0]);
+  EXPECT_EQ("id", cols[1]);
+  EXPECT_EQ("extra", cols[2]);
+  EXPECT_EQ(1, QueryCount(adapter, "SELECT COUNT(*) FROM t"));
+
+  adapter.Shutdown();
+  CleanupDuckdbFiles(path);
+}
+
+TEST(DuckDBAdapterDDLTest, UnsupportedAlterFailsWithoutDefinition) {
+  const std::string path = MakeTempPath("duckdb_ddl_fail");
+  CleanupDuckdbFiles(path);
+
+  DuckDBAdapter adapter;
+  DuckDBConfig cfg;
+  cfg.read_only = false;
+  ExpectOk(adapter.Init(path, cfg));
+
+  ExpectOk(adapter.CreateTable(MakeBaseTable("t")));
+
+  DDLChange alter;
+  alter.type = DDLChange::Type::kAlter;
+  alter.sql = "ALTER TABLE t MODIFY COLUMN val VARCHAR FIRST";
+  alter.table = TableId{"", "t"};
+  auto st = adapter.ApplyDDL(alter);
+  EXPECT_FALSE(st.ok());
+  EXPECT_NE(std::string::npos, st.message.find("Unsupported DuckDB DDL"));
+
+  adapter.Shutdown();
+  CleanupDuckdbFiles(path);
+}
+
 }  // namespace

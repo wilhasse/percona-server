@@ -53,6 +53,63 @@ bool StartsWithCI(const std::string &input, const char *prefix) {
   return true;
 }
 
+bool IsBoundary(char ch) {
+  return !std::isalnum(static_cast<unsigned char>(ch)) && ch != '_';
+}
+
+std::string ToUpperASCII(std::string input) {
+  for (char &ch : input) {
+    ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+  }
+  return input;
+}
+
+bool ContainsToken(const std::string &upper, const std::string &token) {
+  size_t pos = upper.find(token);
+  while (pos != std::string::npos) {
+    const char before = pos == 0 ? ' ' : upper[pos - 1];
+    const size_t end = pos + token.size();
+    const char after = end >= upper.size() ? ' ' : upper[end];
+    if (IsBoundary(before) && IsBoundary(after)) return true;
+    pos = upper.find(token, pos + 1);
+  }
+  return false;
+}
+
+std::string UnsupportedDDLReason(const std::string &sql,
+                                 duckdb_se::DDLChange::Type type) {
+  if (sql.empty()) return "";
+  std::string upper = ToUpperASCII(sql);
+
+  if (ContainsToken(upper, "CHARACTER SET") || ContainsToken(upper, "CHARSET") ||
+      ContainsToken(upper, "COLLATE")) {
+    return "character set/collation";
+  }
+  if (ContainsToken(upper, "GENERATED") || ContainsToken(upper, "VIRTUAL") ||
+      ContainsToken(upper, "STORED")) {
+    return "generated columns";
+  }
+  if (ContainsToken(upper, "PARTITION")) {
+    return "partitioning";
+  }
+  if (ContainsToken(upper, "FOREIGN KEY") || ContainsToken(upper, "REFERENCES")) {
+    return "foreign keys";
+  }
+  if (ContainsToken(upper, "FULLTEXT") || ContainsToken(upper, "SPATIAL") ||
+      ContainsToken(upper, "INDEX") || ContainsToken(upper, "UNIQUE") ||
+      (ContainsToken(upper, "KEY") && !ContainsToken(upper, "PRIMARY KEY") &&
+       !ContainsToken(upper, "FOREIGN KEY"))) {
+    return "secondary indexes";
+  }
+  if (type == duckdb_se::DDLChange::Type::kAlter) {
+    if (ContainsToken(upper, "FIRST") || ContainsToken(upper, "AFTER")) {
+      return "column reordering";
+    }
+  }
+
+  return "";
+}
+
 }  // namespace
 
 Status DuckDBAdapter::Init(std::string db_path, DuckDBConfig cfg) {
@@ -432,11 +489,17 @@ Status DuckDBAdapter::ApplyDDL(DDLChange change) {
   if (type == DDLChange::Type::kUnknown && !change.sql.empty()) {
     type = InferDDLType(change.sql);
   }
+  const std::string unsupported_reason = UnsupportedDDLReason(change.sql, type);
 
   switch (type) {
     case DDLChange::Type::kCreate:
       if (!change.new_def.name.empty()) {
         return CreateTable(std::move(change.new_def));
+      }
+      if (!unsupported_reason.empty()) {
+        return Status::Error(StatusCode::kInvalid,
+                             "Unsupported DuckDB DDL (" + unsupported_reason +
+                                 "); use copy DDL fallback with new_def");
       }
       if (change.sql.empty()) {
         return Status::Error(StatusCode::kInvalid, "Missing CREATE TABLE SQL");
@@ -451,6 +514,14 @@ Status DuckDBAdapter::ApplyDDL(DDLChange change) {
       }
       return ExecuteDDL(NormalizeDDL(change.sql));
     case DDLChange::Type::kAlter:
+      if (!unsupported_reason.empty()) {
+        if (!change.new_def.name.empty()) {
+          return CopyTable(change.table, change.new_def);
+        }
+        return Status::Error(StatusCode::kInvalid,
+                             "Unsupported DuckDB DDL (" + unsupported_reason +
+                                 "); use copy DDL fallback with new_def");
+      }
       if (change.copy_ddl) {
         return CopyTable(change.table, change.new_def);
       }
@@ -476,6 +547,11 @@ Status DuckDBAdapter::ApplyDDL(DDLChange change) {
       return ExecuteDDL(NormalizeDDL(change.sql));
     case DDLChange::Type::kUnknown:
     default:
+      if (!unsupported_reason.empty()) {
+        return Status::Error(StatusCode::kInvalid,
+                             "Unsupported DuckDB DDL (" + unsupported_reason +
+                                 "); use copy DDL fallback with new_def");
+      }
       if (change.sql.empty()) {
         return Status::Error(StatusCode::kInvalid, "Missing DDL SQL");
       }
