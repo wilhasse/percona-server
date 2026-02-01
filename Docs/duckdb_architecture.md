@@ -26,6 +26,8 @@
 | (per-table .duckdb files) |
 +---------------------------+
 
+See `Docs/duckdb_dual_storage.md` for a dual-storage overview and query flow.
+
 Replication path:
 +---------------------------+
 | Binlog stream             |
