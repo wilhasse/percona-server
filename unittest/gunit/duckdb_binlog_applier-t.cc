@@ -118,6 +118,22 @@ int64_t QueryCount(DuckDBAdapter &adapter, const std::string &sql) {
   return chunk->GetValue(0, 0).GetValue<int64_t>();
 }
 
+duckdb::Value QuerySingleValue(DuckDBAdapter &adapter,
+                               const std::string &sql) {
+  SessionCtx ctx;
+  auto result = adapter.ExecuteQuery(sql, ctx);
+  if (!result.ok || !result.result) {
+    ADD_FAILURE() << "DuckDB query failed: " << result.error;
+    return duckdb::Value();
+  }
+  auto chunk = result.result->Fetch();
+  if (!chunk || chunk->size() == 0) {
+    ADD_FAILURE() << "DuckDB query returned no rows";
+    return duckdb::Value();
+  }
+  return chunk->GetValue(0, 0);
+}
+
 TEST(DuckDBBinlogApplierTest, RestartPersistsDataAndWatermark) {
   const std::string path = MakeTempPath("duckdb_restart");
   CleanupDuckdbFiles(path);
@@ -438,6 +454,42 @@ TEST(DuckDBBinlogApplierTest, LagMetricsUpdateOnCommit) {
   const auto metrics = GetBinlogApplyMetrics();
   EXPECT_GT(metrics.last_commit_epoch_ms, 0u);
   EXPECT_GE(metrics.lag_ms, 0u);
+
+  adapter.Shutdown();
+  CleanupDuckdbFiles(path);
+}
+
+TEST(DuckDBBinlogApplierTest, FlushDoesNotCommitMidTransaction) {
+  const std::string path = MakeTempPath("duckdb_flush_boundary");
+  CleanupDuckdbFiles(path);
+
+  DuckDBAdapter adapter;
+  DuckDBConfig cfg;
+  cfg.read_only = false;
+  ExpectOk(adapter.Init(path, cfg));
+  ExpectOk(adapter.CreateTable(MakeSimpleTable()));
+
+  BinlogApplierOptions options;
+  options.max_rows = 1;
+  options.max_bytes = 0;
+  options.max_delay = std::chrono::milliseconds(0);
+  DuckDBBinlogApplier applier(&adapter, options);
+
+  ExpectOk(applier.BeginTransaction(Gtid{"gtid:boundary"}));
+  ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
+  EXPECT_EQ(0, QueryCount(adapter, "SELECT COUNT(*) FROM t"));
+
+  ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("2", "beta")));
+  EXPECT_EQ(0, QueryCount(adapter, "SELECT COUNT(*) FROM t"));
+
+  ExpectOk(applier.CommitTransaction());
+  EXPECT_EQ(2, QueryCount(adapter, "SELECT COUNT(*) FROM t"));
+
+  auto value = QuerySingleValue(
+      adapter,
+      "SELECT commit_ts FROM __repl_watermark WHERE gtid='gtid:boundary'");
+  EXPECT_FALSE(value.IsNull());
+  EXPECT_FALSE(value.ToString().empty());
 
   adapter.Shutdown();
   CleanupDuckdbFiles(path);
