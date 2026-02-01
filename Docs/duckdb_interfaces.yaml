@@ -92,6 +92,27 @@ components:
       rollback_transaction:
         input: []
         output: Status
+      set_paused:
+        input: [bool]
+        output: void
+      set_throttle_rows_per_sec:
+        input: [uint64]
+        output: void
+      set_throttle_bytes_per_sec:
+        input: [uint64]
+        output: void
+      set_lag_alert_threshold_ms:
+        input: [uint64]
+        output: void
+      set_stop_at_gtid:
+        input: [string]
+        output: void
+      get_controls:
+        input: []
+        output: BinlogApplyControls
+      get_metrics:
+        input: []
+        output: BinlogApplyMetrics
 
 schemas:
   TableId:
@@ -104,3 +125,16 @@ schemas:
     fields: [type, sql, table, new_table, new_def, copy_ddl]
   Status:
     fields: [code, message]
+  BinlogApplyControls:
+    fields:
+      [paused, throttle_rows_per_sec, throttle_bytes_per_sec,
+       lag_alert_threshold_ms, stop_at_gtid]
+  BinlogApplyMetrics:
+    fields:
+      [applied_transactions, applied_rows, applied_bytes, last_flush_rows,
+       last_flush_bytes, last_flush_ms, last_throttle_ms, total_throttle_ms,
+       last_commit_epoch_ms, last_commit_ms, lag_ms, lag_alert, last_gtid]
+
+compatibility_notes:
+  - date: 2026-02-01
+    change: Added binlog applier control and metrics interfaces.

@@ -23,12 +23,18 @@
 
 #include "storage/duckdb/duckdb_binlog_applier.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <ctime>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
+#include <thread>
 #include <utility>
 
 namespace duckdb_se {
@@ -38,6 +44,40 @@ struct ParsedUpdate {
   std::map<std::string, Cell> set_values;
   std::map<std::string, Cell> where_values;
 };
+
+struct BinlogApplyState {
+  std::atomic<bool> paused{false};
+  std::atomic<uint64_t> throttle_rows_per_sec{0};
+  std::atomic<uint64_t> throttle_bytes_per_sec{0};
+  std::atomic<uint64_t> lag_alert_threshold_ms{0};
+  std::atomic<uint64_t> applied_transactions{0};
+  std::atomic<uint64_t> applied_rows{0};
+  std::atomic<uint64_t> applied_bytes{0};
+  std::atomic<uint64_t> last_flush_rows{0};
+  std::atomic<uint64_t> last_flush_bytes{0};
+  std::atomic<uint64_t> last_flush_ms{0};
+  std::atomic<uint64_t> last_throttle_ms{0};
+  std::atomic<uint64_t> total_throttle_ms{0};
+  std::atomic<uint64_t> last_commit_epoch_ms{0};
+  std::atomic<uint64_t> last_commit_ms{0};
+  std::mutex pause_mutex;
+  std::condition_variable pause_cv;
+  std::mutex gtid_mutex;
+  std::string last_gtid;
+  std::string stop_at_gtid;
+};
+
+BinlogApplyState &GetApplyState() {
+  static BinlogApplyState state;
+  return state;
+}
+
+uint64_t NowEpochMs() {
+  auto now = std::chrono::system_clock::now();
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      now.time_since_epoch());
+  return static_cast<uint64_t>(ms.count());
+}
 
 size_t EstimateRowBytes(const Row &row) {
   size_t bytes = 0;
@@ -432,6 +472,79 @@ bool BuildDeleteRow(const std::vector<std::string> &columns,
 
 }  // namespace
 
+BinlogApplyControls GetBinlogApplyControls() {
+  const auto &state = GetApplyState();
+  BinlogApplyControls controls;
+  controls.paused = state.paused.load();
+  controls.throttle_rows_per_sec = state.throttle_rows_per_sec.load();
+  controls.throttle_bytes_per_sec = state.throttle_bytes_per_sec.load();
+  controls.lag_alert_threshold_ms = state.lag_alert_threshold_ms.load();
+  {
+    std::lock_guard<std::mutex> guard(state.gtid_mutex);
+    controls.stop_at_gtid = state.stop_at_gtid;
+  }
+  return controls;
+}
+
+BinlogApplyMetrics GetBinlogApplyMetrics() {
+  const auto &state = GetApplyState();
+  BinlogApplyMetrics metrics;
+  metrics.applied_transactions = state.applied_transactions.load();
+  metrics.applied_rows = state.applied_rows.load();
+  metrics.applied_bytes = state.applied_bytes.load();
+  metrics.last_flush_rows = state.last_flush_rows.load();
+  metrics.last_flush_bytes = state.last_flush_bytes.load();
+  metrics.last_flush_ms = state.last_flush_ms.load();
+  metrics.last_throttle_ms = state.last_throttle_ms.load();
+  metrics.total_throttle_ms = state.total_throttle_ms.load();
+  metrics.last_commit_epoch_ms = state.last_commit_epoch_ms.load();
+  metrics.last_commit_ms = state.last_commit_ms.load();
+  if (metrics.last_commit_epoch_ms > 0) {
+    const uint64_t now_ms = NowEpochMs();
+    metrics.lag_ms =
+        now_ms >= metrics.last_commit_epoch_ms
+            ? now_ms - metrics.last_commit_epoch_ms
+            : 0;
+  }
+  {
+    std::lock_guard<std::mutex> guard(state.gtid_mutex);
+    metrics.last_gtid = state.last_gtid;
+  }
+  const uint64_t lag_threshold = state.lag_alert_threshold_ms.load();
+  metrics.lag_alert =
+      lag_threshold > 0 && metrics.lag_ms >= lag_threshold;
+  return metrics;
+}
+
+void SetBinlogApplyPaused(bool paused) {
+  auto &state = GetApplyState();
+  state.paused.store(paused);
+  if (!paused) {
+    state.pause_cv.notify_all();
+  }
+}
+
+void SetBinlogApplyThrottleRowsPerSec(uint64_t rows_per_sec) {
+  auto &state = GetApplyState();
+  state.throttle_rows_per_sec.store(rows_per_sec);
+}
+
+void SetBinlogApplyThrottleBytesPerSec(uint64_t bytes_per_sec) {
+  auto &state = GetApplyState();
+  state.throttle_bytes_per_sec.store(bytes_per_sec);
+}
+
+void SetBinlogApplyLagAlertThresholdMs(uint64_t threshold_ms) {
+  auto &state = GetApplyState();
+  state.lag_alert_threshold_ms.store(threshold_ms);
+}
+
+void SetBinlogApplyStopAtGtid(const std::string &gtid) {
+  auto &state = GetApplyState();
+  std::lock_guard<std::mutex> guard(state.gtid_mutex);
+  state.stop_at_gtid = gtid;
+}
+
 DuckDBBinlogApplier::DuckDBBinlogApplier(DuckDBAdapter *adapter,
                                          Options options)
     : adapter_(adapter), options_(options) {}
@@ -440,6 +553,7 @@ Status DuckDBBinlogApplier::BeginTransaction(Gtid gtid) {
   if (!adapter_) {
     return Status::Error(StatusCode::kInvalid, "DuckDBAdapter is null");
   }
+  WaitIfPaused();
   if (in_txn_) {
     return Status::Error(StatusCode::kInvalid,
                          "Binlog transaction already active");
@@ -480,6 +594,7 @@ Status DuckDBBinlogApplier::AppendInsertBatch(TableId table, RowBatch batch) {
   if (!in_txn_) {
     return Status::Error(StatusCode::kInvalid, "No active binlog transaction");
   }
+  WaitIfPaused();
   if (skip_txn_) {
     return Status::Ok();
   }
@@ -521,6 +636,7 @@ Status DuckDBBinlogApplier::AddUpdateStatement(TableId table, std::string sql) {
   if (!in_txn_) {
     return Status::Error(StatusCode::kInvalid, "No active binlog transaction");
   }
+  WaitIfPaused();
   if (skip_txn_) {
     return Status::Ok();
   }
@@ -620,6 +736,7 @@ Status DuckDBBinlogApplier::AddDeleteStatement(TableId table, std::string sql) {
   if (!in_txn_) {
     return Status::Error(StatusCode::kInvalid, "No active binlog transaction");
   }
+  WaitIfPaused();
   if (skip_txn_) {
     return Status::Ok();
   }
@@ -701,6 +818,7 @@ Status DuckDBBinlogApplier::CommitTransaction() {
   if (!in_txn_) {
     return Status::Error(StatusCode::kInvalid, "No active binlog transaction");
   }
+  WaitIfPaused();
   if (skip_txn_) {
     in_txn_ = false;
     skip_txn_ = false;
@@ -721,6 +839,7 @@ Status DuckDBBinlogApplier::CommitTransaction() {
     return st;
   }
 
+  const auto commit_start = std::chrono::steady_clock::now();
   st = ApplyWatermark();
   if (!st.ok()) {
     RollbackTransaction();
@@ -731,6 +850,26 @@ Status DuckDBBinlogApplier::CommitTransaction() {
   if (!st.ok()) {
     RollbackTransaction();
     return st;
+  }
+  const auto commit_end = std::chrono::steady_clock::now();
+  const auto commit_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(commit_end -
+                                                            commit_start);
+  auto &state = GetApplyState();
+  state.applied_transactions.fetch_add(1);
+  state.last_commit_epoch_ms.store(NowEpochMs());
+  state.last_commit_ms.store(static_cast<uint64_t>(commit_ms.count()));
+  bool should_pause = false;
+  {
+    std::lock_guard<std::mutex> guard(state.gtid_mutex);
+    state.last_gtid = current_gtid_.value;
+    if (!state.stop_at_gtid.empty() &&
+        state.stop_at_gtid == current_gtid_.value) {
+      should_pause = true;
+    }
+  }
+  if (should_pause) {
+    SetBinlogApplyPaused(true);
   }
 
   apply_txn_ = ApplyTxn{};
@@ -785,6 +924,8 @@ Status DuckDBBinlogApplier::FlushBuffered(bool force) {
     return Status::Ok();
   }
 
+  WaitIfPaused();
+  const auto apply_start = std::chrono::steady_clock::now();
   Status st = EnsureApplyTxn();
   if (!st.ok()) {
     return st;
@@ -826,6 +967,14 @@ Status DuckDBBinlogApplier::FlushBuffered(bool force) {
     }
   }
 
+  const auto apply_end = std::chrono::steady_clock::now();
+  const auto apply_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(apply_end -
+                                                            apply_start);
+  const size_t flush_rows = buffered_rows_;
+  const size_t flush_bytes = buffered_bytes_;
+  UpdateMetrics(flush_rows, flush_bytes, apply_ms);
+  MaybeThrottle(flush_rows, flush_bytes, apply_ms);
   ResetBuffers();
   return Status::Ok();
 }
@@ -847,6 +996,63 @@ bool DuckDBBinlogApplier::ShouldFlush() const {
     }
   }
   return false;
+}
+
+void DuckDBBinlogApplier::WaitIfPaused() const {
+  auto &state = GetApplyState();
+  if (!state.paused.load()) {
+    return;
+  }
+  std::unique_lock<std::mutex> lock(state.pause_mutex);
+  state.pause_cv.wait(lock, [&state]() { return !state.paused.load(); });
+}
+
+void DuckDBBinlogApplier::UpdateMetrics(size_t rows, size_t bytes,
+                                        std::chrono::milliseconds apply_ms) {
+  auto &state = GetApplyState();
+  state.last_flush_rows.store(rows);
+  state.last_flush_bytes.store(bytes);
+  state.last_flush_ms.store(static_cast<uint64_t>(apply_ms.count()));
+  state.applied_rows.fetch_add(rows);
+  state.applied_bytes.fetch_add(bytes);
+}
+
+void DuckDBBinlogApplier::MaybeThrottle(size_t rows, size_t bytes,
+                                        std::chrono::milliseconds apply_ms) {
+  auto &state = GetApplyState();
+  const uint64_t rows_per_sec = state.throttle_rows_per_sec.load();
+  const uint64_t bytes_per_sec = state.throttle_bytes_per_sec.load();
+  if (rows_per_sec == 0 && bytes_per_sec == 0) {
+    state.last_throttle_ms.store(0);
+    return;
+  }
+
+  double required_seconds = 0.0;
+  if (rows_per_sec > 0 && rows > 0) {
+    required_seconds = std::max(
+        required_seconds, static_cast<double>(rows) / rows_per_sec);
+  }
+  if (bytes_per_sec > 0 && bytes > 0) {
+    required_seconds = std::max(
+        required_seconds, static_cast<double>(bytes) / bytes_per_sec);
+  }
+  if (required_seconds <= 0.0) {
+    state.last_throttle_ms.store(0);
+    return;
+  }
+
+  const uint64_t required_ms =
+      static_cast<uint64_t>(std::ceil(required_seconds * 1000.0));
+  const uint64_t apply_ms_value =
+      static_cast<uint64_t>(apply_ms.count());
+  if (required_ms > apply_ms_value) {
+    const uint64_t sleep_ms = required_ms - apply_ms_value;
+    state.last_throttle_ms.store(sleep_ms);
+    state.total_throttle_ms.fetch_add(sleep_ms);
+    std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+  } else {
+    state.last_throttle_ms.store(0);
+  }
 }
 
 void DuckDBBinlogApplier::ResetBuffers() {

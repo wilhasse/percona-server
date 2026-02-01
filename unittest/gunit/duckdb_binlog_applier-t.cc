@@ -23,8 +23,10 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <future>
 #include <string>
 #include <thread>
 #include <vector>
@@ -53,6 +55,9 @@ using duckdb_se::Row;
 using duckdb_se::SessionCtx;
 using duckdb_se::Status;
 using duckdb_se::TableId;
+using duckdb_se::GetBinlogApplyMetrics;
+using duckdb_se::SetBinlogApplyPaused;
+using duckdb_se::SetBinlogApplyThrottleRowsPerSec;
 
 std::string TempDirectory() {
   try {
@@ -311,6 +316,98 @@ TEST(DuckDBBinlogApplierTest, BulkUpdatePreservesOrderOnChainedUpdates) {
                           "SELECT COUNT(*) FROM t WHERE val = 'gamma'"));
   EXPECT_EQ(0, QueryCount(adapter,
                           "SELECT COUNT(*) FROM t WHERE val = 'beta'"));
+
+  adapter.Shutdown();
+  CleanupDuckdbFiles(path);
+}
+
+TEST(DuckDBBinlogApplierTest, PauseResumeBlocksApply) {
+  const std::string path = MakeTempPath("duckdb_pause");
+  CleanupDuckdbFiles(path);
+
+  DuckDBAdapter adapter;
+  DuckDBConfig cfg;
+  cfg.read_only = false;
+  ExpectOk(adapter.Init(path, cfg));
+  ExpectOk(adapter.CreateTable(MakeSimpleTable()));
+
+  SetBinlogApplyPaused(true);
+  std::atomic<bool> finished{false};
+  std::promise<void> started;
+  auto started_future = started.get_future();
+  DuckDBBinlogApplier applier(&adapter);
+
+  std::thread worker([&]() {
+    started.set_value();
+    Status st = applier.BeginTransaction(Gtid{"gtid:pause"});
+    if (st.ok()) {
+      st = applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha"));
+    }
+    if (st.ok()) {
+      st = applier.CommitTransaction();
+    }
+    finished.store(true);
+  });
+
+  started_future.wait();
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_FALSE(finished.load());
+
+  SetBinlogApplyPaused(false);
+  worker.join();
+  EXPECT_TRUE(finished.load());
+
+  adapter.Shutdown();
+  CleanupDuckdbFiles(path);
+}
+
+TEST(DuckDBBinlogApplierTest, ThrottleAppliesSleep) {
+  const std::string path = MakeTempPath("duckdb_throttle");
+  CleanupDuckdbFiles(path);
+
+  DuckDBAdapter adapter;
+  DuckDBConfig cfg;
+  cfg.read_only = false;
+  ExpectOk(adapter.Init(path, cfg));
+  ExpectOk(adapter.CreateTable(MakeSimpleTable()));
+
+  SetBinlogApplyThrottleRowsPerSec(1);
+  DuckDBBinlogApplier applier(&adapter);
+  ExpectOk(applier.BeginTransaction(Gtid{"gtid:throttle"}));
+  ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
+  const auto start = std::chrono::steady_clock::now();
+  ExpectOk(applier.CommitTransaction());
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - start);
+
+  const auto metrics = GetBinlogApplyMetrics();
+  EXPECT_GT(metrics.last_throttle_ms, 0u);
+  EXPECT_GE(elapsed.count(), 800);
+
+  SetBinlogApplyThrottleRowsPerSec(0);
+
+  adapter.Shutdown();
+  CleanupDuckdbFiles(path);
+}
+
+TEST(DuckDBBinlogApplierTest, LagMetricsUpdateOnCommit) {
+  const std::string path = MakeTempPath("duckdb_lag_metrics");
+  CleanupDuckdbFiles(path);
+
+  DuckDBAdapter adapter;
+  DuckDBConfig cfg;
+  cfg.read_only = false;
+  ExpectOk(adapter.Init(path, cfg));
+  ExpectOk(adapter.CreateTable(MakeSimpleTable()));
+
+  DuckDBBinlogApplier applier(&adapter);
+  ExpectOk(applier.BeginTransaction(Gtid{"gtid:lag"}));
+  ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
+  ExpectOk(applier.CommitTransaction());
+
+  const auto metrics = GetBinlogApplyMetrics();
+  EXPECT_GT(metrics.last_commit_epoch_ms, 0u);
+  EXPECT_GE(metrics.lag_ms, 0u);
 
   adapter.Shutdown();
   CleanupDuckdbFiles(path);

@@ -41,6 +41,38 @@ struct BinlogApplierOptions {
   std::chrono::milliseconds max_delay = std::chrono::milliseconds(200);
 };
 
+struct BinlogApplyControls {
+  bool paused{false};
+  uint64_t throttle_rows_per_sec{0};
+  uint64_t throttle_bytes_per_sec{0};
+  uint64_t lag_alert_threshold_ms{0};
+  std::string stop_at_gtid;
+};
+
+struct BinlogApplyMetrics {
+  uint64_t applied_transactions{0};
+  uint64_t applied_rows{0};
+  uint64_t applied_bytes{0};
+  uint64_t last_flush_rows{0};
+  uint64_t last_flush_bytes{0};
+  uint64_t last_flush_ms{0};
+  uint64_t last_throttle_ms{0};
+  uint64_t total_throttle_ms{0};
+  uint64_t last_commit_epoch_ms{0};
+  uint64_t last_commit_ms{0};
+  uint64_t lag_ms{0};
+  bool lag_alert{false};
+  std::string last_gtid;
+};
+
+BinlogApplyControls GetBinlogApplyControls();
+BinlogApplyMetrics GetBinlogApplyMetrics();
+void SetBinlogApplyPaused(bool paused);
+void SetBinlogApplyThrottleRowsPerSec(uint64_t rows_per_sec);
+void SetBinlogApplyThrottleBytesPerSec(uint64_t bytes_per_sec);
+void SetBinlogApplyLagAlertThresholdMs(uint64_t threshold_ms);
+void SetBinlogApplyStopAtGtid(const std::string &gtid);
+
 class DuckDBBinlogApplier {
  public:
   using Options = BinlogApplierOptions;
@@ -85,6 +117,11 @@ class DuckDBBinlogApplier {
   Status EnsureApplyTxn();
   Status FlushBuffered(bool force);
   bool ShouldFlush() const;
+  void WaitIfPaused() const;
+  void UpdateMetrics(size_t rows, size_t bytes,
+                     std::chrono::milliseconds apply_ms);
+  void MaybeThrottle(size_t rows, size_t bytes,
+                     std::chrono::milliseconds apply_ms);
   void ResetBuffers();
   Status ApplyWatermark();
   std::string EscapeLiteral(const std::string &value) const;

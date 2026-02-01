@@ -25,6 +25,7 @@
 
 #include <cctype>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -49,6 +50,7 @@
 #include "sql/sql_thd_internal_api.h"
 #include "sql/visible_fields.h"
 #include "scope_guard.h"
+#include "storage/duckdb/duckdb_binlog_applier.h"
 #include "storage/duckdb/duckdb_compat.h"
 #include "sql/field.h"
 #include "sql/table.h"
@@ -1268,6 +1270,242 @@ int ha_duckdb::unload_table(const char *db_name, const char *table_name,
 
 }  // namespace duckdb_se
 
+static bool duckdb_binlog_apply_paused = false;
+static ulonglong duckdb_binlog_apply_throttle_rows_per_sec = 0;
+static ulonglong duckdb_binlog_apply_throttle_bytes_per_sec = 0;
+static ulonglong duckdb_binlog_apply_lag_alert_ms = 0;
+static char *duckdb_binlog_apply_stop_at_gtid = nullptr;
+
+static void duckdb_binlog_apply_paused_update(
+    MYSQL_THD, SYS_VAR *, void *var_ptr, const void *save) {
+  auto value = *static_cast<const bool *>(save);
+  *static_cast<bool *>(var_ptr) = value;
+  duckdb_se::SetBinlogApplyPaused(value);
+}
+
+static void duckdb_binlog_apply_throttle_rows_update(
+    MYSQL_THD, SYS_VAR *, void *var_ptr, const void *save) {
+  auto value = *static_cast<const ulonglong *>(save);
+  *static_cast<ulonglong *>(var_ptr) = value;
+  duckdb_se::SetBinlogApplyThrottleRowsPerSec(value);
+}
+
+static void duckdb_binlog_apply_throttle_bytes_update(
+    MYSQL_THD, SYS_VAR *, void *var_ptr, const void *save) {
+  auto value = *static_cast<const ulonglong *>(save);
+  *static_cast<ulonglong *>(var_ptr) = value;
+  duckdb_se::SetBinlogApplyThrottleBytesPerSec(value);
+}
+
+static void duckdb_binlog_apply_lag_alert_update(
+    MYSQL_THD, SYS_VAR *, void *var_ptr, const void *save) {
+  auto value = *static_cast<const ulonglong *>(save);
+  *static_cast<ulonglong *>(var_ptr) = value;
+  duckdb_se::SetBinlogApplyLagAlertThresholdMs(value);
+}
+
+static void duckdb_binlog_apply_stop_at_gtid_update(
+    MYSQL_THD, SYS_VAR *, void *var_ptr, const void *save) {
+  *static_cast<const char **>(var_ptr) =
+      *static_cast<const char **>(const_cast<void *>(save));
+  const char *value =
+      *static_cast<const char **>(const_cast<void *>(save));
+  duckdb_se::SetBinlogApplyStopAtGtid(value ? value : "");
+}
+
+static MYSQL_SYSVAR_BOOL(
+    binlog_apply_paused, duckdb_binlog_apply_paused, PLUGIN_VAR_RQCMDARG,
+    "Pause or resume DuckDB binlog apply.",
+    nullptr, duckdb_binlog_apply_paused_update, false);
+
+static MYSQL_SYSVAR_ULONGLONG(
+    binlog_apply_throttle_rows_per_sec,
+    duckdb_binlog_apply_throttle_rows_per_sec, PLUGIN_VAR_RQCMDARG,
+    "Throttle DuckDB binlog apply by rows per second (0=unlimited).",
+    nullptr, duckdb_binlog_apply_throttle_rows_update, 0, 0, ~0ULL, 0);
+
+static MYSQL_SYSVAR_ULONGLONG(
+    binlog_apply_throttle_bytes_per_sec,
+    duckdb_binlog_apply_throttle_bytes_per_sec, PLUGIN_VAR_RQCMDARG,
+    "Throttle DuckDB binlog apply by bytes per second (0=unlimited).",
+    nullptr, duckdb_binlog_apply_throttle_bytes_update, 0, 0, ~0ULL, 0);
+
+static MYSQL_SYSVAR_ULONGLONG(
+    binlog_apply_lag_alert_ms, duckdb_binlog_apply_lag_alert_ms,
+    PLUGIN_VAR_RQCMDARG,
+    "Raise lag alert when apply lag exceeds this threshold in ms (0=disabled).",
+    nullptr, duckdb_binlog_apply_lag_alert_update, 0, 0, ~0ULL, 0);
+
+static MYSQL_SYSVAR_STR(
+    binlog_apply_stop_at_gtid, duckdb_binlog_apply_stop_at_gtid,
+    PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
+    "Pause apply after committing this GTID (empty disables).",
+    nullptr, duckdb_binlog_apply_stop_at_gtid_update, "");
+
+static SYS_VAR *duckdb_system_variables[] = {
+    MYSQL_SYSVAR(binlog_apply_paused),
+    MYSQL_SYSVAR(binlog_apply_throttle_rows_per_sec),
+    MYSQL_SYSVAR(binlog_apply_throttle_bytes_per_sec),
+    MYSQL_SYSVAR(binlog_apply_lag_alert_ms),
+    MYSQL_SYSVAR(binlog_apply_stop_at_gtid),
+    nullptr};
+
+static int show_duckdb_binlog_apply_paused(MYSQL_THD, SHOW_VAR *var, char *) {
+  static bool value;
+  value = duckdb_se::GetBinlogApplyControls().paused;
+  var->type = SHOW_BOOL;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
+static int show_duckdb_binlog_applied_transactions(MYSQL_THD, SHOW_VAR *var,
+                                                   char *) {
+  static ulonglong value;
+  value = duckdb_se::GetBinlogApplyMetrics().applied_transactions;
+  var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
+static int show_duckdb_binlog_applied_rows(MYSQL_THD, SHOW_VAR *var, char *) {
+  static ulonglong value;
+  value = duckdb_se::GetBinlogApplyMetrics().applied_rows;
+  var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
+static int show_duckdb_binlog_applied_bytes(MYSQL_THD, SHOW_VAR *var, char *) {
+  static ulonglong value;
+  value = duckdb_se::GetBinlogApplyMetrics().applied_bytes;
+  var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
+static int show_duckdb_binlog_last_flush_rows(MYSQL_THD, SHOW_VAR *var,
+                                              char *) {
+  static ulonglong value;
+  value = duckdb_se::GetBinlogApplyMetrics().last_flush_rows;
+  var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
+static int show_duckdb_binlog_last_flush_bytes(MYSQL_THD, SHOW_VAR *var,
+                                               char *) {
+  static ulonglong value;
+  value = duckdb_se::GetBinlogApplyMetrics().last_flush_bytes;
+  var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
+static int show_duckdb_binlog_last_flush_ms(MYSQL_THD, SHOW_VAR *var, char *) {
+  static ulonglong value;
+  value = duckdb_se::GetBinlogApplyMetrics().last_flush_ms;
+  var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
+static int show_duckdb_binlog_last_throttle_ms(MYSQL_THD, SHOW_VAR *var,
+                                               char *) {
+  static ulonglong value;
+  value = duckdb_se::GetBinlogApplyMetrics().last_throttle_ms;
+  var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
+static int show_duckdb_binlog_total_throttle_ms(MYSQL_THD, SHOW_VAR *var,
+                                                char *) {
+  static ulonglong value;
+  value = duckdb_se::GetBinlogApplyMetrics().total_throttle_ms;
+  var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
+static int show_duckdb_binlog_last_commit_epoch_ms(MYSQL_THD, SHOW_VAR *var,
+                                                   char *) {
+  static ulonglong value;
+  value = duckdb_se::GetBinlogApplyMetrics().last_commit_epoch_ms;
+  var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
+static int show_duckdb_binlog_last_commit_ms(MYSQL_THD, SHOW_VAR *var, char *) {
+  static ulonglong value;
+  value = duckdb_se::GetBinlogApplyMetrics().last_commit_ms;
+  var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
+static int show_duckdb_binlog_lag_ms(MYSQL_THD, SHOW_VAR *var, char *) {
+  static ulonglong value;
+  value = duckdb_se::GetBinlogApplyMetrics().lag_ms;
+  var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
+static int show_duckdb_binlog_lag_alert(MYSQL_THD, SHOW_VAR *var, char *) {
+  static bool value;
+  value = duckdb_se::GetBinlogApplyMetrics().lag_alert;
+  var->type = SHOW_BOOL;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
+static int show_duckdb_binlog_last_gtid(MYSQL_THD, SHOW_VAR *var, char *buf) {
+  var->type = SHOW_CHAR;
+  var->value = buf;
+  const auto metrics = duckdb_se::GetBinlogApplyMetrics();
+  const char *gtid = metrics.last_gtid.empty() ? "" : metrics.last_gtid.c_str();
+  std::snprintf(buf, SHOW_VAR_FUNC_BUFF_SIZE, "%s", gtid);
+  return 0;
+}
+
+static SHOW_VAR duckdb_status_variables[] = {
+    {"duckdb_binlog_apply_paused_state",
+     (char *)show_duckdb_binlog_apply_paused, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_binlog_applied_transactions",
+     (char *)show_duckdb_binlog_applied_transactions, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"duckdb_binlog_applied_rows", (char *)show_duckdb_binlog_applied_rows,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_binlog_applied_bytes", (char *)show_duckdb_binlog_applied_bytes,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_binlog_last_flush_rows",
+     (char *)show_duckdb_binlog_last_flush_rows, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"duckdb_binlog_last_flush_bytes",
+     (char *)show_duckdb_binlog_last_flush_bytes, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"duckdb_binlog_last_flush_ms", (char *)show_duckdb_binlog_last_flush_ms,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_binlog_last_throttle_ms",
+     (char *)show_duckdb_binlog_last_throttle_ms, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"duckdb_binlog_total_throttle_ms",
+     (char *)show_duckdb_binlog_total_throttle_ms, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"duckdb_binlog_last_commit_epoch_ms",
+     (char *)show_duckdb_binlog_last_commit_epoch_ms, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"duckdb_binlog_last_commit_ms",
+     (char *)show_duckdb_binlog_last_commit_ms, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_binlog_lag_ms", (char *)show_duckdb_binlog_lag_ms, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"duckdb_binlog_lag_alert", (char *)show_duckdb_binlog_lag_alert, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"duckdb_binlog_last_gtid", (char *)show_duckdb_binlog_last_gtid, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {nullptr, nullptr, SHOW_UNDEF, SHOW_SCOPE_GLOBAL}};
+
 static handler *duckdb_create_handler(handlerton *hton, TABLE_SHARE *table,
                                       bool, MEM_ROOT *mem_root) {
   return new (mem_root) duckdb_se::ha_duckdb(hton, table);
@@ -1277,6 +1515,15 @@ static int duckdb_init_func(void *p) {
   DBUG_TRACE;
 
   loaded_tables = new LoadedTables();
+  duckdb_se::SetBinlogApplyPaused(duckdb_binlog_apply_paused);
+  duckdb_se::SetBinlogApplyThrottleRowsPerSec(
+      duckdb_binlog_apply_throttle_rows_per_sec);
+  duckdb_se::SetBinlogApplyThrottleBytesPerSec(
+      duckdb_binlog_apply_throttle_bytes_per_sec);
+  duckdb_se::SetBinlogApplyLagAlertThresholdMs(
+      duckdb_binlog_apply_lag_alert_ms);
+  duckdb_se::SetBinlogApplyStopAtGtid(
+      duckdb_binlog_apply_stop_at_gtid ? duckdb_binlog_apply_stop_at_gtid : "");
 
   handlerton *duckdb_hton = static_cast<handlerton *>(p);
   duckdb_hton->create = duckdb_create_handler;
@@ -1316,8 +1563,8 @@ mysql_declare_plugin(duckdb_se){
     nullptr,            /* Plugin check uninstall */
     duckdb_deinit_func, /* Plugin Deinit */
     0x0001 /* 0.1 */,
-    nullptr, /* status variables */
-    nullptr, /* system variables */
+    duckdb_status_variables, /* status variables */
+    duckdb_system_variables, /* system variables */
     nullptr, /* config options */
     0,       /* flags */
 } mysql_declare_plugin_end;

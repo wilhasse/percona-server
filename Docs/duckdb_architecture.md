@@ -78,6 +78,8 @@ Replication path:
 - Type mapping drift: keep adapter mapping centralized and add tests for
   common types (NULL handling, binary, JSON, etc.). See
   `Docs/duckdb_type_mapping.md` for the current mapping table.
+- Operational controls: pause/throttle/lag metrics and backfill workflow are
+  documented in `Docs/duckdb_operations.md`.
 
 ## Milestone Plan
 - M1: Read-only secondary engine and per-table DuckDB files (done).
