@@ -485,6 +485,18 @@ IF(TARGET duckdb_static)
   TARGET_INCLUDE_DIRECTORIES(duckdb_binlog_applier-t PRIVATE
     ${CMAKE_SOURCE_DIR}/extra/duckdb/src/include
   )
+
+  MYSQL_ADD_EXECUTABLE(duckdb_adapter_ddl-t
+    duckdb_adapter_ddl-t.cc
+    ../../storage/duckdb/duckdb_adapter.cc
+    ENABLE_EXPORTS
+    ADD_TEST duckdb_adapter_ddl
+    LINK_LIBRARIES gunit_small duckdb_static dummy_static_extension_loader
+                  extra::rapidjson
+  )
+  TARGET_INCLUDE_DIRECTORIES(duckdb_adapter_ddl-t PRIVATE
+    ${CMAKE_SOURCE_DIR}/extra/duckdb/src/include
+  )
 ENDIF()
 
 ADD_SUBDIRECTORY(ddl_rewriter)
