@@ -83,6 +83,9 @@ class DuckDBBinlogApplier {
   Status BeginTransaction(Gtid gtid);
   Status AppendInsert(TableId table, Row row);
   Status AppendInsertBatch(TableId table, RowBatch batch);
+  Status AppendInsertRows(TableId table, RowBatch batch);
+  Status AppendUpdateRows(TableId table, BulkUpdateBatch batch);
+  Status AppendDeleteRows(TableId table, BulkDeleteBatch batch);
   Status AddUpdateStatement(TableId table, std::string sql);
   Status AddDeleteStatement(TableId table, std::string sql);
   Status ApplyDDL(DDLChange change);

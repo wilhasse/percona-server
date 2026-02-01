@@ -591,6 +591,10 @@ Status DuckDBBinlogApplier::AppendInsert(TableId table, Row row) {
 }
 
 Status DuckDBBinlogApplier::AppendInsertBatch(TableId table, RowBatch batch) {
+  return AppendInsertRows(std::move(table), std::move(batch));
+}
+
+Status DuckDBBinlogApplier::AppendInsertRows(TableId table, RowBatch batch) {
   if (!in_txn_) {
     return Status::Error(StatusCode::kInvalid, "No active binlog transaction");
   }
@@ -622,6 +626,120 @@ Status DuckDBBinlogApplier::AppendInsertBatch(TableId table, RowBatch batch) {
   buffer.inserts.rows.reserve(buffer.inserts.rows.size() + batch.rows.size());
   for (auto &row : batch.rows) {
     buffer.inserts.rows.push_back(std::move(row));
+  }
+
+  buffer.row_count += rows_added;
+  buffer.byte_count += bytes_added;
+  buffered_rows_ += rows_added;
+  buffered_bytes_ += bytes_added;
+
+  return FlushBuffered(false);
+}
+
+Status DuckDBBinlogApplier::AppendUpdateRows(TableId table,
+                                             BulkUpdateBatch batch) {
+  if (!in_txn_) {
+    return Status::Error(StatusCode::kInvalid, "No active binlog transaction");
+  }
+  WaitIfPaused();
+  if (skip_txn_) {
+    return Status::Ok();
+  }
+  if (batch.old_rows.empty()) {
+    return Status::Ok();
+  }
+  if (batch.old_rows.size() != batch.new_rows.size()) {
+    return Status::Error(StatusCode::kInvalid,
+                         "Update row counts do not match");
+  }
+
+  const TableKey key{table.schema, table.table};
+  auto &buffer = buffers_[key];
+  if (!buffer.updates.statements.empty()) {
+    Status st = FlushBuffered(true);
+    if (!st.ok()) return st;
+  }
+
+  if (!have_buffered_) {
+    have_buffered_ = true;
+    first_event_time_ = std::chrono::steady_clock::now();
+  }
+
+  if (buffer.bulk_updates.table.table.empty()) {
+    buffer.bulk_updates.table = table;
+  }
+
+  size_t rows_added = 0;
+  size_t bytes_added = 0;
+  for (size_t i = 0; i < batch.old_rows.size(); ++i) {
+    const auto &old_row = batch.old_rows[i];
+    const auto &new_row = batch.new_rows[i];
+    ++rows_added;
+    bytes_added += EstimateRowBytes(old_row);
+    bytes_added += EstimateRowBytes(new_row);
+    const uint64_t old_hash = HashRow(old_row);
+    const uint64_t new_hash = HashRow(new_row);
+
+    if (HasBulkUpdateConflict(buffer.bulk_updates.old_rows,
+                              buffer.bulk_updates.new_rows,
+                              buffer.bulk_update_old_hashes,
+                              buffer.bulk_update_new_hashes, old_hash, old_row,
+                              new_hash, new_row)) {
+      Status st = FlushBuffered(true);
+      if (!st.ok()) return st;
+    }
+
+    const size_t row_index = buffer.bulk_updates.old_rows.size();
+    buffer.bulk_updates.old_rows.push_back(std::move(batch.old_rows[i]));
+    buffer.bulk_updates.new_rows.push_back(std::move(batch.new_rows[i]));
+    buffer.bulk_update_old_hashes[old_hash].push_back(row_index);
+    buffer.bulk_update_new_hashes[new_hash].push_back(row_index);
+  }
+
+  buffer.row_count += rows_added;
+  buffer.byte_count += bytes_added;
+  buffered_rows_ += rows_added;
+  buffered_bytes_ += bytes_added;
+
+  return FlushBuffered(false);
+}
+
+Status DuckDBBinlogApplier::AppendDeleteRows(TableId table,
+                                             BulkDeleteBatch batch) {
+  if (!in_txn_) {
+    return Status::Error(StatusCode::kInvalid, "No active binlog transaction");
+  }
+  WaitIfPaused();
+  if (skip_txn_) {
+    return Status::Ok();
+  }
+  if (batch.old_rows.empty()) {
+    return Status::Ok();
+  }
+
+  const TableKey key{table.schema, table.table};
+  auto &buffer = buffers_[key];
+  if (!buffer.deletes.statements.empty()) {
+    Status st = FlushBuffered(true);
+    if (!st.ok()) return st;
+  }
+
+  if (!have_buffered_) {
+    have_buffered_ = true;
+    first_event_time_ = std::chrono::steady_clock::now();
+  }
+
+  if (buffer.bulk_deletes.table.table.empty()) {
+    buffer.bulk_deletes.table = table;
+  }
+
+  size_t rows_added = 0;
+  size_t bytes_added = 0;
+  for (size_t i = 0; i < batch.old_rows.size(); ++i) {
+    const auto &row = batch.old_rows[i];
+    ++rows_added;
+    bytes_added += EstimateRowBytes(row);
+    buffer.bulk_deletes.old_rows.push_back(std::move(batch.old_rows[i]));
   }
 
   buffer.row_count += rows_added;
