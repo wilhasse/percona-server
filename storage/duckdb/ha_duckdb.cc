@@ -59,6 +59,7 @@
 #include "sql/visible_fields.h"
 #include "scope_guard.h"
 #include "storage/duckdb/duckdb_binlog_applier.h"
+#include "storage/duckdb/duckdb_binlog_apply_thread.h"
 #include "storage/duckdb/duckdb_compat.h"
 #include "sql/field.h"
 #include "sql/table.h"
@@ -1577,11 +1578,50 @@ int ha_duckdb::unload_table(const char *db_name, const char *table_name,
 
 }  // namespace duckdb_se
 
+static bool duckdb_binlog_apply_enabled = true;
+static char *duckdb_binlog_apply_host = nullptr;
+static char *duckdb_binlog_apply_user = nullptr;
+static char *duckdb_binlog_apply_password = nullptr;
+static char *duckdb_binlog_apply_socket = nullptr;
+static char *duckdb_binlog_apply_start_gtid = nullptr;
+static char *duckdb_binlog_apply_schema_filter = nullptr;
+static ulonglong duckdb_binlog_apply_server_id = 0;
+static uint duckdb_binlog_apply_port = 3306;
 static bool duckdb_binlog_apply_paused = false;
 static ulonglong duckdb_binlog_apply_throttle_rows_per_sec = 0;
 static ulonglong duckdb_binlog_apply_throttle_bytes_per_sec = 0;
 static ulonglong duckdb_binlog_apply_lag_alert_ms = 0;
 static char *duckdb_binlog_apply_stop_at_gtid = nullptr;
+
+static duckdb_se::BinlogApplyThreadOptions duckdb_make_binlog_apply_options() {
+  duckdb_se::BinlogApplyThreadOptions options;
+  options.enabled = duckdb_binlog_apply_enabled;
+  options.host = duckdb_binlog_apply_host ? duckdb_binlog_apply_host
+                                          : "127.0.0.1";
+  options.user = duckdb_binlog_apply_user ? duckdb_binlog_apply_user : "root";
+  options.password = duckdb_binlog_apply_password ? duckdb_binlog_apply_password
+                                                  : "";
+  options.socket = duckdb_binlog_apply_socket ? duckdb_binlog_apply_socket : "";
+  options.port = duckdb_binlog_apply_port;
+  options.server_id = static_cast<uint32_t>(duckdb_binlog_apply_server_id);
+  options.start_gtid_set =
+      duckdb_binlog_apply_start_gtid ? duckdb_binlog_apply_start_gtid : "";
+  options.schema_filter = duckdb_binlog_apply_schema_filter
+                              ? duckdb_binlog_apply_schema_filter
+                              : "";
+  return options;
+}
+
+static void duckdb_binlog_apply_enabled_update(
+    MYSQL_THD, SYS_VAR *, void *var_ptr, const void *save) {
+  auto value = *static_cast<const bool *>(save);
+  *static_cast<bool *>(var_ptr) = value;
+  if (value) {
+    duckdb_se::StartBinlogApplyThread(duckdb_make_binlog_apply_options());
+  } else {
+    duckdb_se::StopBinlogApplyThread();
+  }
+}
 
 static void duckdb_binlog_apply_paused_update(
     MYSQL_THD, SYS_VAR *, void *var_ptr, const void *save) {
@@ -1621,6 +1661,57 @@ static void duckdb_binlog_apply_stop_at_gtid_update(
 }
 
 static MYSQL_SYSVAR_BOOL(
+    binlog_apply_enabled, duckdb_binlog_apply_enabled, PLUGIN_VAR_RQCMDARG,
+    "Enable DuckDB binlog applier thread.",
+    nullptr, duckdb_binlog_apply_enabled_update, true);
+
+static MYSQL_SYSVAR_STR(
+    binlog_apply_host, duckdb_binlog_apply_host,
+    PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
+    "Source MySQL host for DuckDB binlog apply.",
+    nullptr, nullptr, "127.0.0.1");
+
+static MYSQL_SYSVAR_STR(
+    binlog_apply_user, duckdb_binlog_apply_user,
+    PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
+    "Source MySQL user for DuckDB binlog apply.",
+    nullptr, nullptr, "root");
+
+static MYSQL_SYSVAR_STR(
+    binlog_apply_password, duckdb_binlog_apply_password,
+    PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
+    "Source MySQL password for DuckDB binlog apply.",
+    nullptr, nullptr, "");
+
+static MYSQL_SYSVAR_STR(
+    binlog_apply_socket, duckdb_binlog_apply_socket,
+    PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
+    "Source MySQL socket for DuckDB binlog apply (optional).",
+    nullptr, nullptr, "");
+
+static MYSQL_SYSVAR_UINT(
+    binlog_apply_port, duckdb_binlog_apply_port, PLUGIN_VAR_RQCMDARG,
+    "Source MySQL port for DuckDB binlog apply.",
+    nullptr, nullptr, 3306, 0, 65535, 0);
+
+static MYSQL_SYSVAR_ULONGLONG(
+    binlog_apply_server_id, duckdb_binlog_apply_server_id, PLUGIN_VAR_RQCMDARG,
+    "Replica server_id for DuckDB binlog apply connection (0=auto).",
+    nullptr, nullptr, 0, 0, ~0ULL, 0);
+
+static MYSQL_SYSVAR_STR(
+    binlog_apply_start_gtid, duckdb_binlog_apply_start_gtid,
+    PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
+    "GTID set to start DuckDB binlog apply from (empty uses @@GLOBAL.GTID_EXECUTED).",
+    nullptr, nullptr, "");
+
+static MYSQL_SYSVAR_STR(
+    binlog_apply_schema_filter, duckdb_binlog_apply_schema_filter,
+    PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
+    "Optional schema filter for DuckDB binlog apply (empty applies all).",
+    nullptr, nullptr, "");
+
+static MYSQL_SYSVAR_BOOL(
     binlog_apply_paused, duckdb_binlog_apply_paused, PLUGIN_VAR_RQCMDARG,
     "Pause or resume DuckDB binlog apply.",
     nullptr, duckdb_binlog_apply_paused_update, false);
@@ -1650,6 +1741,15 @@ static MYSQL_SYSVAR_STR(
     nullptr, duckdb_binlog_apply_stop_at_gtid_update, "");
 
 static SYS_VAR *duckdb_system_variables[] = {
+    MYSQL_SYSVAR(binlog_apply_enabled),
+    MYSQL_SYSVAR(binlog_apply_host),
+    MYSQL_SYSVAR(binlog_apply_user),
+    MYSQL_SYSVAR(binlog_apply_password),
+    MYSQL_SYSVAR(binlog_apply_socket),
+    MYSQL_SYSVAR(binlog_apply_port),
+    MYSQL_SYSVAR(binlog_apply_server_id),
+    MYSQL_SYSVAR(binlog_apply_start_gtid),
+    MYSQL_SYSVAR(binlog_apply_schema_filter),
     MYSQL_SYSVAR(binlog_apply_paused),
     MYSQL_SYSVAR(binlog_apply_throttle_rows_per_sec),
     MYSQL_SYSVAR(binlog_apply_throttle_bytes_per_sec),
@@ -1751,10 +1851,33 @@ static int show_duckdb_binlog_last_commit_ms(MYSQL_THD, SHOW_VAR *var, char *) {
   return 0;
 }
 
+static int show_duckdb_binlog_rows_per_sec(MYSQL_THD, SHOW_VAR *var, char *) {
+  static double value;
+  const auto metrics = duckdb_se::GetBinlogApplyMetrics();
+  if (metrics.last_flush_ms > 0) {
+    value = static_cast<double>(metrics.last_flush_rows) * 1000.0 /
+            static_cast<double>(metrics.last_flush_ms);
+  } else {
+    value = 0.0;
+  }
+  var->type = SHOW_DOUBLE;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
 static int show_duckdb_binlog_lag_ms(MYSQL_THD, SHOW_VAR *var, char *) {
   static ulonglong value;
   value = duckdb_se::GetBinlogApplyMetrics().lag_ms;
   var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
+static int show_duckdb_binlog_lag_seconds(MYSQL_THD, SHOW_VAR *var, char *) {
+  static double value;
+  const auto metrics = duckdb_se::GetBinlogApplyMetrics();
+  value = static_cast<double>(metrics.lag_ms) / 1000.0;
+  var->type = SHOW_DOUBLE;
   var->value = reinterpret_cast<char *>(&value);
   return 0;
 }
@@ -1805,8 +1928,12 @@ static SHOW_VAR duckdb_status_variables[] = {
      SHOW_SCOPE_GLOBAL},
     {"duckdb_binlog_last_commit_ms",
      (char *)show_duckdb_binlog_last_commit_ms, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_binlog_rows_per_sec",
+     (char *)show_duckdb_binlog_rows_per_sec, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"duckdb_binlog_lag_ms", (char *)show_duckdb_binlog_lag_ms, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
+    {"duckdb_binlog_lag_seconds",
+     (char *)show_duckdb_binlog_lag_seconds, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"duckdb_binlog_lag_alert", (char *)show_duckdb_binlog_lag_alert, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
     {"duckdb_binlog_last_gtid", (char *)show_duckdb_binlog_last_gtid, SHOW_FUNC,
@@ -1831,6 +1958,7 @@ static int duckdb_init_func(void *p) {
       duckdb_binlog_apply_lag_alert_ms);
   duckdb_se::SetBinlogApplyStopAtGtid(
       duckdb_binlog_apply_stop_at_gtid ? duckdb_binlog_apply_stop_at_gtid : "");
+  duckdb_se::StartBinlogApplyThread(duckdb_make_binlog_apply_options());
 
   handlerton *duckdb_hton = static_cast<handlerton *>(p);
   duckdb_hton->create = duckdb_create_handler;
@@ -1851,6 +1979,7 @@ static int duckdb_init_func(void *p) {
 static int duckdb_deinit_func(void *) {
   DBUG_TRACE;
 
+  duckdb_se::StopBinlogApplyThread();
   delete loaded_tables;
   loaded_tables = nullptr;
   return 0;
