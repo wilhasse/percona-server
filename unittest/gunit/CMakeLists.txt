@@ -504,7 +504,7 @@ IF(TARGET duckdb_static)
     ENABLE_EXPORTS
     ADD_TEST duckdb_row_decoder
     LINK_LIBRARIES gunit_small duckdb_static dummy_static_extension_loader
-                  extra::rapidjson
+                  binlogevents_static mysys extra::rapidjson
   )
   TARGET_INCLUDE_DIRECTORIES(duckdb_row_decoder-t PRIVATE
     ${CMAKE_SOURCE_DIR}/extra/duckdb/src/include
