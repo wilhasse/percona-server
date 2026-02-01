@@ -228,9 +228,21 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
   stream_opts.gtid_set = gtid_set;
   stream_opts.non_blocking = true;
 
+  sql_print_information(
+      "DuckDB binlog applier: Opening stream to %s:%u as %s, "
+      "server_id=%u, gtid_set='%.200s'",
+      stream_opts.host.c_str(), stream_opts.port, stream_opts.user.c_str(),
+      stream_opts.server_id,
+      stream_opts.gtid_set.empty() ? "(empty)" : stream_opts.gtid_set.c_str());
+
   DuckDBBinlogStreamer streamer;
   Status st = streamer.Open(stream_opts);
-  if (!st.ok()) return st;
+  if (!st.ok()) {
+    sql_print_warning("DuckDB binlog applier: Failed to open stream: %s",
+                      st.message.c_str());
+    return st;
+  }
+  sql_print_information("DuckDB binlog applier: Stream opened successfully");
 
   std::map<std::string, SchemaApplierState> schema_states;
   std::string current_gtid;

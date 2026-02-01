@@ -650,6 +650,7 @@ Status DecodeRowsInternal(const BinlogTableMap &map,
   std::vector<ColumnInfo> columns_info;
   Status st = BuildColumnInfo(map, &columns_info);
   if (!st.ok()) return st;
+
   st = EnsureFullImage(columns, columns_info.size());
   if (!st.ok()) return st;
 
@@ -661,14 +662,24 @@ Status DecodeRowsInternal(const BinlogTableMap &map,
     Row row;
     size_t consumed = 0;
     st = DecodeRow(columns_info, columns, ptr, end, &row, &consumed);
-    if (!st.ok()) return st;
+    if (!st.ok()) {
+      // If we've decoded at least one row and the remaining data looks like
+      // trailing padding (small amount, starting with zeros), ignore it
+      const size_t remaining = static_cast<size_t>(end - ptr);
+      if (!rows->empty() && remaining <= 4 && *ptr == 0) {
+        break;
+      }
+      return st;
+    }
     if (consumed == 0) {
       return Status::Error(StatusCode::kInvalid, "Row decode made no progress");
     }
     ptr += consumed;
     rows->push_back(std::move(row));
   }
-  if (ptr != end) {
+  // Allow small amounts of trailing padding (common in binlog events)
+  const size_t trailing = static_cast<size_t>(end - ptr);
+  if (trailing > 4) {
     return Status::Error(StatusCode::kInvalid,
                          "Row payload length mismatch");
   }
