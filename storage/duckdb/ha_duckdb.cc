@@ -748,6 +748,17 @@ std::string duckdb_value_to_string(const duckdb::Value &value) {
   return value.ToString();
 }
 
+bool duckdb_validate_read_only_settings() {
+  if (!read_only || !super_read_only) {
+    sql_print_warning(
+        "DuckDB analytics node should run with read_only=ON and "
+        "super_read_only=ON (current: read_only=%s, super_read_only=%s)",
+        read_only ? "ON" : "OFF", super_read_only ? "ON" : "OFF");
+    return false;
+  }
+  return true;
+}
+
 bool store_duckdb_result_value(THD *thd, Item *item, Item_cache *cache,
                                const duckdb::Value &value,
                                std::string *reason) {
@@ -1958,6 +1969,7 @@ static int duckdb_init_func(void *p) {
       duckdb_binlog_apply_lag_alert_ms);
   duckdb_se::SetBinlogApplyStopAtGtid(
       duckdb_binlog_apply_stop_at_gtid ? duckdb_binlog_apply_stop_at_gtid : "");
+  (void)duckdb_validate_read_only_settings();
   duckdb_se::StartBinlogApplyThread(duckdb_make_binlog_apply_options());
 
   handlerton *duckdb_hton = static_cast<handlerton *>(p);
