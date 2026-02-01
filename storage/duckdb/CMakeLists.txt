@@ -76,4 +76,18 @@ if(NOT WITHOUT_DUCKDB_SE_STORAGE_ENGINE)
       ${DUCKDB_SOURCE_DIR}/src/include
       )
   endif()
+
+  if(TARGET duckdb_static)
+    MYSQL_ADD_EXECUTABLE(duckdb_bench
+      duckdb_bench.cc
+      duckdb_adapter.cc
+      duckdb_binlog_applier.cc
+      ENABLE_EXPORTS
+      EXCLUDE_FROM_ALL
+      LINK_LIBRARIES duckdb_static dummy_static_extension_loader extra::rapidjson
+    )
+    TARGET_INCLUDE_DIRECTORIES(duckdb_bench PRIVATE
+      ${DUCKDB_SOURCE_DIR}/src/include
+    )
+  endif()
 endif()
