@@ -41,13 +41,17 @@
 #include "mysqld_error.h"
 #include "sql_error.h"
 #include "sql/field.h"
+#include "sql/item.h"
 #include "mysql/plugin.h"
+#include "sql/my_decimal.h"
 #include "sql/mysqld.h"
 #include "sql/query_result.h"
 #include "sql/sql_class.h"
 #include "sql/sql_lex.h"
 #include "sql/sql_optimizer.h"
 #include "sql/sql_thd_internal_api.h"
+#include "sql/sql_time.h"
+#include "sql/tztime.h"
 #include "sql/visible_fields.h"
 #include "scope_guard.h"
 #include "storage/duckdb/duckdb_binlog_applier.h"
@@ -647,21 +651,118 @@ bool is_simple_select(LEX *lex, Table_ref **base_table,
   return true;
 }
 
-bool uses_only_field_items(const mem_root_deque<Item *> &fields,
-                           TABLE *base_table, std::string *reason) {
+bool uses_supported_select_items(const mem_root_deque<Item *> &fields,
+                                 std::string *reason) {
   for (Item *item : VisibleFields(fields)) {
     Item *real = item->real_item();
-    if (real->type() != Item::FIELD_ITEM) {
-      if (reason) *reason = "Only direct column projections are supported";
+    if (real->result_type() == ROW_RESULT) {
+      if (reason) *reason = "Row constructors are not supported";
       return false;
     }
-    auto *field_item = down_cast<Item_field *>(real);
-    if (field_item->field == nullptr ||
-        field_item->field->table != base_table) {
-      if (reason) *reason = "Columns from a single base table are required";
+    if (real->type() == Item::SUBQUERY_ITEM) {
+      if (reason) *reason = "Subqueries in SELECT list are not supported";
       return false;
     }
   }
+  return true;
+}
+
+Item_cache *create_duckdb_output_cache(Item *item, std::string *reason) {
+  if (item == nullptr) {
+    if (reason) *reason = "DuckDB output item missing";
+    return nullptr;
+  }
+  if (item->result_type() == ROW_RESULT) {
+    if (reason) *reason = "Row constructors are not supported";
+    return nullptr;
+  }
+  if (item->data_type() == MYSQL_TYPE_JSON) {
+    return new Item_cache_str(item);
+  }
+  return Item_cache::get_cache(item);
+}
+
+std::string duckdb_value_to_string(const duckdb::Value &value) {
+  const auto physical = value.type().InternalType();
+  if (physical == duckdb::PhysicalType::VARCHAR ||
+      physical == duckdb::PhysicalType::BLOB) {
+    return duckdb::StringValue::Get(value);
+  }
+  return value.ToString();
+}
+
+bool store_duckdb_result_value(THD *thd, Item *item, Item_cache *cache,
+                               const duckdb::Value &value,
+                               std::string *reason) {
+  if (cache == nullptr) {
+    if (reason) *reason = "DuckDB output cache missing";
+    return true;
+  }
+  if (value.IsNull()) {
+    cache->store_null();
+    return false;
+  }
+
+  cache->null_value = false;
+  switch (cache->result_type()) {
+    case INT_RESULT: {
+      const longlong v = item->unsigned_flag
+                             ? static_cast<longlong>(value.GetValue<uint64_t>())
+                             : static_cast<longlong>(value.GetValue<int64_t>());
+      down_cast<Item_cache_int *>(cache)->store_value(cache, v);
+      return false;
+    }
+    case REAL_RESULT: {
+      const double v = value.GetValue<double>();
+      down_cast<Item_cache_real *>(cache)->store_value(cache, v);
+      return false;
+    }
+    case DECIMAL_RESULT: {
+      const std::string text = duckdb_value_to_string(value);
+      my_decimal dec;
+      if (str2my_decimal(E_DEC_FATAL_ERROR, text.c_str(), text.size(),
+                         item->collation.collation, &dec)) {
+        if (reason) *reason = "DuckDB decimal conversion failed";
+        return true;
+      }
+      down_cast<Item_cache_decimal *>(cache)->store_value(cache, &dec);
+      return false;
+    }
+    case STRING_RESULT: {
+      const std::string text = duckdb_value_to_string(value);
+      if (item->is_temporal()) {
+        String tmp(text.c_str(), text.size(), item->collation.collation);
+        MYSQL_TIME ltime;
+        MYSQL_TIME_STATUS status{};
+        const my_time_flags_t flags = TIME_FUZZY_DATE;
+        bool parse_error = false;
+        if (item->data_type() == MYSQL_TYPE_TIME) {
+          parse_error = str_to_time(&tmp, &ltime, flags, &status);
+        } else {
+          parse_error = str_to_datetime(&tmp, &ltime, flags, &status);
+        }
+        if (!parse_error && ltime.time_type == MYSQL_TIMESTAMP_DATETIME_TZ) {
+          parse_error =
+              convert_time_zone_displacement(thd->time_zone(), &ltime);
+        }
+        if (parse_error) {
+          if (reason) *reason = "DuckDB temporal conversion failed";
+          return true;
+        }
+        const longlong packed =
+            TIME_to_longlong_packed(ltime, item->data_type());
+        down_cast<Item_cache_datetime *>(cache)->store_value(cache, packed);
+        return false;
+      }
+      String tmp(text.c_str(), text.size(), item->collation.collation);
+      down_cast<Item_cache_str *>(cache)->store_value(cache, tmp);
+      return false;
+    }
+    default:
+      break;
+  }
+
+  if (reason) *reason = "Unsupported DuckDB result type";
   return true;
 }
 
@@ -700,17 +801,33 @@ static bool DuckdbExecuteQuery(JOIN *join, Query_result *query_result) {
       return true;
     }
 
-    std::vector<Field *> out_fields;
-    out_fields.reserve(field_count);
+    std::vector<Item *> out_items;
+    std::vector<Item_cache *> out_caches;
+    std::vector<std::unique_ptr<Item_cache>> cache_storage;
+    mem_root_deque<Item *> cache_items(thd->mem_root);
+    out_items.reserve(field_count);
+    out_caches.reserve(field_count);
+    cache_storage.reserve(field_count);
+
     for (Item *item : VisibleFields(*join->fields)) {
-      Item *real = item->real_item();
-      if (real->type() != Item::FIELD_ITEM) {
-        my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-                 "Unsupported SELECT list for DuckDB offload");
+      std::string reason;
+      Item_cache *cache = create_duckdb_output_cache(item, &reason);
+      if (cache == nullptr) {
+        const std::string err = reason.empty()
+                                    ? "DuckDB output cache creation failed"
+                                    : reason;
+        my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), err.c_str());
         return true;
       }
-      auto *field_item = down_cast<Item_field *>(real);
-      out_fields.push_back(field_item->field);
+      if (cache->setup(item)) {
+        my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+                 "DuckDB output cache setup failed");
+        return true;
+      }
+      cache_storage.emplace_back(cache);
+      cache_items.push_back(cache);
+      out_items.push_back(item);
+      out_caches.push_back(cache);
     }
 
     ha_rows sent = 0;
@@ -720,12 +837,19 @@ static bool DuckdbExecuteQuery(JOIN *join, Query_result *query_result) {
 
       for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
         for (duckdb::idx_t col = 0; col < chunk->ColumnCount(); ++col) {
-          Field *field = out_fields[col];
           const duckdb::Value value = chunk->GetValue(col, row);
-          store_duckdb_value(field, value);
+          std::string reason;
+          if (store_duckdb_result_value(thd, out_items[col], out_caches[col],
+                                        value, &reason)) {
+            const std::string err = reason.empty()
+                                        ? "DuckDB result conversion failed"
+                                        : reason;
+            my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), err.c_str());
+            return true;
+          }
         }
 
-        if (query_result->send_data(thd, *join->fields)) return true;
+        if (query_result->send_data(thd, cache_items)) return true;
         ++sent;
       }
     }
@@ -799,8 +923,7 @@ static bool OptimizeSecondaryEngine(THD *thd, LEX *lex) {
     return true;
   }
 
-  if (!uses_only_field_items(*qb->join->fields, ctx->base_table,
-                             &ctx->fail_reason)) {
+  if (!uses_supported_select_items(*qb->join->fields, &ctx->fail_reason)) {
     thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
     return true;
   }

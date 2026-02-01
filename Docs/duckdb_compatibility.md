@@ -42,8 +42,9 @@ Legend: SUPPORTED, PARTIAL (differences), NOT SUPPORTED
 - NOT SUPPORTED: Not rewritten yet (use `CAST(.. AS type)` with DuckDB types).
 
 ## Notes
-- Offload currently requires a simple single-table `SELECT` with direct column
-  projections. Complex projections may be added later.
+- Offload currently requires a simple single-table `SELECT` (no subqueries or
+  UNIONs). The SELECT list may include expressions, functions, and aggregates
+  that DuckDB can execute; unsupported expressions fall back.
 - Unsupported rewrites fall back to the primary engine when
   `use_secondary_engine=ON`, or raise an error if `FORCED`.
 - See `Docs/duckdb_compatibility_gaps.md` for current gaps and next steps.

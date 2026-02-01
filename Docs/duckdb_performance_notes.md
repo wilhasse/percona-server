@@ -9,8 +9,9 @@ DuckDB secondary-engine workloads.
   binlog applier micro-batching.
 - **Write amplification**: Frequent schema changes can trigger Copy DDL
   and table rewrites; avoid repeated ALTERs in tight loops.
-- **Offload eligibility**: Queries must be simple single-table SELECTs
-  with direct column projection; unsupported queries fall back.
+- **Offload eligibility**: Queries must be simple single-table SELECTs;
+  SELECT lists may include expressions/functions/aggregates if DuckDB
+  supports them, otherwise they fall back.
 - **Disk contention**: Per-table DuckDB files can amplify IO when many
   tables are loaded at once.
 
