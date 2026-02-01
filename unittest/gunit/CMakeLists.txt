@@ -472,6 +472,21 @@ MYSQL_ADD_EXECUTABLE(rpl_event_ctx-t rpl_event_ctx-t.cc
   LINK_LIBRARIES rpl_event_ctx_lib gunit_small
 )
 
+IF(TARGET duckdb_static)
+  MYSQL_ADD_EXECUTABLE(duckdb_binlog_applier-t
+    duckdb_binlog_applier-t.cc
+    ../../storage/duckdb/duckdb_adapter.cc
+    ../../storage/duckdb/duckdb_binlog_applier.cc
+    ENABLE_EXPORTS
+    ADD_TEST duckdb_binlog_applier
+    LINK_LIBRARIES gunit_small duckdb_static dummy_static_extension_loader
+                  extra::rapidjson
+  )
+  TARGET_INCLUDE_DIRECTORIES(duckdb_binlog_applier-t PRIVATE
+    ${CMAKE_SOURCE_DIR}/extra/duckdb/src/include
+  )
+ENDIF()
+
 ADD_SUBDIRECTORY(ddl_rewriter)
 ADD_SUBDIRECTORY(innodb)
 ADD_SUBDIRECTORY(keyring)
