@@ -76,7 +76,8 @@ Replication path:
 - Performance regressions: micro-batching for apply, per-table DB files,
   and cost threshold gating for offload.
 - Type mapping drift: keep adapter mapping centralized and add tests for
-  common types (NULL handling, binary, JSON, etc.).
+  common types (NULL handling, binary, JSON, etc.). See
+  `Docs/duckdb_type_mapping.md` for the current mapping table.
 
 ## Milestone Plan
 - M1: Read-only secondary engine and per-table DuckDB files (done).

@@ -38,6 +38,8 @@
 #include "my_dbug.h"
 #include "my_sys.h"
 #include "mysqld_error.h"
+#include "sql_error.h"
+#include "sql/field.h"
 #include "mysql/plugin.h"
 #include "sql/mysqld.h"
 #include "sql/query_result.h"
@@ -137,8 +139,146 @@ bool is_binary_field(const Field *field) {
   return field->binary();
 }
 
+enum class MappingSeverity {
+  kOk,
+  kWarning,
+  kLossy
+};
+
+struct DuckDBTypeMapping {
+  std::string type;
+  MappingSeverity severity{MappingSeverity::kOk};
+  std::string reason;
+};
+
+DuckDBTypeMapping duckdb_type_mapping_for_field(const Field *field) {
+  DuckDBTypeMapping mapping;
+  if (field == nullptr) {
+    mapping.type = "VARCHAR";
+    mapping.severity = MappingSeverity::kLossy;
+    mapping.reason = "unknown field type";
+    return mapping;
+  }
+
+  const bool binary = is_binary_field(field);
+  const bool unsigned_flag = field->unsigned_flag;
+  switch (field->type()) {
+    case MYSQL_TYPE_TINY:
+      mapping.type = unsigned_flag ? "UTINYINT" : "TINYINT";
+      break;
+    case MYSQL_TYPE_SHORT:
+      mapping.type = unsigned_flag ? "USMALLINT" : "SMALLINT";
+      break;
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+      mapping.type = unsigned_flag ? "UINTEGER" : "INTEGER";
+      break;
+    case MYSQL_TYPE_LONGLONG:
+      mapping.type = unsigned_flag ? "UBIGINT" : "BIGINT";
+      break;
+    case MYSQL_TYPE_FLOAT:
+      mapping.type = "FLOAT";
+      break;
+    case MYSQL_TYPE_DOUBLE:
+      mapping.type = "DOUBLE";
+      break;
+    case MYSQL_TYPE_DECIMAL:
+    case MYSQL_TYPE_NEWDECIMAL: {
+      uint precision = 0;
+      uint scale = field->decimals();
+      if (field->type() == MYSQL_TYPE_NEWDECIMAL) {
+        const auto *dec = static_cast<const Field_new_decimal *>(field);
+        precision = dec->precision;
+      }
+      if (precision == 0) {
+        precision = field->field_length;
+      }
+      if (precision > 38) {
+        mapping.type = "VARCHAR";
+        mapping.severity = MappingSeverity::kLossy;
+        mapping.reason = "DECIMAL precision > 38 stored as VARCHAR";
+      } else {
+        mapping.type = "DECIMAL(" + std::to_string(precision) + "," +
+                       std::to_string(scale) + ")";
+      }
+      break;
+    }
+    case MYSQL_TYPE_DATE:
+      mapping.type = "DATE";
+      break;
+    case MYSQL_TYPE_TIME:
+      mapping.type = "TIME";
+      break;
+    case MYSQL_TYPE_DATETIME:
+      mapping.type = "TIMESTAMP";
+      break;
+    case MYSQL_TYPE_TIMESTAMP:
+      mapping.type = "TIMESTAMP";
+      mapping.severity = MappingSeverity::kWarning;
+      mapping.reason = "TIMESTAMP timezone semantics may differ";
+      break;
+    case MYSQL_TYPE_YEAR:
+      mapping.type = "SMALLINT";
+      mapping.severity = MappingSeverity::kWarning;
+      mapping.reason = "YEAR stored as SMALLINT";
+      break;
+    case MYSQL_TYPE_BIT:
+      mapping.type = "BLOB";
+      mapping.severity = MappingSeverity::kLossy;
+      mapping.reason = "BIT stored as BLOB";
+      break;
+    case MYSQL_TYPE_JSON:
+      mapping.type = "BLOB";
+      mapping.severity = MappingSeverity::kLossy;
+      mapping.reason = "JSON stored as BLOB";
+      break;
+    case MYSQL_TYPE_ENUM:
+    case MYSQL_TYPE_SET:
+      mapping.type = "VARCHAR";
+      mapping.severity = MappingSeverity::kLossy;
+      mapping.reason = "ENUM/SET stored as VARCHAR";
+      break;
+    case MYSQL_TYPE_GEOMETRY:
+      mapping.type = "BLOB";
+      mapping.severity = MappingSeverity::kLossy;
+      mapping.reason = "GEOMETRY stored as BLOB";
+      break;
+    case MYSQL_TYPE_BLOB:
+    case MYSQL_TYPE_LONG_BLOB:
+    case MYSQL_TYPE_MEDIUM_BLOB:
+    case MYSQL_TYPE_TINY_BLOB:
+      mapping.type = binary ? "BLOB" : "VARCHAR";
+      break;
+    case MYSQL_TYPE_STRING:
+    case MYSQL_TYPE_VAR_STRING:
+    case MYSQL_TYPE_VARCHAR:
+      mapping.type = binary ? "BLOB" : "VARCHAR";
+      break;
+    default:
+      mapping.type = binary ? "BLOB" : "VARCHAR";
+      mapping.severity = MappingSeverity::kLossy;
+      mapping.reason = "fallback to string storage";
+      break;
+  }
+
+  return mapping;
+}
+
 std::string duckdb_type_for_field(const Field *field) {
-  return is_binary_field(field) ? "BLOB" : "VARCHAR";
+  return duckdb_type_mapping_for_field(field).type;
+}
+
+void EmitTypeMappingWarning(THD *thd, const char *table, const char *column,
+                            const DuckDBTypeMapping &mapping) {
+  if (thd == nullptr) return;
+  if (mapping.severity == MappingSeverity::kOk) return;
+  const char *reason = mapping.reason.empty() ? "type mapping warning"
+                                              : mapping.reason.c_str();
+  push_warning_printf(
+      thd, Sql_condition::SL_WARNING, ER_UNKNOWN_ERROR,
+      "DuckDB type mapping for %s.%s uses %s (%s)",
+      table != nullptr ? table : "unknown",
+      column != nullptr ? column : "unknown", mapping.type.c_str(), reason);
 }
 
 class FieldOffsetGuard {
@@ -690,7 +830,10 @@ int ha_duckdb::create(const char *, TABLE *table_arg, HA_CREATE_INFO *,
       create_sql += quote_ident(field->field_name,
                                 std::strlen(field->field_name));
       create_sql += " ";
-      create_sql += duckdb_type_for_field(field);
+      const auto mapping = duckdb_type_mapping_for_field(field);
+      EmitTypeMappingWarning(table_arg->in_use, table_arg->s->table_name.str,
+                             field->field_name, mapping);
+      create_sql += mapping.type;
       if (!field->is_nullable()) create_sql += " NOT NULL";
       if (i + 1 < table_arg->s->fields) create_sql += ", ";
     }
@@ -1048,7 +1191,10 @@ int ha_duckdb::load_table(const TABLE &table) {
       const Field *field = table.field[i];
       create_sql += quote_ident(field->field_name, strlen(field->field_name));
       create_sql += " ";
-      create_sql += duckdb_type_for_field(field);
+      const auto mapping = duckdb_type_mapping_for_field(field);
+      EmitTypeMappingWarning(table.in_use, table.s->table_name.str,
+                             field->field_name, mapping);
+      create_sql += mapping.type;
       if (!field->is_nullable()) create_sql += " NOT NULL";
       if (i + 1 < table.s->fields) create_sql += ", ";
     }

@@ -114,6 +114,27 @@ std::vector<std::string> ColumnNames(DuckDBAdapter &adapter,
   return names;
 }
 
+std::vector<std::string> ColumnTypes(DuckDBAdapter &adapter,
+                                     const std::string &table) {
+  SessionCtx ctx;
+  std::vector<std::string> types;
+  auto result =
+      adapter.ExecuteQuery("PRAGMA table_info('" + table + "')", ctx);
+  if (!result.ok || !result.result) {
+    ADD_FAILURE() << "PRAGMA table_info failed: " << result.error;
+    return types;
+  }
+
+  while (true) {
+    auto chunk = result.result->Fetch();
+    if (!chunk || chunk->size() == 0) break;
+    for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
+      types.push_back(chunk->GetValue(2, row).ToString());
+    }
+  }
+  return types;
+}
+
 MySQLTableDef MakeBaseTable(const std::string &name) {
   MySQLTableDef def;
   def.name = name;
@@ -307,6 +328,48 @@ TEST(DuckDBAdapterDDLTest, UnsupportedAlterFailsWithoutDefinition) {
   auto st = adapter.ApplyDDL(alter);
   EXPECT_FALSE(st.ok());
   EXPECT_NE(std::string::npos, st.message.find("Unsupported DuckDB DDL"));
+
+  adapter.Shutdown();
+  CleanupDuckdbFiles(path);
+}
+
+TEST(DuckDBAdapterDDLTest, TypeMappingRejectsLossyColumns) {
+  const std::string path = MakeTempPath("duckdb_type_lossy");
+  CleanupDuckdbFiles(path);
+
+  DuckDBAdapter adapter;
+  DuckDBConfig cfg;
+  cfg.read_only = false;
+  ExpectOk(adapter.Init(path, cfg));
+
+  MySQLTableDef def;
+  def.name = "t";
+  def.columns.push_back({"payload", "JSON", false});
+  auto st = adapter.CreateTable(def);
+  EXPECT_FALSE(st.ok());
+  EXPECT_NE(std::string::npos, st.message.find("lossy"));
+
+  adapter.Shutdown();
+  CleanupDuckdbFiles(path);
+}
+
+TEST(DuckDBAdapterDDLTest, TypeMappingDecimalPreserved) {
+  const std::string path = MakeTempPath("duckdb_type_decimal");
+  CleanupDuckdbFiles(path);
+
+  DuckDBAdapter adapter;
+  DuckDBConfig cfg;
+  cfg.read_only = false;
+  ExpectOk(adapter.Init(path, cfg));
+
+  MySQLTableDef def;
+  def.name = "t";
+  def.columns.push_back({"amount", "DECIMAL(10,2)", false});
+  ExpectOk(adapter.CreateTable(def));
+
+  auto types = ColumnTypes(adapter, "t");
+  ASSERT_EQ(1u, types.size());
+  EXPECT_NE(std::string::npos, types[0].find("DECIMAL"));
 
   adapter.Shutdown();
   CleanupDuckdbFiles(path);

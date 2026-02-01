@@ -53,8 +53,30 @@ bool StartsWithCI(const std::string &input, const char *prefix) {
   return true;
 }
 
-bool IsBoundary(char ch) {
-  return !std::isalnum(static_cast<unsigned char>(ch)) && ch != '_';
+enum class TypeSeverity {
+  kOk,
+  kWarning,
+  kLossy
+};
+
+struct TypeMapping {
+  std::string type;
+  TypeSeverity severity{TypeSeverity::kOk};
+  std::string reason;
+};
+
+std::string Trim(const std::string &input) {
+  size_t start = 0;
+  while (start < input.size() &&
+         std::isspace(static_cast<unsigned char>(input[start]))) {
+    ++start;
+  }
+  size_t end = input.size();
+  while (end > start &&
+         std::isspace(static_cast<unsigned char>(input[end - 1]))) {
+    --end;
+  }
+  return input.substr(start, end - start);
 }
 
 std::string ToUpperASCII(std::string input) {
@@ -62,6 +84,184 @@ std::string ToUpperASCII(std::string input) {
     ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
   }
   return input;
+}
+
+bool ParsePrecisionScale(const std::string &input, uint *precision,
+                         uint *scale) {
+  if (!precision || !scale) return false;
+  *precision = 0;
+  *scale = 0;
+
+  size_t pos = 0;
+  while (pos < input.size() && std::isspace(static_cast<unsigned char>(input[pos]))) {
+    ++pos;
+  }
+  if (pos >= input.size() || !std::isdigit(static_cast<unsigned char>(input[pos]))) {
+    return false;
+  }
+  while (pos < input.size() &&
+         std::isdigit(static_cast<unsigned char>(input[pos]))) {
+    *precision = *precision * 10 + (input[pos] - '0');
+    ++pos;
+  }
+  while (pos < input.size() && std::isspace(static_cast<unsigned char>(input[pos]))) {
+    ++pos;
+  }
+  if (pos >= input.size() || input[pos] != ',') {
+    return true;
+  }
+  ++pos;
+  while (pos < input.size() && std::isspace(static_cast<unsigned char>(input[pos]))) {
+    ++pos;
+  }
+  if (pos >= input.size() || !std::isdigit(static_cast<unsigned char>(input[pos]))) {
+    return false;
+  }
+  while (pos < input.size() &&
+         std::isdigit(static_cast<unsigned char>(input[pos]))) {
+    *scale = *scale * 10 + (input[pos] - '0');
+    ++pos;
+  }
+  return true;
+}
+
+TypeMapping MapMySQLTypeString(const std::string &mysql_type) {
+  TypeMapping mapping;
+  const std::string trimmed = Trim(mysql_type);
+  if (trimmed.empty()) {
+    mapping.type = "VARCHAR";
+    mapping.severity = TypeSeverity::kLossy;
+    mapping.reason = "empty type";
+    return mapping;
+  }
+
+  std::string upper = ToUpperASCII(trimmed);
+  const bool unsigned_flag = upper.find("UNSIGNED") != std::string::npos;
+  const size_t base_end = upper.find_first_of(" (");
+  const std::string base =
+      base_end == std::string::npos ? upper : upper.substr(0, base_end);
+  uint precision = 0;
+  uint scale = 0;
+  const size_t paren = upper.find('(');
+  if (paren != std::string::npos) {
+    const size_t end = upper.find(')', paren);
+    if (end != std::string::npos) {
+      (void)ParsePrecisionScale(upper.substr(paren + 1, end - paren - 1),
+                                &precision, &scale);
+    }
+  }
+
+  if (base == "TINYINT") {
+    mapping.type = unsigned_flag ? "UTINYINT" : "TINYINT";
+    return mapping;
+  }
+  if (base == "SMALLINT") {
+    mapping.type = unsigned_flag ? "USMALLINT" : "SMALLINT";
+    return mapping;
+  }
+  if (base == "MEDIUMINT" || base == "INT" || base == "INTEGER") {
+    mapping.type = unsigned_flag ? "UINTEGER" : "INTEGER";
+    return mapping;
+  }
+  if (base == "BIGINT") {
+    mapping.type = unsigned_flag ? "UBIGINT" : "BIGINT";
+    return mapping;
+  }
+  if (base == "FLOAT" || base == "REAL") {
+    mapping.type = "FLOAT";
+    return mapping;
+  }
+  if (base == "DOUBLE" || base == "DOUBLE PRECISION") {
+    mapping.type = "DOUBLE";
+    return mapping;
+  }
+  if (base == "DECIMAL" || base == "NUMERIC") {
+    if (precision == 0) precision = 10;
+    if (precision > 38) {
+      mapping.type = "VARCHAR";
+      mapping.severity = TypeSeverity::kLossy;
+      mapping.reason = "DECIMAL precision > 38 stored as VARCHAR";
+      return mapping;
+    }
+    mapping.type = "DECIMAL(" + std::to_string(precision) + "," +
+                   std::to_string(scale) + ")";
+    return mapping;
+  }
+  if (base == "DATE") {
+    mapping.type = "DATE";
+    return mapping;
+  }
+  if (base == "TIME") {
+    mapping.type = "TIME";
+    return mapping;
+  }
+  if (base == "DATETIME") {
+    mapping.type = "TIMESTAMP";
+    return mapping;
+  }
+  if (base == "TIMESTAMP") {
+    mapping.type = "TIMESTAMP";
+    mapping.severity = TypeSeverity::kWarning;
+    mapping.reason = "TIMESTAMP timezone semantics may differ";
+    return mapping;
+  }
+  if (base == "YEAR") {
+    mapping.type = "SMALLINT";
+    mapping.severity = TypeSeverity::kWarning;
+    mapping.reason = "YEAR stored as SMALLINT";
+    return mapping;
+  }
+  if (base == "JSON") {
+    mapping.type = "VARCHAR";
+    mapping.severity = TypeSeverity::kLossy;
+    mapping.reason = "JSON stored as VARCHAR";
+    return mapping;
+  }
+  if (base == "ENUM" || base == "SET") {
+    mapping.type = "VARCHAR";
+    mapping.severity = TypeSeverity::kLossy;
+    mapping.reason = "ENUM/SET stored as VARCHAR";
+    return mapping;
+  }
+  if (base == "BIT") {
+    mapping.type = "BLOB";
+    mapping.severity = TypeSeverity::kLossy;
+    mapping.reason = "BIT stored as BLOB";
+    return mapping;
+  }
+  if (base == "BLOB" || base == "TINYBLOB" || base == "MEDIUMBLOB" ||
+      base == "LONGBLOB") {
+    mapping.type = "BLOB";
+    return mapping;
+  }
+  if (base == "TEXT" || base == "TINYTEXT" || base == "MEDIUMTEXT" ||
+      base == "LONGTEXT") {
+    mapping.type = "VARCHAR";
+    return mapping;
+  }
+  if (base == "CHAR" || base == "VARCHAR") {
+    mapping.type = "VARCHAR";
+    return mapping;
+  }
+  if (base == "BOOLEAN" || base == "BOOL") {
+    mapping.type = "BOOLEAN";
+    return mapping;
+  }
+  if (base == "BLOB" || base == "VARCHAR" || base == "INTEGER" ||
+      base == "BIGINT" || base == "DOUBLE" || base == "FLOAT" ||
+      base == "TIMESTAMP") {
+    mapping.type = base;
+    return mapping;
+  }
+
+  mapping.type = "VARCHAR";
+  mapping.severity = TypeSeverity::kLossy;
+  mapping.reason = "unrecognized type";
+  return mapping;
+}
+
+bool IsBoundary(char ch) {
+  return !std::isalnum(static_cast<unsigned char>(ch)) && ch != '_';
 }
 
 bool ContainsToken(const std::string &upper, const std::string &token) {
@@ -261,7 +461,14 @@ Status DuckDBAdapter::CreateTable(MySQLTableDef def) {
     ddl << "CREATE TABLE " << QualifiedName(id) << " (";
     for (size_t i = 0; i < def.columns.size(); ++i) {
       const auto &col = def.columns[i];
-      ddl << QuoteIdent(col.name) << " " << col.type;
+      const auto mapping = MapMySQLTypeString(col.type);
+      if (mapping.severity == TypeSeverity::kLossy) {
+        return Status::Error(
+            StatusCode::kInvalid,
+            "Unsupported or lossy column type for " + col.name + ": " +
+                col.type + " (" + mapping.reason + ")");
+      }
+      ddl << QuoteIdent(col.name) << " " << mapping.type;
       if (col.not_null) ddl << " NOT NULL";
       if (i + 1 < def.columns.size()) ddl << ", ";
     }
