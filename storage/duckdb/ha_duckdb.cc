@@ -39,7 +39,7 @@
 #include "my_dbug.h"
 #include "my_sys.h"
 #include "mysqld_error.h"
-#include "sql_error.h"
+#include "sql/sql_error.h"
 #include "sql/field.h"
 #include "sql/item.h"
 #include "mysql/plugin.h"
@@ -51,6 +51,7 @@
 #include "sql/sql_optimizer.h"
 #include "sql/sql_thd_internal_api.h"
 #include "sql/sql_time.h"
+#include "sql/rpl_gtid.h"
 #include "sql/tztime.h"
 #include "sql/visible_fields.h"
 #include "scope_guard.h"
@@ -167,7 +168,7 @@ DuckDBTypeMapping duckdb_type_mapping_for_field(const Field *field) {
   }
 
   const bool binary = is_binary_field(field);
-  const bool unsigned_flag = field->unsigned_flag;
+  const bool unsigned_flag = field->is_unsigned();
   switch (field->type()) {
     case MYSQL_TYPE_TINY:
       mapping.type = unsigned_flag ? "UTINYINT" : "TINYINT";
@@ -323,7 +324,7 @@ duckdb::Value field_value(Field *field) {
     return duckdb::Value::BLOB_RAW(std::string(tmp.ptr(), tmp.length()));
   }
 
-  const bool unsigned_flag = field->unsigned_flag;
+  const bool unsigned_flag = field->is_unsigned();
   switch (field->type()) {
     case MYSQL_TYPE_TINY: {
       const longlong v = field->val_int();
@@ -380,7 +381,7 @@ void store_duckdb_value(Field *field, const duckdb::Value &value) {
     return;
   }
 
-  const bool unsigned_flag = field->unsigned_flag;
+  const bool unsigned_flag = field->is_unsigned();
   switch (field->type()) {
     case MYSQL_TYPE_TINY:
     case MYSQL_TYPE_SHORT:
@@ -408,9 +409,9 @@ void store_duckdb_value(Field *field, const duckdb::Value &value) {
   }
 
   std::string text;
-  const auto physical = value.type().InternalType();
-  if (physical == duckdb::PhysicalType::VARCHAR ||
-      physical == duckdb::PhysicalType::BLOB) {
+  const auto type_id = value.type().id();
+  if (type_id == duckdb::LogicalTypeId::VARCHAR ||
+      type_id == duckdb::LogicalTypeId::BLOB) {
     text = duckdb::StringValue::Get(value);
   } else {
     text = value.ToString();
@@ -527,6 +528,34 @@ bool ensure_duckdb_file(const std::string &path) {
     my_delete((path + ".wal").c_str(), MYF(0));
   }
   return true;
+}
+
+std::string capture_snapshot_gtid() {
+  std::string snapshot;
+  if (gtid_state != nullptr) {
+    gtid_state->get_snapshot_gtid_executed(snapshot);
+  }
+  return snapshot;
+}
+
+bool store_snapshot_gtid(duckdb::Connection &con,
+                         const std::string &snapshot_gtid) {
+  auto state_result = con.Query(
+      "CREATE TABLE IF NOT EXISTS __repl_state ("
+      "id INTEGER PRIMARY KEY, "
+      "snapshot_gtid_set VARCHAR, "
+      "updated_ts TIMESTAMP)");
+  if (state_result->HasError()) return false;
+
+  const std::string sql =
+      "INSERT INTO __repl_state (id, snapshot_gtid_set, updated_ts) "
+      "VALUES (1, " +
+      value_to_sql(duckdb::Value(snapshot_gtid)) + ", CURRENT_TIMESTAMP) "
+      "ON CONFLICT(id) DO UPDATE SET "
+      "snapshot_gtid_set = excluded.snapshot_gtid_set, "
+      "updated_ts = excluded.updated_ts";
+  auto upsert_result = con.Query(sql);
+  return !upsert_result->HasError();
 }
 
 bool is_ident_char(char ch) {
@@ -656,7 +685,7 @@ bool uses_supported_select_items(const mem_root_deque<Item *> &fields,
       if (reason) *reason = "Row constructors are not supported";
       return false;
     }
-    if (real->type() == Item::SUBQUERY_ITEM) {
+    if (real->type() == Item::SUBSELECT_ITEM) {
       if (reason) *reason = "Subqueries in SELECT list are not supported";
       return false;
     }
@@ -680,9 +709,9 @@ Item_cache *create_duckdb_output_cache(Item *item, std::string *reason) {
 }
 
 std::string duckdb_value_to_string(const duckdb::Value &value) {
-  const auto physical = value.type().InternalType();
-  if (physical == duckdb::PhysicalType::VARCHAR ||
-      physical == duckdb::PhysicalType::BLOB) {
+  const auto type_id = value.type().id();
+  if (type_id == duckdb::LogicalTypeId::VARCHAR ||
+      type_id == duckdb::LogicalTypeId::BLOB) {
     return duckdb::StringValue::Get(value);
   }
   return value.ToString();
@@ -1411,6 +1440,13 @@ int ha_duckdb::load_table(const TABLE &table) {
     if (create_result->HasError()) {
       my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
                create_result->GetError().c_str());
+      return HA_ERR_GENERIC;
+    }
+
+    const std::string snapshot_gtid = capture_snapshot_gtid();
+    if (!store_snapshot_gtid(con, snapshot_gtid)) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               "Failed to store snapshot GTID set");
       return HA_ERR_GENERIC;
     }
 
