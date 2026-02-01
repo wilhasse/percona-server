@@ -50,12 +50,11 @@ namespace duckdb_se {
 
 class ha_duckdb : public handler {
  public:
-  ha_duckdb(handlerton *hton, TABLE_SHARE *table_share);
+ ha_duckdb(handlerton *hton, TABLE_SHARE *table_share);
 
  private:
-  int create(const char *, TABLE *, HA_CREATE_INFO *, dd::Table *) override {
-    return HA_ERR_WRONG_COMMAND;
-  }
+  int create(const char *name, TABLE *table, HA_CREATE_INFO *info,
+             dd::Table *table_def) override;
 
   int open(const char *name, int mode, unsigned int test_if_locked,
            const dd::Table *table_def) override;
@@ -66,6 +65,12 @@ class ha_duckdb : public handler {
   int rnd_end() override;
 
   int rnd_next(uchar *buf) override;
+
+  int write_row(uchar *buf) override;
+
+  int update_row(const uchar *old_data, uchar *new_data) override;
+
+  int delete_row(const uchar *buf) override;
 
   int rnd_pos(uchar *buf, uchar *pos) override;
 

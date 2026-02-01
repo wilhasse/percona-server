@@ -24,6 +24,7 @@
 #include "storage/duckdb/ha_duckdb.h"
 
 #include <cctype>
+#include <cstddef>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -43,6 +44,7 @@
 #include "sql/sql_class.h"
 #include "sql/sql_lex.h"
 #include "sql/sql_optimizer.h"
+#include "sql/sql_thd_internal_api.h"
 #include "sql/visible_fields.h"
 #include "scope_guard.h"
 #include "storage/duckdb/duckdb_compat.h"
@@ -137,6 +139,100 @@ bool is_binary_field(const Field *field) {
 
 std::string duckdb_type_for_field(const Field *field) {
   return is_binary_field(field) ? "BLOB" : "VARCHAR";
+}
+
+class FieldOffsetGuard {
+ public:
+  FieldOffsetGuard(TABLE *table, const uchar *record)
+      : table_(table),
+        diff_(record != nullptr && table_ != nullptr
+                  ? record - table_->record[0]
+                  : 0) {
+    if (diff_ == 0 || table_ == nullptr) return;
+    const uint field_count = table_->s->fields;
+    for (uint i = 0; i < field_count; ++i) {
+      table_->field[i]->move_field_offset(diff_);
+    }
+  }
+
+  ~FieldOffsetGuard() {
+    if (diff_ == 0 || table_ == nullptr) return;
+    const uint field_count = table_->s->fields;
+    for (uint i = 0; i < field_count; ++i) {
+      table_->field[i]->move_field_offset(-diff_);
+    }
+  }
+
+ private:
+  TABLE *table_;
+  ptrdiff_t diff_;
+};
+
+duckdb::Value field_value(Field *field) {
+  if (field->is_null()) return duckdb::Value();
+
+  String tmp;
+  field->val_str(&tmp);
+  if (is_binary_field(field)) {
+    return duckdb::Value::BLOB_RAW(std::string(tmp.ptr(), tmp.length()));
+  }
+  return duckdb::Value(std::string(tmp.ptr(), tmp.length()));
+}
+
+std::vector<Field *> collect_fields(TABLE *table, const MY_BITMAP *bitmap) {
+  std::vector<Field *> fields;
+  if (table == nullptr || table->s == nullptr) return fields;
+
+  const uint field_count = table->s->fields;
+  fields.reserve(field_count);
+  for (uint i = 0; i < field_count; ++i) {
+    Field *field = table->field[i];
+    if (bitmap == nullptr ||
+        bitmap_is_set(bitmap, field->field_index())) {
+      fields.push_back(field);
+    }
+  }
+
+  if (fields.empty() && bitmap != nullptr) {
+    for (uint i = 0; i < field_count; ++i) {
+      fields.push_back(table->field[i]);
+    }
+  }
+
+  return fields;
+}
+
+std::vector<duckdb::Value> collect_values(TABLE *table, const uchar *record,
+                                          const std::vector<Field *> &fields) {
+  FieldOffsetGuard guard(table, record);
+  std::vector<duckdb::Value> values;
+  values.reserve(fields.size());
+  for (Field *field : fields) {
+    values.push_back(field_value(field));
+  }
+  return values;
+}
+
+std::string build_set_clause(const std::vector<Field *> &fields) {
+  std::string sql;
+  for (size_t i = 0; i < fields.size(); ++i) {
+    if (i > 0) sql.append(", ");
+    const char *name = fields[i]->field_name;
+    sql.append(quote_ident(name, std::strlen(name)));
+    sql.append(" = ?");
+  }
+  return sql;
+}
+
+std::string build_where_clause(const std::vector<Field *> &fields) {
+  std::string sql;
+  for (size_t i = 0; i < fields.size(); ++i) {
+    if (i > 0) sql.append(" AND ");
+    const char *name = fields[i]->field_name;
+    sql.append(quote_ident(name, std::strlen(name)));
+    sql.append(" IS NOT DISTINCT FROM ?");
+  }
+  return sql;
 }
 
 std::string default_duckdb_path(const TABLE_SHARE *share) {
@@ -528,12 +624,93 @@ namespace duckdb_se {
 ha_duckdb::ha_duckdb(handlerton *hton, TABLE_SHARE *table_share_arg)
     : handler(hton, table_share_arg) {}
 
+int ha_duckdb::create(const char *, TABLE *table_arg, HA_CREATE_INFO *,
+                      dd::Table *) {
+  if (table_arg == nullptr || table_arg->s == nullptr) {
+    return HA_ERR_GENERIC;
+  }
+
+  const std::string path = resolve_duckdb_path(table_arg->s);
+  const size_t dir_pos = path.rfind(FN_LIBCHAR);
+  if (dir_pos == std::string::npos) {
+    my_error(ER_CANT_CREATE_TABLE, MYF(0), table_arg->s->table_name.str,
+             HA_ERR_GENERIC, "Invalid DuckDB path");
+    return HA_ERR_GENERIC;
+  }
+
+  const std::string dir = path.substr(0, dir_pos);
+  MY_STAT stat_buf;
+  if (my_stat(dir.c_str(), &stat_buf, MYF(0)) == nullptr) {
+    my_error(ER_CANT_CREATE_TABLE, MYF(0), table_arg->s->table_name.str,
+             HA_ERR_GENERIC, "DuckDB directory does not exist");
+    return HA_ERR_GENERIC;
+  }
+
+  if (my_stat(path.c_str(), &stat_buf, MYF(0)) != nullptr) {
+    my_error(ER_TABLE_EXISTS_ERROR, MYF(0), table_arg->s->table_name.str);
+    return HA_ERR_TABLE_EXIST;
+  }
+
+  my_delete((path + ".wal").c_str(), MYF(0));
+
+  try {
+    duckdb::DBConfig config(false);
+    duckdb::DuckDB db(path, &config);
+    duckdb::Connection conn(db);
+    std::string create_sql = "CREATE TABLE ";
+    create_sql += quote_ident(table_arg->s->table_name.str,
+                              table_arg->s->table_name.length);
+    create_sql += " (";
+    for (uint i = 0; i < table_arg->s->fields; ++i) {
+      const Field *field = table_arg->field[i];
+      create_sql += quote_ident(field->field_name,
+                                std::strlen(field->field_name));
+      create_sql += " ";
+      create_sql += duckdb_type_for_field(field);
+      if (!field->is_nullable()) create_sql += " NOT NULL";
+      if (i + 1 < table_arg->s->fields) create_sql += ", ";
+    }
+    create_sql += ")";
+
+    auto result = conn.Query(create_sql);
+    if (result->HasError()) {
+      my_error(ER_CANT_CREATE_TABLE, MYF(0), table_arg->s->table_name.str,
+               HA_ERR_GENERIC, result->GetError().c_str());
+      return HA_ERR_GENERIC;
+    }
+  } catch (const std::exception &ex) {
+    my_error(ER_CANT_CREATE_TABLE, MYF(0), table_arg->s->table_name.str,
+             HA_ERR_GENERIC, ex.what());
+    return HA_ERR_GENERIC;
+  }
+
+  loaded_tables->add(table_arg->s->db.str, table_arg->s->table_name.str, path);
+  return 0;
+}
+
 int ha_duckdb::open(const char *, int, unsigned int, const dd::Table *) {
   DuckdbTableState *share =
       loaded_tables->get(table_share->db.str, table_share->table_name.str);
-  if (share == nullptr) {
+  if (share == nullptr && table_share->is_secondary_engine()) {
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), "Table has not been loaded");
     return HA_ERR_GENERIC;
+  }
+  if (share == nullptr) {
+    const std::string path = resolve_duckdb_path(table_share);
+    MY_STAT stat_buf;
+    if (my_stat(path.c_str(), &stat_buf, MYF(0)) == nullptr) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               "DuckDB table file not found");
+      return HA_ERR_GENERIC;
+    }
+    loaded_tables->add(table_share->db.str, table_share->table_name.str, path);
+    share =
+        loaded_tables->get(table_share->db.str, table_share->table_name.str);
+    if (share == nullptr) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               "Failed to register DuckDB table");
+      return HA_ERR_GENERIC;
+    }
   }
   thr_lock_data_init(&share->lock, &m_lock, nullptr);
   m_table_path = share->path;
@@ -541,7 +718,7 @@ int ha_duckdb::open(const char *, int, unsigned int, const dd::Table *) {
                              table_share->table_name.length);
 
   try {
-    duckdb::DBConfig config(true);
+    duckdb::DBConfig config(table_share->is_secondary_engine());
     m_db = std::make_unique<duckdb::DuckDB>(m_table_path, &config);
     m_conn = std::make_unique<duckdb::Connection>(*m_db);
   } catch (const std::exception &ex) {
@@ -643,6 +820,157 @@ int ha_duckdb::rnd_next(uchar *) {
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), ex.what());
     return HA_ERR_GENERIC;
   }
+}
+
+int ha_duckdb::write_row(uchar *buf) {
+  if (table_share->is_secondary_engine()) return HA_ERR_WRONG_COMMAND;
+  THD *thd = ha_thd();
+  if (thd == nullptr || !thd_slave_thread(thd)) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "DuckDB DML is restricted to replication applier threads");
+    return HA_ERR_WRONG_COMMAND;
+  }
+  ha_statistic_increment(&System_status_var::ha_write_count);
+  if (buf == nullptr || table == nullptr) return HA_ERR_GENERIC;
+
+  try {
+    duckdb::DBConfig config(false);
+    duckdb::DuckDB db(m_table_path, &config);
+    duckdb::Connection conn(db);
+    duckdb::Appender appender(conn, m_table_name);
+
+    FieldOffsetGuard guard(table, buf);
+    const uint field_count = table->s->fields;
+    appender.BeginRow();
+    for (uint i = 0; i < field_count; ++i) {
+      Field *field = table->field[i];
+      if (field->is_null()) {
+        appender.Append(duckdb::Value());
+        continue;
+      }
+      String tmp;
+      field->val_str(&tmp);
+      if (is_binary_field(field)) {
+        appender.Append(duckdb::Value::BLOB_RAW(
+            std::string(tmp.ptr(), tmp.length())));
+      } else {
+        appender.Append(tmp.ptr(), static_cast<uint32_t>(tmp.length()));
+      }
+    }
+    appender.EndRow();
+    appender.Close();
+  } catch (const std::exception &ex) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), ex.what());
+    return HA_ERR_GENERIC;
+  }
+
+  stats.records++;
+  return 0;
+}
+
+int ha_duckdb::update_row(const uchar *old_data, uchar *new_data) {
+  if (table_share->is_secondary_engine()) return HA_ERR_WRONG_COMMAND;
+  THD *thd = ha_thd();
+  if (thd == nullptr || !thd_slave_thread(thd)) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "DuckDB DML is restricted to replication applier threads");
+    return HA_ERR_WRONG_COMMAND;
+  }
+  ha_statistic_increment(&System_status_var::ha_update_count);
+  if (old_data == nullptr || new_data == nullptr || table == nullptr) {
+    return HA_ERR_GENERIC;
+  }
+
+  const std::vector<Field *> set_fields =
+      collect_fields(table, table->write_set);
+  const std::vector<Field *> where_fields =
+      collect_fields(table, table->read_set);
+  if (set_fields.empty() || where_fields.empty()) return HA_ERR_GENERIC;
+
+  std::vector<duckdb::Value> params =
+      collect_values(table, new_data, set_fields);
+  std::vector<duckdb::Value> where_values =
+      collect_values(table, old_data, where_fields);
+  params.reserve(params.size() + where_values.size());
+  for (auto &val : where_values) {
+    params.push_back(std::move(val));
+  }
+
+  std::string sql = "UPDATE ";
+  sql += quote_ident(m_table_name.c_str(), m_table_name.size());
+  sql += " SET ";
+  sql += build_set_clause(set_fields);
+  sql += " WHERE ";
+  sql += build_where_clause(where_fields);
+
+  try {
+    duckdb::DBConfig config(false);
+    duckdb::DuckDB db(m_table_path, &config);
+    duckdb::Connection conn(db);
+    auto prepared = conn.Prepare(sql);
+    if (prepared->HasError()) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               prepared->GetError().c_str());
+      return HA_ERR_GENERIC;
+    }
+    auto result = prepared->Execute(params);
+    if (result->HasError()) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), result->GetError().c_str());
+      return HA_ERR_GENERIC;
+    }
+  } catch (const std::exception &ex) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), ex.what());
+    return HA_ERR_GENERIC;
+  }
+
+  return 0;
+}
+
+int ha_duckdb::delete_row(const uchar *buf) {
+  if (table_share->is_secondary_engine()) return HA_ERR_WRONG_COMMAND;
+  THD *thd = ha_thd();
+  if (thd == nullptr || !thd_slave_thread(thd)) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "DuckDB DML is restricted to replication applier threads");
+    return HA_ERR_WRONG_COMMAND;
+  }
+  ha_statistic_increment(&System_status_var::ha_delete_count);
+  if (buf == nullptr || table == nullptr) return HA_ERR_GENERIC;
+
+  const std::vector<Field *> where_fields =
+      collect_fields(table, table->read_set);
+  if (where_fields.empty()) return HA_ERR_GENERIC;
+
+  std::vector<duckdb::Value> params =
+      collect_values(table, buf, where_fields);
+
+  std::string sql = "DELETE FROM ";
+  sql += quote_ident(m_table_name.c_str(), m_table_name.size());
+  sql += " WHERE ";
+  sql += build_where_clause(where_fields);
+
+  try {
+    duckdb::DBConfig config(false);
+    duckdb::DuckDB db(m_table_path, &config);
+    duckdb::Connection conn(db);
+    auto prepared = conn.Prepare(sql);
+    if (prepared->HasError()) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               prepared->GetError().c_str());
+      return HA_ERR_GENERIC;
+    }
+    auto result = prepared->Execute(params);
+    if (result->HasError()) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), result->GetError().c_str());
+      return HA_ERR_GENERIC;
+    }
+  } catch (const std::exception &ex) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), ex.what());
+    return HA_ERR_GENERIC;
+  }
+
+  stats.records = stats.records > 0 ? stats.records - 1 : 0;
+  return 0;
 }
 
 int ha_duckdb::rnd_pos(uchar *, uchar *) {
