@@ -29,6 +29,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -37,8 +38,10 @@
 #include "duckdb/common/types/value.hpp"
 #include "my_bitmap.h"
 #include "my_dbug.h"
+#include "my_systime.h"
 #include "my_sys.h"
 #include "mysqld_error.h"
+#include "sql/log.h"
 #include "sql/sql_error.h"
 #include "sql/field.h"
 #include "sql/item.h"
@@ -516,6 +519,32 @@ std::string resolve_duckdb_path(const TABLE_SHARE *share) {
   return default_duckdb_path(share);
 }
 
+std::string make_loading_table_name(const std::string &base, THD *thd) {
+  std::ostringstream oss;
+  oss << "__loading_" << base << "_" << static_cast<ulonglong>(my_micro_time());
+  if (thd != nullptr) {
+    oss << "_" << static_cast<ulonglong>(thd->thread_id());
+  }
+  return oss.str();
+}
+
+bool backup_stale_wal(const std::string &path) {
+  const std::string wal = path + ".wal";
+  MY_STAT stat_buf;
+  if (my_stat(wal.c_str(), &stat_buf, MYF(0)) == nullptr) return true;
+  std::ostringstream oss;
+  oss << wal << ".bak." << static_cast<ulonglong>(my_micro_time());
+  const std::string backup = oss.str();
+  if (my_rename(wal.c_str(), backup.c_str(), MYF(0)) != 0) {
+    sql_print_warning("DuckDB WAL backup failed for %s (%s)", wal.c_str(),
+                      my_strerror(0, my_errno()));
+    return false;
+  }
+  sql_print_warning("DuckDB WAL moved aside to %s before creating %s",
+                    backup.c_str(), path.c_str());
+  return true;
+}
+
 bool ensure_duckdb_file(const std::string &path) {
   // Check if directory exists; DuckDB will create the file itself
   MY_STAT stat_buf;
@@ -524,8 +553,8 @@ bool ensure_duckdb_file(const std::string &path) {
     return false;  // Directory doesn't exist
   }
   if (my_stat(path.c_str(), &stat_buf, MYF(0)) == nullptr) {
-    // If DB doesn't exist, remove any stale WAL before DuckDB creates it.
-    my_delete((path + ".wal").c_str(), MYF(0));
+    // If DB doesn't exist but WAL does, preserve it by moving aside.
+    if (!backup_stale_wal(path)) return false;
   }
   return true;
 }
@@ -1044,7 +1073,11 @@ int ha_duckdb::create(const char *, TABLE *table_arg, HA_CREATE_INFO *,
 
   const bool file_exists = (my_stat(path.c_str(), &stat_buf, MYF(0)) != nullptr);
   if (!file_exists) {
-    my_delete((path + ".wal").c_str(), MYF(0));
+    if (!backup_stale_wal(path)) {
+      my_error(ER_CANT_CREATE_TABLE, MYF(0), table_arg->s->table_name.str,
+               HA_ERR_GENERIC, "Failed to move stale DuckDB WAL");
+      return HA_ERR_GENERIC;
+    }
   }
 
   try {
@@ -1412,17 +1445,31 @@ int ha_duckdb::load_table(const TABLE &table) {
     duckdb::Connection con(db);
     const std::string table_name(table.s->table_name.str,
                                  table.s->table_name.length);
+    const std::string temp_table =
+        make_loading_table_name(table_name, table.in_use);
     const std::string quoted_table =
         quote_ident(table.s->table_name.str, table.s->table_name.length);
+    const std::string quoted_temp =
+        quote_ident(temp_table.c_str(), temp_table.size());
 
-    auto drop_result = con.Query("DROP TABLE IF EXISTS " + quoted_table);
-    if (drop_result->HasError()) {
+    const std::string exists_sql =
+        "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' "
+        "AND table_name = " + value_to_sql(duckdb::Value(table_name)) +
+        " LIMIT 1";
+    auto exists_result = con.Query(exists_sql);
+    if (exists_result->HasError()) {
       my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-               drop_result->GetError().c_str());
+               exists_result->GetError().c_str());
       return HA_ERR_GENERIC;
     }
+    auto exists_chunk = exists_result->Fetch();
+    if (exists_chunk && exists_chunk->size() > 0) {
+      sql_print_warning(
+          "DuckDB secondary load will replace existing table %s in %s",
+          table.s->table_name.str, path.c_str());
+    }
 
-    std::string create_sql = "CREATE TABLE " + quoted_table + " (";
+    std::string create_sql = "CREATE TABLE " + quoted_temp + " (";
     for (uint i = 0; i < table.s->fields; ++i) {
       const Field *field = table.field[i];
       create_sql += quote_ident(field->field_name, strlen(field->field_name));
@@ -1450,7 +1497,7 @@ int ha_duckdb::load_table(const TABLE &table) {
       return HA_ERR_GENERIC;
     }
 
-    duckdb::Appender appender(con, table_name);
+    duckdb::Appender appender(con, temp_table);
 
     handler *primary = table.file;
     TABLE &mutable_table = const_cast<TABLE &>(table);
@@ -1477,6 +1524,35 @@ int ha_duckdb::load_table(const TABLE &table) {
     }
 
     appender.Close();
+
+    auto begin_result = con.Query("BEGIN TRANSACTION");
+    if (begin_result->HasError()) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               begin_result->GetError().c_str());
+      return HA_ERR_GENERIC;
+    }
+    auto drop_result = con.Query("DROP TABLE IF EXISTS " + quoted_table);
+    if (drop_result->HasError()) {
+      con.Query("ROLLBACK");
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               drop_result->GetError().c_str());
+      return HA_ERR_GENERIC;
+    }
+    auto rename_result = con.Query("ALTER TABLE " + quoted_temp +
+                                   " RENAME TO " + quoted_table);
+    if (rename_result->HasError()) {
+      con.Query("ROLLBACK");
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               rename_result->GetError().c_str());
+      return HA_ERR_GENERIC;
+    }
+    auto commit_result = con.Query("COMMIT");
+    if (commit_result->HasError()) {
+      con.Query("ROLLBACK");
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               commit_result->GetError().c_str());
+      return HA_ERR_GENERIC;
+    }
   } catch (const std::exception &ex) {
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), ex.what());
     return HA_ERR_GENERIC;
