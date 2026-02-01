@@ -1,0 +1,486 @@
+/* Copyright (c) 2026, Percona LLC and/or its affiliates.
+
+  This program is free software; you can redistribute it and/or modify
+  it under the terms of the GNU General Public License, version 2.0,
+  as published by the Free Software Foundation.
+
+  This program is designed to work with certain software (including
+  but not limited to OpenSSL) that is licensed under separate terms,
+  as designated in a particular file or component or in included license
+  documentation.  The authors of MySQL hereby grant you an additional
+  permission to link the program and your derivative works with the
+  separately licensed software that they have either included with
+  the program or referenced in the documentation.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License, version 2.0, for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with this program; if not, write to the Free Software
+  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
+
+#include "storage/duckdb/duckdb_binlog_streamer.h"
+
+#include <algorithm>
+#include <cctype>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <sstream>
+
+#include "libbinlogevents/include/binlog_event.h"
+#include "libbinlogevents/include/control_events.h"
+#include "libbinlogevents/include/gtids/gtidset.h"
+#include "libbinlogevents/include/rows_event.h"
+#include "my_byteorder.h"
+
+namespace {
+
+using binary_log::Format_description_event;
+using binary_log::Gtid_event;
+using binary_log::Log_event_type;
+using binary_log::gtids::Gno_interval;
+using binary_log::gtids::Gtid_set;
+using binary_log::gtids::Uuid;
+
+class Write_rows_event_view : public binary_log::Write_rows_event {
+ public:
+  Write_rows_event_view(const char *buf, const Format_description_event *fde)
+      : binary_log::Write_rows_event(buf, fde) {}
+  const std::vector<uint8_t> &columns_before() const {
+    return columns_before_image;
+  }
+  const std::vector<uint8_t> &columns_after() const {
+    return columns_after_image;
+  }
+  const std::vector<uint8_t> &rows() const { return row; }
+};
+
+class Update_rows_event_view : public binary_log::Update_rows_event {
+ public:
+  Update_rows_event_view(const char *buf, const Format_description_event *fde,
+                         Log_event_type type)
+      : binary_log::Update_rows_event(buf, fde, type) {}
+  const std::vector<uint8_t> &columns_before() const {
+    return columns_before_image;
+  }
+  const std::vector<uint8_t> &columns_after() const {
+    return columns_after_image;
+  }
+  const std::vector<uint8_t> &rows() const { return row; }
+};
+
+class Delete_rows_event_view : public binary_log::Delete_rows_event {
+ public:
+  Delete_rows_event_view(const char *buf, const Format_description_event *fde)
+      : binary_log::Delete_rows_event(buf, fde) {}
+  const std::vector<uint8_t> &columns_before() const {
+    return columns_before_image;
+  }
+  const std::vector<uint8_t> &columns_after() const {
+    return columns_after_image;
+  }
+  const std::vector<uint8_t> &rows() const { return row; }
+};
+
+std::string Trim(std::string value) {
+  auto is_space = [](unsigned char ch) { return std::isspace(ch) != 0; };
+  value.erase(value.begin(),
+              std::find_if(value.begin(), value.end(),
+                           [&](unsigned char ch) { return !is_space(ch); }));
+  value.erase(std::find_if(value.rbegin(), value.rend(),
+                           [&](unsigned char ch) { return !is_space(ch); })
+                  .base(),
+              value.end());
+  return value;
+}
+
+bool ParseInterval(const std::string &token, long long *start_out,
+                   long long *end_out) {
+  if (!start_out || !end_out) return false;
+  const auto dash = token.find('-');
+  const std::string start_str =
+      dash == std::string::npos ? token : token.substr(0, dash);
+  const std::string end_str =
+      dash == std::string::npos ? token : token.substr(dash + 1);
+  if (start_str.empty() || end_str.empty()) return false;
+  char *endptr = nullptr;
+  errno = 0;
+  long long start = std::strtoll(start_str.c_str(), &endptr, 10);
+  if (errno != 0 || endptr == start_str.c_str() || *endptr != '\0') {
+    return false;
+  }
+  errno = 0;
+  endptr = nullptr;
+  long long end = std::strtoll(end_str.c_str(), &endptr, 10);
+  if (errno != 0 || endptr == end_str.c_str() || *endptr != '\0') {
+    return false;
+  }
+  if (start <= 0 || end < start) return false;
+  *start_out = start;
+  *end_out = end;
+  return true;
+}
+
+bool ParseGtidSetString(const std::string &input, Gtid_set *out,
+                        std::string *error) {
+  if (!out) return false;
+  if (input.empty()) return true;
+  std::string gtid_set = Trim(input);
+  if (gtid_set.empty()) return true;
+
+  size_t pos = 0;
+  while (pos < gtid_set.size()) {
+    const size_t comma = gtid_set.find(',', pos);
+    const std::string entry = Trim(
+        gtid_set.substr(pos, comma == std::string::npos ? std::string::npos
+                                                        : comma - pos));
+    if (!entry.empty()) {
+      const size_t first_colon = entry.find(':');
+      if (first_colon == std::string::npos) {
+        if (error) *error = "Missing ':' in GTID set entry";
+        return false;
+      }
+      const std::string uuid_str = entry.substr(0, first_colon);
+      Uuid uuid;
+      if (uuid.parse(uuid_str.c_str(), uuid_str.size()) != 0) {
+        if (error) *error = "Invalid UUID in GTID set";
+        return false;
+      }
+      size_t interval_pos = first_colon + 1;
+      while (interval_pos < entry.size()) {
+        const size_t next_colon = entry.find(':', interval_pos);
+        const std::string token = entry.substr(
+            interval_pos, next_colon == std::string::npos
+                              ? std::string::npos
+                              : next_colon - interval_pos);
+        long long start = 0;
+        long long end = 0;
+        if (!ParseInterval(token, &start, &end)) {
+          if (error) *error = "Invalid interval in GTID set";
+          return false;
+        }
+        if (out->add(uuid, Gno_interval(start, end))) {
+          if (error) *error = "Failed to add interval to GTID set";
+          return false;
+        }
+        if (next_colon == std::string::npos) break;
+        interval_pos = next_colon + 1;
+      }
+    }
+    if (comma == std::string::npos) break;
+    pos = comma + 1;
+  }
+  return true;
+}
+
+bool EncodeGtidSet(const Gtid_set &gtids, std::vector<uint8_t> *out) {
+  if (!out) return false;
+  out->clear();
+  const auto &contents = gtids.get_gtid_set();
+  if (contents.empty()) return true;
+  char tmp[8];
+  int8store(tmp, static_cast<ulonglong>(contents.size()));
+  out->insert(out->end(), tmp, tmp + 8);
+  for (const auto &entry : contents) {
+    const auto &uuid = entry.first;
+    const auto &intervals = entry.second;
+    out->insert(out->end(), uuid.bytes, uuid.bytes + Uuid::BYTE_LENGTH);
+    int8store(tmp, static_cast<ulonglong>(intervals.size()));
+    out->insert(out->end(), tmp, tmp + 8);
+    for (const auto &interval : intervals) {
+      int8store(tmp, interval.get_start());
+      out->insert(out->end(), tmp, tmp + 8);
+      int8store(tmp, interval.get_end() + 1);
+      out->insert(out->end(), tmp, tmp + 8);
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
+namespace duckdb_se {
+
+DuckDBBinlogStreamer::DuckDBBinlogStreamer() = default;
+
+DuckDBBinlogStreamer::~DuckDBBinlogStreamer() { (void)Close(); }
+
+Status DuckDBBinlogStreamer::Open(const BinlogStreamOptions &options) {
+  if (open_) {
+    return Status::Error(StatusCode::kAlreadyInitialized,
+                         "Binlog streamer already open");
+  }
+  options_ = options;
+  mysql_ = mysql_init(nullptr);
+  if (!mysql_) {
+    return Status::Error(StatusCode::kInvalid, "mysql_init failed");
+  }
+  if (!mysql_real_connect(mysql_, options_.host.c_str(), options_.user.c_str(),
+                          options_.password.empty()
+                              ? nullptr
+                              : options_.password.c_str(),
+                          nullptr, options_.port,
+                          options_.socket.empty() ? nullptr
+                                                  : options_.socket.c_str(),
+                          0)) {
+    const std::string msg = mysql_error(mysql_);
+    mysql_close(mysql_);
+    mysql_ = nullptr;
+    return Status::Error(StatusCode::kInvalid,
+                         "mysql_real_connect failed: " + msg);
+  }
+
+  const std::string checksum_sql =
+      "SET @master_binlog_checksum = 'NONE', "
+      "@source_binlog_checksum = 'NONE'";
+  if (mysql_real_query(mysql_, checksum_sql.c_str(), checksum_sql.size()) != 0) {
+    const std::string msg = mysql_error(mysql_);
+    mysql_close(mysql_);
+    mysql_ = nullptr;
+    return Status::Error(StatusCode::kInvalid,
+                         "Failed to set binlog checksum: " + msg);
+  }
+
+  rpl_ = MYSQL_RPL{};
+  rpl_.file_name_length = 0;
+  rpl_.file_name = "";
+  rpl_.start_position = 4;
+  rpl_.server_id = options_.server_id;
+  rpl_.flags = MYSQL_RPL_SKIP_HEARTBEAT | MYSQL_RPL_GTID;
+  if (options_.non_blocking) {
+    constexpr unsigned int kNonBlockingFlag = 1u << 0;
+    rpl_.flags |= kNonBlockingFlag;
+  }
+
+  if (!options_.gtid_set.empty()) {
+    Status st = ParseGtidSet(options_.gtid_set);
+    if (!st.ok()) {
+      mysql_close(mysql_);
+      mysql_ = nullptr;
+      return st;
+    }
+    rpl_.gtid_set_arg = gtid_encoded_;
+    rpl_.gtid_set_encoded_size = gtid_encoded_size_;
+  } else {
+    rpl_.gtid_set_arg = nullptr;
+    rpl_.gtid_set_encoded_size = 0;
+  }
+
+  if (mysql_binlog_open(mysql_, &rpl_) != 0) {
+    const std::string msg = mysql_error(mysql_);
+    mysql_close(mysql_);
+    mysql_ = nullptr;
+    return Status::Error(StatusCode::kInvalid,
+                         "mysql_binlog_open failed: " + msg);
+  }
+
+  fde_ = std::make_unique<Format_description_event>(BINLOG_VERSION, "8.0.0");
+  open_ = true;
+  return Status::Ok();
+}
+
+Status DuckDBBinlogStreamer::Close() {
+  if (!open_) return Status::Ok();
+  mysql_binlog_close(mysql_, &rpl_);
+  mysql_close(mysql_);
+  mysql_ = nullptr;
+  if (gtid_encoded_) {
+    free(gtid_encoded_);
+    gtid_encoded_ = nullptr;
+  }
+  gtid_encoded_size_ = 0;
+  raw_buffer_.clear();
+  table_maps_.clear();
+  current_gtid_.clear();
+  fde_.reset();
+  open_ = false;
+  return Status::Ok();
+}
+
+Status DuckDBBinlogStreamer::ParseGtidSet(const std::string &gtid_set) {
+  Gtid_set parsed;
+  std::string error;
+  if (!ParseGtidSetString(gtid_set, &parsed, &error)) {
+    return Status::Error(StatusCode::kInvalid,
+                         error.empty() ? "Invalid GTID set" : error);
+  }
+  std::vector<uint8_t> encoded;
+  EncodeGtidSet(parsed, &encoded);
+  if (!encoded.empty()) {
+    gtid_encoded_ = malloc(encoded.size());
+    if (!gtid_encoded_) {
+      return Status::Error(StatusCode::kInvalid,
+                           "Failed to allocate GTID set buffer");
+    }
+    std::memcpy(gtid_encoded_, encoded.data(), encoded.size());
+    gtid_encoded_size_ = encoded.size();
+  }
+  return Status::Ok();
+}
+
+Status DuckDBBinlogStreamer::ReadRawEvent(std::vector<uint8_t> *buffer) {
+  if (!buffer) {
+    return Status::Error(StatusCode::kInvalid, "Buffer is null");
+  }
+  if (!open_) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "Binlog streamer not open");
+  }
+  if (mysql_binlog_fetch(mysql_, &rpl_) != 0) {
+    const std::string msg = mysql_error(mysql_);
+    return Status::Error(StatusCode::kInvalid,
+                         "mysql_binlog_fetch failed: " + msg);
+  }
+  if (rpl_.size == 0) {
+    buffer->clear();
+    return Status::Error(StatusCode::kInvalid, "No binlog data available");
+  }
+  const unsigned char *payload = rpl_.buffer + 1;
+  const unsigned long payload_size = rpl_.size - 1;
+  buffer->assign(payload, payload + payload_size);
+  return Status::Ok();
+}
+
+Status DuckDBBinlogStreamer::NextEvent(BinlogEvent *event) {
+  if (!event) {
+    return Status::Error(StatusCode::kInvalid, "Event output is null");
+  }
+  event->type = BinlogEvent::Type::kOther;
+  event->gtid.clear();
+  event->table_id = 0;
+  event->schema.clear();
+  event->table.clear();
+  event->columns_before.clear();
+  event->columns_after.clear();
+  event->row_data.clear();
+
+  if (!fde_) {
+    fde_ = std::make_unique<Format_description_event>(BINLOG_VERSION, "8.0.0");
+  }
+
+  for (;;) {
+    Status st = ReadRawEvent(&raw_buffer_);
+    if (!st.ok()) return st;
+    if (raw_buffer_.empty()) {
+      return Status::Error(StatusCode::kInvalid, "No binlog data available");
+    }
+    const auto ev_type = static_cast<Log_event_type>(
+        raw_buffer_[EVENT_TYPE_OFFSET]);
+    const char *buf = reinterpret_cast<const char *>(raw_buffer_.data());
+
+    switch (ev_type) {
+      case binary_log::FORMAT_DESCRIPTION_EVENT: {
+        auto next_fde = std::make_unique<Format_description_event>(buf, fde_.get());
+        fde_ = std::move(next_fde);
+        continue;
+      }
+      case binary_log::TABLE_MAP_EVENT: {
+        binary_log::Table_map_event tme(buf, fde_.get());
+        BinlogTableMap map;
+        map.table_id = tme.get_table_id();
+        map.schema = tme.get_db_name();
+        map.table = tme.get_table_name();
+        if (tme.m_coltype && tme.m_colcnt > 0) {
+          map.column_types.assign(tme.m_coltype, tme.m_coltype + tme.m_colcnt);
+        }
+        if (tme.m_field_metadata && tme.m_field_metadata_size > 0) {
+          map.metadata.assign(tme.m_field_metadata,
+                              tme.m_field_metadata + tme.m_field_metadata_size);
+        }
+        const size_t null_bitmap_size = (tme.m_colcnt + 7) / 8;
+        if (tme.m_null_bits && null_bitmap_size > 0) {
+          map.null_bitmap.assign(tme.m_null_bits,
+                                 tme.m_null_bits + null_bitmap_size);
+        }
+        table_maps_[map.table_id] = map;
+        event->type = BinlogEvent::Type::kTableMap;
+        event->table_id = map.table_id;
+        event->schema = map.schema;
+        event->table = map.table;
+        return Status::Ok();
+      }
+      case binary_log::GTID_LOG_EVENT: {
+        Gtid_event gev(buf, fde_.get());
+        binary_log::gtids::Gtid gtid(gev.get_uuid(), gev.get_gno());
+        current_gtid_ = gtid.to_string();
+        event->type = BinlogEvent::Type::kGtid;
+        event->gtid = current_gtid_;
+        return Status::Ok();
+      }
+      case binary_log::WRITE_ROWS_EVENT:
+      case binary_log::WRITE_ROWS_EVENT_V1: {
+        Write_rows_event_view wev(buf, fde_.get());
+        event->type = BinlogEvent::Type::kWriteRows;
+        event->table_id = wev.get_table_id();
+        event->columns_before = wev.columns_before();
+        event->columns_after = wev.columns_after();
+        event->row_data = wev.rows();
+        event->gtid = current_gtid_;
+        if (auto it = table_maps_.find(event->table_id);
+            it != table_maps_.end()) {
+          event->schema = it->second.schema;
+          event->table = it->second.table;
+        }
+        return Status::Ok();
+      }
+      case binary_log::UPDATE_ROWS_EVENT:
+      case binary_log::UPDATE_ROWS_EVENT_V1:
+      case binary_log::PARTIAL_UPDATE_ROWS_EVENT: {
+        Update_rows_event_view uev(buf, fde_.get(), ev_type);
+        event->type = BinlogEvent::Type::kUpdateRows;
+        event->table_id = uev.get_table_id();
+        event->columns_before = uev.columns_before();
+        event->columns_after = uev.columns_after();
+        event->row_data = uev.rows();
+        event->gtid = current_gtid_;
+        if (auto it = table_maps_.find(event->table_id);
+            it != table_maps_.end()) {
+          event->schema = it->second.schema;
+          event->table = it->second.table;
+        }
+        return Status::Ok();
+      }
+      case binary_log::DELETE_ROWS_EVENT:
+      case binary_log::DELETE_ROWS_EVENT_V1: {
+        Delete_rows_event_view dev(buf, fde_.get());
+        event->type = BinlogEvent::Type::kDeleteRows;
+        event->table_id = dev.get_table_id();
+        event->columns_before = dev.columns_before();
+        event->columns_after = dev.columns_after();
+        event->row_data = dev.rows();
+        event->gtid = current_gtid_;
+        if (auto it = table_maps_.find(event->table_id);
+            it != table_maps_.end()) {
+          event->schema = it->second.schema;
+          event->table = it->second.table;
+        }
+        return Status::Ok();
+      }
+      case binary_log::XID_EVENT: {
+        event->type = BinlogEvent::Type::kXid;
+        event->gtid = current_gtid_;
+        return Status::Ok();
+      }
+      case binary_log::QUERY_EVENT: {
+        event->type = BinlogEvent::Type::kQuery;
+        event->gtid = current_gtid_;
+        return Status::Ok();
+      }
+      default:
+        break;
+    }
+  }
+}
+
+const BinlogTableMap *DuckDBBinlogStreamer::GetTableMap(
+    uint64_t table_id) const {
+  auto it = table_maps_.find(table_id);
+  if (it == table_maps_.end()) return nullptr;
+  return &it->second;
+}
+
+}  // namespace duckdb_se
