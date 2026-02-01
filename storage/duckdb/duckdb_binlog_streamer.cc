@@ -49,7 +49,8 @@ using binary_log::gtids::Uuid;
 class Write_rows_event_view : public binary_log::Write_rows_event {
  public:
   Write_rows_event_view(const char *buf, const Format_description_event *fde)
-      : binary_log::Write_rows_event(buf, fde) {}
+      : binary_log::Rows_event(buf, fde),
+        binary_log::Write_rows_event(buf, fde) {}
   const std::vector<uint8_t> &columns_before() const {
     return columns_before_image;
   }
@@ -61,9 +62,9 @@ class Write_rows_event_view : public binary_log::Write_rows_event {
 
 class Update_rows_event_view : public binary_log::Update_rows_event {
  public:
-  Update_rows_event_view(const char *buf, const Format_description_event *fde,
-                         Log_event_type type)
-      : binary_log::Update_rows_event(buf, fde, type) {}
+  Update_rows_event_view(const char *buf, const Format_description_event *fde)
+      : binary_log::Rows_event(buf, fde),
+        binary_log::Update_rows_event(buf, fde) {}
   const std::vector<uint8_t> &columns_before() const {
     return columns_before_image;
   }
@@ -76,7 +77,8 @@ class Update_rows_event_view : public binary_log::Update_rows_event {
 class Delete_rows_event_view : public binary_log::Delete_rows_event {
  public:
   Delete_rows_event_view(const char *buf, const Format_description_event *fde)
-      : binary_log::Delete_rows_event(buf, fde) {}
+      : binary_log::Rows_event(buf, fde),
+        binary_log::Delete_rows_event(buf, fde) {}
   const std::vector<uint8_t> &columns_before() const {
     return columns_before_image;
   }
@@ -430,7 +432,7 @@ Status DuckDBBinlogStreamer::NextEvent(BinlogEvent *event) {
       case binary_log::UPDATE_ROWS_EVENT:
       case binary_log::UPDATE_ROWS_EVENT_V1:
       case binary_log::PARTIAL_UPDATE_ROWS_EVENT: {
-        Update_rows_event_view uev(buf, fde_.get(), ev_type);
+        Update_rows_event_view uev(buf, fde_.get());
         event->type = BinlogEvent::Type::kUpdateRows;
         event->table_id = uev.get_table_id();
         event->columns_before = uev.columns_before();
