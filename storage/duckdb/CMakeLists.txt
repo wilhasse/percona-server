@@ -93,9 +93,12 @@ if(NOT WITHOUT_DUCKDB_SE_STORAGE_ENGINE)
     MYSQL_ADD_EXECUTABLE(duckdb_snapshot_loader
       duckdb_snapshot_loader.cc
       duckdb_adapter.cc
+      duckdb_binlog_applier.cc
+      duckdb_binlog_streamer.cc
+      duckdb_row_decoder.cc
       ENABLE_EXPORTS
       EXCLUDE_FROM_ALL
-      LINK_LIBRARIES duckdb_static dummy_static_extension_loader perconaserverclient
+      LINK_LIBRARIES duckdb_static dummy_static_extension_loader perconaserverclient binlogevents_static
     )
     TARGET_INCLUDE_DIRECTORIES(duckdb_snapshot_loader PRIVATE
       ${DUCKDB_SOURCE_DIR}/src/include

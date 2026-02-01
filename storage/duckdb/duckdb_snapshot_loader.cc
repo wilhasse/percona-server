@@ -24,6 +24,7 @@
 #include <mysql.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -32,8 +33,10 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -43,14 +46,21 @@
 #endif
 
 #include "storage/duckdb/duckdb_adapter.h"
+#include "storage/duckdb/duckdb_binlog_applier.h"
+#include "storage/duckdb/duckdb_binlog_streamer.h"
+#include "storage/duckdb/duckdb_row_decoder.h"
 
 namespace {
 
 using duckdb_se::ApplyTxn;
 using duckdb_se::Cell;
+using duckdb_se::DuckDBBinlogApplier;
 using duckdb_se::DuckDBAdapter;
+using duckdb_se::DuckDBBinlogStreamer;
 using duckdb_se::DuckDBConfig;
 using duckdb_se::Gtid;
+using duckdb_se::BinlogEvent;
+using duckdb_se::BinlogStreamOptions;
 using duckdb_se::MySQLTableDef;
 using duckdb_se::Row;
 using duckdb_se::RowBatch;
@@ -104,6 +114,11 @@ int GetPid() {
 #else
   return ::getpid();
 #endif
+}
+
+uint32_t MakeServerId() {
+  const uint32_t pid = static_cast<uint32_t>(GetPid());
+  return 100000u + (pid % 100000u);
 }
 
 bool StartsWith(const std::string &value, const std::string &prefix) {
@@ -810,6 +825,215 @@ bool StreamTable(MYSQL *mysql, DuckDBAdapter &adapter,
   return true;
 }
 
+struct BinlogBufferState {
+  std::vector<BinlogEvent> events;
+  std::mutex mutex;
+  std::atomic<bool> stop{false};
+  std::atomic<bool> failed{false};
+  std::string error;
+};
+
+class BinlogBufferGuard {
+ public:
+  BinlogBufferGuard(DuckDBBinlogStreamer *streamer, BinlogBufferState *state,
+                    std::thread *thread)
+      : streamer_(streamer), state_(state), thread_(thread) {}
+
+  void StopThread() {
+    if (thread_stopped_) return;
+    if (state_) state_->stop.store(true);
+    if (thread_ && thread_->joinable()) thread_->join();
+    thread_stopped_ = true;
+  }
+
+  void CloseStreamer() {
+    if (streamer_closed_) return;
+    if (streamer_) streamer_->Close();
+    streamer_closed_ = true;
+  }
+
+  ~BinlogBufferGuard() {
+    StopThread();
+    CloseStreamer();
+  }
+
+ private:
+  DuckDBBinlogStreamer *streamer_{nullptr};
+  BinlogBufferState *state_{nullptr};
+  std::thread *thread_{nullptr};
+  bool thread_stopped_{false};
+  bool streamer_closed_{false};
+};
+
+bool IsBufferableEvent(const BinlogEvent &event) {
+  switch (event.type) {
+    case BinlogEvent::Type::kGtid:
+    case BinlogEvent::Type::kWriteRows:
+    case BinlogEvent::Type::kUpdateRows:
+    case BinlogEvent::Type::kDeleteRows:
+    case BinlogEvent::Type::kXid:
+      return true;
+    default:
+      return false;
+  }
+}
+
+void BufferBinlogEvents(DuckDBBinlogStreamer *streamer,
+                        BinlogBufferState *state, bool verbose) {
+  if (!streamer || !state) return;
+  while (!state->stop.load()) {
+    BinlogEvent event;
+    Status st = streamer->NextEvent(&event);
+    if (!st.ok()) {
+      if (state->stop.load()) break;
+      if (st.code == duckdb_se::StatusCode::kInvalid &&
+          st.message == "No binlog data available") {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        continue;
+      }
+      {
+        std::lock_guard<std::mutex> guard(state->mutex);
+        state->error = st.message;
+      }
+      state->failed.store(true);
+      break;
+    }
+
+    if (!IsBufferableEvent(event)) {
+      continue;
+    }
+
+    if (verbose && event.type == BinlogEvent::Type::kGtid) {
+      std::cerr << "Buffered GTID: " << event.gtid << "\n";
+    }
+
+    std::lock_guard<std::mutex> guard(state->mutex);
+    state->events.push_back(std::move(event));
+  }
+}
+
+bool ShouldApplyEvent(const BinlogEvent &event, const std::string &schema,
+                      const std::string &table) {
+  if (!schema.empty() && event.schema != schema) return false;
+  if (!table.empty() && event.table != table) return false;
+  return true;
+}
+
+Status ApplyBufferedEvents(DuckDBAdapter &adapter, DuckDBBinlogStreamer &streamer,
+                           const std::vector<BinlogEvent> &events,
+                           const std::string &schema_filter,
+                           const std::string &table_filter, bool verbose) {
+  DuckDBBinlogApplier applier(&adapter);
+  bool txn_active = false;
+  std::string active_gtid;
+
+  auto begin_txn = [&](const std::string &gtid) -> Status {
+    active_gtid = gtid;
+    Status st = applier.BeginTransaction(Gtid{gtid});
+    if (!st.ok()) return st;
+    txn_active = true;
+    return Status::Ok();
+  };
+
+  auto commit_txn = [&]() -> Status {
+    if (!txn_active) return Status::Ok();
+    Status st = applier.CommitTransaction();
+    if (!st.ok()) return st;
+    txn_active = false;
+    return Status::Ok();
+  };
+
+  for (const auto &event : events) {
+    switch (event.type) {
+      case BinlogEvent::Type::kGtid: {
+        if (txn_active) {
+          Status st = commit_txn();
+          if (!st.ok()) return st;
+        }
+        if (event.gtid.empty()) {
+          return Status::Error(duckdb_se::StatusCode::kInvalid,
+                               "Missing GTID in binlog event");
+        }
+        Status st = begin_txn(event.gtid);
+        if (!st.ok()) return st;
+        break;
+      }
+      case BinlogEvent::Type::kWriteRows:
+      case BinlogEvent::Type::kUpdateRows:
+      case BinlogEvent::Type::kDeleteRows: {
+        if (!ShouldApplyEvent(event, schema_filter, table_filter)) {
+          break;
+        }
+        if (!txn_active) {
+          if (event.gtid.empty()) {
+            return Status::Error(duckdb_se::StatusCode::kInvalid,
+                                 "Row event without active GTID");
+          }
+          Status st = begin_txn(event.gtid);
+          if (!st.ok()) return st;
+        }
+        const auto *map = streamer.GetTableMap(event.table_id);
+        if (!map) {
+          return Status::Error(duckdb_se::StatusCode::kInvalid,
+                               "Missing table map for row event");
+        }
+        TableId table_id{map->schema, map->table};
+
+        if (event.type == BinlogEvent::Type::kWriteRows) {
+          std::vector<Row> rows;
+          const auto &columns = event.columns_after.empty()
+                                    ? event.columns_before
+                                    : event.columns_after;
+          Status st = duckdb_se::DecodeWriteRows(*map, columns, event.row_data,
+                                                 &rows);
+          if (!st.ok()) return st;
+          RowBatch batch;
+          batch.table = table_id;
+          batch.rows = std::move(rows);
+          st = applier.AppendInsertRows(table_id, std::move(batch));
+          if (!st.ok()) return st;
+        } else if (event.type == BinlogEvent::Type::kUpdateRows) {
+          std::vector<Row> before_rows;
+          std::vector<Row> after_rows;
+          Status st = duckdb_se::DecodeUpdateRows(
+              *map, event.columns_before, event.columns_after, event.row_data,
+              &before_rows, &after_rows);
+          if (!st.ok()) return st;
+          duckdb_se::BulkUpdateBatch batch;
+          batch.table = table_id;
+          batch.old_rows = std::move(before_rows);
+          batch.new_rows = std::move(after_rows);
+          st = applier.AppendUpdateRows(table_id, std::move(batch));
+          if (!st.ok()) return st;
+        } else if (event.type == BinlogEvent::Type::kDeleteRows) {
+          std::vector<Row> rows;
+          const auto &columns = event.columns_before.empty()
+                                    ? event.columns_after
+                                    : event.columns_before;
+          Status st = duckdb_se::DecodeDeleteRows(*map, columns, event.row_data,
+                                                  &rows);
+          if (!st.ok()) return st;
+          duckdb_se::BulkDeleteBatch batch;
+          batch.table = table_id;
+          batch.old_rows = std::move(rows);
+          st = applier.AppendDeleteRows(table_id, std::move(batch));
+          if (!st.ok()) return st;
+        }
+        break;
+      }
+      case BinlogEvent::Type::kXid: {
+        Status st = commit_txn();
+        if (!st.ok()) return st;
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  return commit_txn();
+}
+
 std::string ResolveDuckdbPath(const Options &opts) {
   if (!opts.duckdb_path.empty()) return opts.duckdb_path;
   if (opts.duckdb_dir.empty()) return {};
@@ -886,6 +1110,31 @@ int main(int argc, char **argv) {
   if (opts.verbose) {
     std::cerr << "Snapshot GTID set: " << snapshot_gtid << "\n";
   }
+
+  DuckDBBinlogStreamer binlog_streamer;
+  BinlogBufferState binlog_buffer;
+  std::thread binlog_thread;
+  {
+    BinlogStreamOptions stream_opts;
+    stream_opts.host = opts.host;
+    stream_opts.user = opts.user;
+    stream_opts.password = opts.password;
+    stream_opts.socket = opts.socket;
+    stream_opts.port = opts.port;
+    stream_opts.server_id = MakeServerId();
+    stream_opts.gtid_set = snapshot_gtid;
+    Status st = binlog_streamer.Open(stream_opts);
+    if (!st.ok()) {
+      std::cerr << "Binlog stream open failed: " << st.message << "\n";
+      mysql_close(mysql);
+      mysql_library_end();
+      return 1;
+    }
+  }
+  binlog_thread = std::thread(BufferBinlogEvents, &binlog_streamer,
+                              &binlog_buffer, opts.verbose);
+  BinlogBufferGuard binlog_guard(&binlog_streamer, &binlog_buffer,
+                                 &binlog_thread);
 
   std::vector<std::string> tables;
   if (!opts.table.empty()) {
@@ -1025,6 +1274,38 @@ int main(int argc, char **argv) {
   }
 
   ExecQuery(mysql, "COMMIT");
+
+  binlog_guard.StopThread();
+  if (binlog_buffer.failed.load()) {
+    std::lock_guard<std::mutex> guard(binlog_buffer.mutex);
+    std::cerr << "Binlog buffering failed: " << binlog_buffer.error << "\n";
+    adapter.Shutdown();
+    mysql_close(mysql);
+    mysql_library_end();
+    return 1;
+  }
+
+  std::vector<BinlogEvent> buffered_events;
+  {
+    std::lock_guard<std::mutex> guard(binlog_buffer.mutex);
+    buffered_events = std::move(binlog_buffer.events);
+  }
+  if (opts.verbose) {
+    std::cerr << "Buffered " << buffered_events.size() << " binlog events\n";
+  }
+  if (!buffered_events.empty()) {
+    Status st = ApplyBufferedEvents(adapter, binlog_streamer, buffered_events,
+                                    opts.schema, opts.table, opts.verbose);
+    if (!st.ok()) {
+      std::cerr << "Applying buffered binlog events failed: " << st.message
+                << "\n";
+      adapter.Shutdown();
+      mysql_close(mysql);
+      mysql_library_end();
+      return 1;
+    }
+  }
+  binlog_guard.CloseStreamer();
   if (opts.verbose) {
     std::cerr << "Total rows loaded: " << total_rows << "\n";
   }
