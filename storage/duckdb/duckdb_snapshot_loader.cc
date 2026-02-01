@@ -655,7 +655,7 @@ bool ValidateSums(MYSQL *mysql, DuckDBAdapter &adapter,
                 << def.name << "." << col.name << "\n";
       return false;
     }
-    const long double diff = std::fabsl(mysql_sum - duckdb_sum);
+    const long double diff = std::fabs(mysql_sum - duckdb_sum);
     const long double tol = 1e-6L;
     if (diff > tol) {
       std::cerr << "Validation mismatch for " << schema << "." << def.name
