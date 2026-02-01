@@ -384,6 +384,11 @@ INSERT INTO global_suppressions VALUES
 
  ("'mysql_native_password' is deprecated and will be removed in a future release."),
 
+ /*
+   DuckDB binlog applier connection errors during shutdown
+ */
+ ("DuckDB binlog applier error: mysql_binlog_fetch failed"),
+
  ("THE_LAST_SUPPRESSION");
 
 
