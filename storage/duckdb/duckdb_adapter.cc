@@ -457,10 +457,16 @@ ApplyTxn DuckDBAdapter::BeginApplyTxn(Gtid gtid) {
   ApplyTxn txn;
   txn.gtid = std::move(gtid);
 
+  if (!db_) {
+    txn.status = Status::Error(StatusCode::kNotInitialized,
+                               "DuckDBAdapter not initialized");
+    return txn;
+  }
+
   try {
-    duckdb::DBConfig config(false);
-    txn.db = std::make_unique<duckdb::DuckDB>(db_path_, &config);
-    txn.conn = std::make_unique<duckdb::Connection>(*txn.db);
+    // Use existing database instance instead of creating a new one.
+    // DuckDB instances are isolated and don't share catalog changes.
+    txn.conn = std::make_unique<duckdb::Connection>(*db_);
     auto result = txn.conn->Query("BEGIN TRANSACTION");
     if (result->HasError()) {
       txn.status = Status::Error(StatusCode::kDuckDBError, result->GetError());

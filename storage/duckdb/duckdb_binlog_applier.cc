@@ -23,10 +23,31 @@
 
 #include "storage/duckdb/duckdb_binlog_applier.h"
 
+#include <ctime>
+#include <iomanip>
+#include <sstream>
 #include <utility>
 
 namespace duckdb_se {
 namespace {
+
+std::string GetCurrentTimestampString() {
+  auto now = std::chrono::system_clock::now();
+  auto time_t_now = std::chrono::system_clock::to_time_t(now);
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now.time_since_epoch()) %
+            1000;
+  std::tm tm_buf{};
+#ifdef _WIN32
+  gmtime_s(&tm_buf, &time_t_now);
+#else
+  gmtime_r(&time_t_now, &tm_buf);
+#endif
+  std::ostringstream oss;
+  oss << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S") << '.'
+      << std::setfill('0') << std::setw(3) << ms.count();
+  return oss.str();
+}
 
 size_t EstimateRowBytes(const Row &row) {
   size_t bytes = 0;
@@ -64,9 +85,9 @@ Status DuckDBBinlogApplier::BeginTransaction(Gtid gtid) {
 
 Status DuckDBBinlogApplier::AppendInsert(TableId table, Row row) {
   RowBatch batch;
-  batch.table = std::move(table);
+  batch.table = table;  // Copy table ID to batch
   batch.rows.emplace_back(std::move(row));
-  return AppendInsertBatch(batch.table, std::move(batch));
+  return AppendInsertBatch(std::move(table), std::move(batch));
 }
 
 Status DuckDBBinlogApplier::AppendInsertBatch(TableId table, RowBatch batch) {
@@ -250,17 +271,20 @@ Status DuckDBBinlogApplier::FlushBuffered(bool force) {
     auto &buffer = entry.second;
     if (!buffer.inserts.rows.empty()) {
       RowBatch batch = std::move(buffer.inserts);
-      st = adapter_->AppendRows(apply_txn_, batch.table, std::move(batch));
+      TableId table = batch.table;  // Copy before move to avoid UB
+      st = adapter_->AppendRows(apply_txn_, std::move(table), std::move(batch));
       if (!st.ok()) return st;
     }
     if (!buffer.updates.statements.empty()) {
       UpdateBatch batch = std::move(buffer.updates);
-      st = adapter_->ApplyUpdates(apply_txn_, batch.table, std::move(batch));
+      TableId table = batch.table;  // Copy before move to avoid UB
+      st = adapter_->ApplyUpdates(apply_txn_, std::move(table), std::move(batch));
       if (!st.ok()) return st;
     }
     if (!buffer.deletes.statements.empty()) {
       DeleteBatch batch = std::move(buffer.deletes);
-      st = adapter_->ApplyDeletes(apply_txn_, batch.table, std::move(batch));
+      TableId table = batch.table;  // Copy before move to avoid UB
+      st = adapter_->ApplyDeletes(apply_txn_, std::move(table), std::move(batch));
       if (!st.ok()) return st;
     }
   }
@@ -310,7 +334,8 @@ Status DuckDBBinlogApplier::ApplyWatermark() {
       EscapeLiteral(current_gtid_.value) + "'";
   const std::string insert_sql =
       "INSERT INTO __repl_watermark (gtid, commit_ts) VALUES ('" +
-      EscapeLiteral(current_gtid_.value) + "', CURRENT_TIMESTAMP)";
+      EscapeLiteral(current_gtid_.value) + "', '" +
+      GetCurrentTimestampString() + "')";
 
   try {
     auto result = apply_txn_.conn->Query(create_sql);
