@@ -162,6 +162,7 @@ class DuckDBAdapter {
   Status AlterTable(DDLChange change);
   Status DropTable(std::string schema, std::string table);
   Status ApplyDDL(DDLChange change);
+  Status ApplyDDLInTxn(ApplyTxn &txn, DDLChange change);
 
   ApplyTxn BeginApplyTxn(Gtid gtid);
   Status AppendRows(ApplyTxn &txn, TableId table, RowBatch batch);
@@ -182,6 +183,15 @@ class DuckDBAdapter {
   Status EnsureInitialized() const;
   Status ExecuteDDL(const std::string &sql);
   Status ExecuteDDLOn(duckdb::Connection &conn, const std::string &sql);
+  Status ApplyDDLOn(duckdb::Connection &conn, DDLChange change,
+                    bool manage_copy_txn);
+  Status CreateTableOn(duckdb::Connection &conn, MySQLTableDef def);
+  Status DropTableOn(duckdb::Connection &conn, std::string schema,
+                     std::string table);
+  Status RenameTableOn(duckdb::Connection &conn, TableId from, TableId to);
+  Status TruncateTableOn(duckdb::Connection &conn, TableId table);
+  Status CopyTableOn(duckdb::Connection &conn, TableId source,
+                     const MySQLTableDef &target_def, bool manage_txn);
   Status EnsureDeltaTable(duckdb::Connection &conn, TableId table);
   std::string DeltaTableName(const TableId &table) const;
   Status RenameTable(TableId from, TableId to);

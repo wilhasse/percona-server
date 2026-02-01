@@ -49,6 +49,7 @@ using duckdb_se::Cell;
 using duckdb_se::DuckDBAdapter;
 using duckdb_se::DuckDBBinlogApplier;
 using duckdb_se::DuckDBConfig;
+using duckdb_se::DDLChange;
 using duckdb_se::Gtid;
 using duckdb_se::MySQLTableDef;
 using duckdb_se::Row;
@@ -316,6 +317,35 @@ TEST(DuckDBBinlogApplierTest, BulkUpdatePreservesOrderOnChainedUpdates) {
                           "SELECT COUNT(*) FROM t WHERE val = 'gamma'"));
   EXPECT_EQ(0, QueryCount(adapter,
                           "SELECT COUNT(*) FROM t WHERE val = 'beta'"));
+
+  adapter.Shutdown();
+  CleanupDuckdbFiles(path);
+}
+
+TEST(DuckDBBinlogApplierTest, ApplyDDLInTransaction) {
+  const std::string path = MakeTempPath("duckdb_apply_ddl");
+  CleanupDuckdbFiles(path);
+
+  DuckDBAdapter adapter;
+  DuckDBConfig cfg;
+  cfg.read_only = false;
+  ExpectOk(adapter.Init(path, cfg));
+
+  DuckDBBinlogApplier applier(&adapter);
+  DDLChange create_change;
+  create_change.type = DDLChange::Type::kCreate;
+  create_change.new_def = MakeSimpleTable();
+
+  ExpectOk(applier.BeginTransaction(Gtid{"gtid:ddl:1"}));
+  ExpectOk(applier.ApplyDDL(std::move(create_change)));
+  ExpectOk(applier.CommitTransaction());
+
+  EXPECT_EQ(0, QueryCount(adapter, "SELECT COUNT(*) FROM t"));
+
+  ExpectOk(applier.BeginTransaction(Gtid{"gtid:ddl:2"}));
+  ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
+  ExpectOk(applier.CommitTransaction());
+  EXPECT_EQ(1, QueryCount(adapter, "SELECT COUNT(*) FROM t"));
 
   adapter.Shutdown();
   CleanupDuckdbFiles(path);

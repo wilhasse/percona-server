@@ -473,7 +473,7 @@ bool BuildDeleteRow(const std::vector<std::string> &columns,
 }  // namespace
 
 BinlogApplyControls GetBinlogApplyControls() {
-  const auto &state = GetApplyState();
+  auto &state = GetApplyState();
   BinlogApplyControls controls;
   controls.paused = state.paused.load();
   controls.throttle_rows_per_sec = state.throttle_rows_per_sec.load();
@@ -487,7 +487,7 @@ BinlogApplyControls GetBinlogApplyControls() {
 }
 
 BinlogApplyMetrics GetBinlogApplyMetrics() {
-  const auto &state = GetApplyState();
+  auto &state = GetApplyState();
   BinlogApplyMetrics metrics;
   metrics.applied_transactions = state.applied_transactions.load();
   metrics.applied_rows = state.applied_rows.load();
@@ -812,6 +812,28 @@ Status DuckDBBinlogApplier::AddDeleteStatement(TableId table, std::string sql) {
   buffered_bytes_ += bytes_added;
 
   return FlushBuffered(false);
+}
+
+Status DuckDBBinlogApplier::ApplyDDL(DDLChange change) {
+  if (!in_txn_) {
+    return Status::Error(StatusCode::kInvalid, "No active binlog transaction");
+  }
+  WaitIfPaused();
+  if (skip_txn_) {
+    return Status::Ok();
+  }
+
+  Status st = FlushBuffered(true);
+  if (!st.ok()) {
+    return st;
+  }
+
+  st = EnsureApplyTxn();
+  if (!st.ok()) {
+    return st;
+  }
+
+  return adapter_->ApplyDDLInTxn(apply_txn_, std::move(change));
 }
 
 Status DuckDBBinlogApplier::CommitTransaction() {

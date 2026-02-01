@@ -85,6 +85,7 @@ class DuckDBBinlogApplier {
   Status AppendInsertBatch(TableId table, RowBatch batch);
   Status AddUpdateStatement(TableId table, std::string sql);
   Status AddDeleteStatement(TableId table, std::string sql);
+  Status ApplyDDL(DDLChange change);
   Status CommitTransaction();
   Status RollbackTransaction();
 

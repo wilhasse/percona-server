@@ -43,6 +43,9 @@ components:
       apply_ddl:
         input: [DDLChange]
         output: Status
+      apply_ddl_in_txn:
+        input: [ApplyTxn, DDLChange]
+        output: Status
       drop_table:
         input: [schema, table]
         output: Status
@@ -92,6 +95,9 @@ components:
       rollback_transaction:
         input: []
         output: Status
+      apply_ddl:
+        input: [DDLChange]
+        output: Status
       set_paused:
         input: [bool]
         output: void
@@ -138,3 +144,5 @@ schemas:
 compatibility_notes:
   - date: 2026-02-01
     change: Added binlog applier control and metrics interfaces.
+  - date: 2026-02-01
+    change: Added DDL apply interfaces for binlog applier and adapter txn use.
