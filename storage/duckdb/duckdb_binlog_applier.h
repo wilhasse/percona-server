@@ -25,6 +25,7 @@
 #define PLUGIN_DUCKDB_BINLOG_APPLIER_H_
 
 #include <chrono>
+#include <cstdint>
 #include <map>
 #include <string>
 #include <utility>
@@ -70,6 +71,13 @@ class DuckDBBinlogApplier {
     RowBatch inserts;
     UpdateBatch updates;
     DeleteBatch deletes;
+    BulkUpdateBatch bulk_updates;
+    BulkDeleteBatch bulk_deletes;
+    std::vector<std::string> columns;
+    std::map<std::string, size_t> column_index;
+    std::map<uint64_t, std::vector<size_t>> bulk_update_old_hashes;
+    std::map<uint64_t, std::vector<size_t>> bulk_update_new_hashes;
+    bool columns_loaded{false};
     size_t row_count{0};
     size_t byte_count{0};
   };

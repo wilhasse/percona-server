@@ -114,6 +114,17 @@ struct RowBatch {
   std::vector<Row> rows;
 };
 
+struct BulkUpdateBatch {
+  TableId table;
+  std::vector<Row> old_rows;
+  std::vector<Row> new_rows;
+};
+
+struct BulkDeleteBatch {
+  TableId table;
+  std::vector<Row> old_rows;
+};
+
 struct UpdateBatch {
   TableId table;
   std::vector<std::string> statements;
@@ -156,6 +167,8 @@ class DuckDBAdapter {
   Status AppendRows(ApplyTxn &txn, TableId table, RowBatch batch);
   Status ApplyUpdates(ApplyTxn &txn, TableId table, UpdateBatch batch);
   Status ApplyDeletes(ApplyTxn &txn, TableId table, DeleteBatch batch);
+  Status ApplyBulkUpdates(ApplyTxn &txn, TableId table, BulkUpdateBatch batch);
+  Status ApplyBulkDeletes(ApplyTxn &txn, TableId table, BulkDeleteBatch batch);
   Status CommitApplyTxn(ApplyTxn &txn);
   Status RollbackApplyTxn(ApplyTxn &txn);
 
@@ -163,14 +176,16 @@ class DuckDBAdapter {
   Status GetLatestWatermark(Gtid *gtid);
   Status GetAppliedGtids(std::vector<Gtid> *gtids);
   Status IsGtidApplied(const Gtid &gtid, bool *applied);
+  Status GetTableColumns(TableId table, std::vector<std::string> *columns);
 
  private:
   Status EnsureInitialized() const;
   Status ExecuteDDL(const std::string &sql);
   Status ExecuteDDLOn(duckdb::Connection &conn, const std::string &sql);
+  Status EnsureDeltaTable(duckdb::Connection &conn, TableId table);
+  std::string DeltaTableName(const TableId &table) const;
   Status RenameTable(TableId from, TableId to);
   Status TruncateTable(TableId table);
-  Status GetTableColumns(TableId table, std::vector<std::string> *columns);
   Status CopyTable(TableId source, const MySQLTableDef &target_def);
   std::string QuoteIdent(const std::string &name) const;
   std::string QualifiedName(const TableId &table) const;

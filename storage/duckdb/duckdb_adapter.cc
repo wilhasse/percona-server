@@ -106,6 +106,36 @@ Status DuckDBAdapter::ExecuteDDLOn(duckdb::Connection &conn,
   return Status::Ok();
 }
 
+std::string DuckDBAdapter::DeltaTableName(const TableId &table) const {
+  return "__delta_" + table.table;
+}
+
+Status DuckDBAdapter::EnsureDeltaTable(duckdb::Connection &conn,
+                                       TableId table) {
+  if (table.table.empty()) {
+    return Status::Error(StatusCode::kInvalid, "Missing table name");
+  }
+
+  std::vector<std::string> columns;
+  Status st = GetTableColumns(table, &columns);
+  if (!st.ok()) return st;
+  if (columns.empty()) {
+    return Status::Error(StatusCode::kInvalid, "No columns for delta table");
+  }
+
+  std::string sql = "CREATE TABLE IF NOT EXISTS ";
+  TableId delta{table.schema, DeltaTableName(table)};
+  sql += QualifiedName(delta);
+  sql += " (";
+  for (size_t i = 0; i < columns.size(); ++i) {
+    sql += QuoteIdent(columns[i]) + " VARCHAR";
+    if (i + 1 < columns.size()) sql += ", ";
+  }
+  sql += ")";
+
+  return ExecuteDDLOn(conn, sql);
+}
+
 Status DuckDBAdapter::ExecuteDDL(const std::string &sql) {
   auto st = EnsureInitialized();
   if (!st.ok()) return st;
@@ -531,6 +561,182 @@ Status DuckDBAdapter::ApplyUpdates(ApplyTxn &txn, TableId,
         return Status::Error(StatusCode::kDuckDBError, result->GetError());
       }
     }
+  } catch (const std::exception &ex) {
+    return Status::Error(StatusCode::kDuckDBError, ex.what());
+  }
+
+  return Status::Ok();
+}
+
+Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
+                                       BulkUpdateBatch batch) {
+  if (!txn.active || !txn.conn) {
+    return Status::Error(StatusCode::kInvalid, "Apply transaction not active");
+  }
+  if (batch.new_rows.empty()) {
+    return Status::Ok();
+  }
+  if (batch.old_rows.size() != batch.new_rows.size()) {
+    return Status::Error(StatusCode::kInvalid,
+                         "Bulk update row counts do not match");
+  }
+
+  Status st = EnsureDeltaTable(*txn.conn, table);
+  if (!st.ok()) return st;
+
+  try {
+    TableId delta{table.schema, DeltaTableName(table)};
+    std::unique_ptr<duckdb::Appender> appender;
+    if (delta.schema.empty()) {
+      appender = std::make_unique<duckdb::Appender>(*txn.conn, delta.table);
+    } else {
+      appender =
+          std::make_unique<duckdb::Appender>(*txn.conn, delta.schema,
+                                             delta.table);
+    }
+
+    for (const auto &row : batch.old_rows) {
+      appender->BeginRow();
+      for (const auto &cell : row) {
+        if (cell.is_null) {
+          appender->Append(duckdb::Value());
+        } else if (cell.is_blob) {
+          appender->Append(duckdb::Value::BLOB(cell.value));
+        } else {
+          appender->Append(cell.value.c_str(),
+                           static_cast<uint32_t>(cell.value.size()));
+        }
+      }
+      appender->EndRow();
+    }
+    appender->Close();
+
+    std::vector<std::string> columns;
+    st = GetTableColumns(table, &columns);
+    if (!st.ok()) return st;
+    if (columns.empty()) {
+      return Status::Error(StatusCode::kInvalid,
+                           "No columns available for bulk update");
+    }
+
+    for (const auto &row : batch.old_rows) {
+      if (row.size() != columns.size()) {
+        return Status::Error(StatusCode::kInvalid,
+                             "Bulk update row does not match column count");
+      }
+    }
+    for (const auto &row : batch.new_rows) {
+      if (row.size() != columns.size()) {
+        return Status::Error(StatusCode::kInvalid,
+                             "Bulk update row does not match column count");
+      }
+    }
+
+    const std::string target = QualifiedName(table);
+    const std::string delta_name = QualifiedName(delta);
+
+    std::string join_sql;
+    for (size_t i = 0; i < columns.size(); ++i) {
+      if (i > 0) join_sql += " AND ";
+      const std::string col = QuoteIdent(columns[i]);
+      join_sql += target + "." + col + " IS NOT DISTINCT FROM " + delta_name +
+                  "." + col;
+    }
+
+    const std::string delete_sql =
+        "DELETE FROM " + target + " USING " + delta_name + " WHERE " + join_sql;
+    st = ExecuteDDLOn(*txn.conn, delete_sql);
+    if (!st.ok()) return st;
+
+    const std::string cleanup_sql = "DELETE FROM " + delta_name;
+    st = ExecuteDDLOn(*txn.conn, cleanup_sql);
+    if (!st.ok()) return st;
+
+    RowBatch insert_batch;
+    insert_batch.table = table;
+    insert_batch.rows = std::move(batch.new_rows);
+    st = AppendRows(txn, std::move(table), std::move(insert_batch));
+    if (!st.ok()) return st;
+  } catch (const std::exception &ex) {
+    return Status::Error(StatusCode::kDuckDBError, ex.what());
+  }
+
+  return Status::Ok();
+}
+
+Status DuckDBAdapter::ApplyBulkDeletes(ApplyTxn &txn, TableId table,
+                                       BulkDeleteBatch batch) {
+  if (!txn.active || !txn.conn) {
+    return Status::Error(StatusCode::kInvalid, "Apply transaction not active");
+  }
+  if (batch.old_rows.empty()) {
+    return Status::Ok();
+  }
+
+  Status st = EnsureDeltaTable(*txn.conn, table);
+  if (!st.ok()) return st;
+
+  try {
+    TableId delta{table.schema, DeltaTableName(table)};
+    std::unique_ptr<duckdb::Appender> appender;
+    if (delta.schema.empty()) {
+      appender = std::make_unique<duckdb::Appender>(*txn.conn, delta.table);
+    } else {
+      appender =
+          std::make_unique<duckdb::Appender>(*txn.conn, delta.schema,
+                                             delta.table);
+    }
+
+    for (const auto &row : batch.old_rows) {
+      appender->BeginRow();
+      for (const auto &cell : row) {
+        if (cell.is_null) {
+          appender->Append(duckdb::Value());
+        } else if (cell.is_blob) {
+          appender->Append(duckdb::Value::BLOB(cell.value));
+        } else {
+          appender->Append(cell.value.c_str(),
+                           static_cast<uint32_t>(cell.value.size()));
+        }
+      }
+      appender->EndRow();
+    }
+    appender->Close();
+
+    std::vector<std::string> columns;
+    st = GetTableColumns(table, &columns);
+    if (!st.ok()) return st;
+    if (columns.empty()) {
+      return Status::Error(StatusCode::kInvalid,
+                           "No columns available for bulk delete");
+    }
+
+    for (const auto &row : batch.old_rows) {
+      if (row.size() != columns.size()) {
+        return Status::Error(StatusCode::kInvalid,
+                             "Bulk delete row does not match column count");
+      }
+    }
+
+    const std::string target = QualifiedName(table);
+    const std::string delta_name = QualifiedName(delta);
+
+    std::string join_sql;
+    for (size_t i = 0; i < columns.size(); ++i) {
+      if (i > 0) join_sql += " AND ";
+      const std::string col = QuoteIdent(columns[i]);
+      join_sql += target + "." + col + " IS NOT DISTINCT FROM " + delta_name +
+                  "." + col;
+    }
+
+    const std::string delete_sql =
+        "DELETE FROM " + target + " USING " + delta_name + " WHERE " + join_sql;
+    st = ExecuteDDLOn(*txn.conn, delete_sql);
+    if (!st.ok()) return st;
+
+    const std::string cleanup_sql = "DELETE FROM " + delta_name;
+    st = ExecuteDDLOn(*txn.conn, cleanup_sql);
+    if (!st.ok()) return st;
   } catch (const std::exception &ex) {
     return Status::Error(StatusCode::kDuckDBError, ex.what());
   }

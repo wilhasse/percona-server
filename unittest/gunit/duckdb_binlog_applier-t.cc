@@ -245,4 +245,75 @@ TEST(DuckDBBinlogApplierTest, IdempotentReplaySkipsAppliedGtid) {
   CleanupDuckdbFiles(path);
 }
 
+TEST(DuckDBBinlogApplierTest, BulkUpdateDeleteFullRowImage) {
+  const std::string path = MakeTempPath("duckdb_bulk_update");
+  CleanupDuckdbFiles(path);
+
+  DuckDBAdapter adapter;
+  DuckDBConfig cfg;
+  cfg.read_only = false;
+  ExpectOk(adapter.Init(path, cfg));
+  ExpectOk(adapter.CreateTable(MakeSimpleTable()));
+
+  DuckDBBinlogApplier applier(&adapter);
+  ExpectOk(applier.BeginTransaction(Gtid{"gtid:bulk:1"}));
+  ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
+  ExpectOk(applier.CommitTransaction());
+
+  const std::string update_sql =
+      "UPDATE \"t\" SET \"val\" = 'beta' WHERE \"id\" IS NOT DISTINCT FROM '1' "
+      "AND \"val\" IS NOT DISTINCT FROM 'alpha'";
+  ExpectOk(applier.BeginTransaction(Gtid{"gtid:bulk:2"}));
+  ExpectOk(applier.AddUpdateStatement(TableId{"", "t"}, update_sql));
+  ExpectOk(applier.CommitTransaction());
+  EXPECT_EQ(1, QueryCount(adapter,
+                          "SELECT COUNT(*) FROM t WHERE val = 'beta'"));
+
+  const std::string delete_sql =
+      "DELETE FROM \"t\" WHERE \"id\" IS NOT DISTINCT FROM '1' AND \"val\" IS "
+      "NOT DISTINCT FROM 'beta'";
+  ExpectOk(applier.BeginTransaction(Gtid{"gtid:bulk:3"}));
+  ExpectOk(applier.AddDeleteStatement(TableId{"", "t"}, delete_sql));
+  ExpectOk(applier.CommitTransaction());
+  EXPECT_EQ(0, QueryCount(adapter, "SELECT COUNT(*) FROM t"));
+
+  adapter.Shutdown();
+  CleanupDuckdbFiles(path);
+}
+
+TEST(DuckDBBinlogApplierTest, BulkUpdatePreservesOrderOnChainedUpdates) {
+  const std::string path = MakeTempPath("duckdb_bulk_chain");
+  CleanupDuckdbFiles(path);
+
+  DuckDBAdapter adapter;
+  DuckDBConfig cfg;
+  cfg.read_only = false;
+  ExpectOk(adapter.Init(path, cfg));
+  ExpectOk(adapter.CreateTable(MakeSimpleTable()));
+
+  DuckDBBinlogApplier applier(&adapter);
+  ExpectOk(applier.BeginTransaction(Gtid{"gtid:chain:1"}));
+  ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
+  ExpectOk(applier.CommitTransaction());
+
+  const std::string update1 =
+      "UPDATE \"t\" SET \"val\" = 'beta' WHERE \"id\" IS NOT DISTINCT FROM '1' "
+      "AND \"val\" IS NOT DISTINCT FROM 'alpha'";
+  const std::string update2 =
+      "UPDATE \"t\" SET \"val\" = 'gamma' WHERE \"id\" IS NOT DISTINCT FROM '1' "
+      "AND \"val\" IS NOT DISTINCT FROM 'beta'";
+  ExpectOk(applier.BeginTransaction(Gtid{"gtid:chain:2"}));
+  ExpectOk(applier.AddUpdateStatement(TableId{"", "t"}, update1));
+  ExpectOk(applier.AddUpdateStatement(TableId{"", "t"}, update2));
+  ExpectOk(applier.CommitTransaction());
+
+  EXPECT_EQ(1, QueryCount(adapter,
+                          "SELECT COUNT(*) FROM t WHERE val = 'gamma'"));
+  EXPECT_EQ(0, QueryCount(adapter,
+                          "SELECT COUNT(*) FROM t WHERE val = 'beta'"));
+
+  adapter.Shutdown();
+  CleanupDuckdbFiles(path);
+}
+
 }  // namespace
