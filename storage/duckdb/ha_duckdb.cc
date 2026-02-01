@@ -313,12 +313,105 @@ class FieldOffsetGuard {
 duckdb::Value field_value(Field *field) {
   if (field->is_null()) return duckdb::Value();
 
-  String tmp;
-  field->val_str(&tmp);
   if (is_binary_field(field)) {
+    String tmp;
+    field->val_str(&tmp);
     return duckdb::Value::BLOB_RAW(std::string(tmp.ptr(), tmp.length()));
   }
+
+  const bool unsigned_flag = field->unsigned_flag;
+  switch (field->type()) {
+    case MYSQL_TYPE_TINY: {
+      const longlong v = field->val_int();
+      return unsigned_flag ? duckdb::Value::UTINYINT(static_cast<uint8_t>(v))
+                           : duckdb::Value::TINYINT(static_cast<int8_t>(v));
+    }
+    case MYSQL_TYPE_SHORT: {
+      const longlong v = field->val_int();
+      return unsigned_flag ? duckdb::Value::USMALLINT(static_cast<uint16_t>(v))
+                           : duckdb::Value::SMALLINT(static_cast<int16_t>(v));
+    }
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG: {
+      const longlong v = field->val_int();
+      return unsigned_flag ? duckdb::Value::UINTEGER(static_cast<uint32_t>(v))
+                           : duckdb::Value::INTEGER(static_cast<int32_t>(v));
+    }
+    case MYSQL_TYPE_LONGLONG: {
+      const longlong v = field->val_int();
+      return unsigned_flag ? duckdb::Value::UBIGINT(static_cast<uint64_t>(v))
+                           : duckdb::Value::BIGINT(static_cast<int64_t>(v));
+    }
+    case MYSQL_TYPE_FLOAT: {
+      const double v = field->val_real();
+      return duckdb::Value::FLOAT(static_cast<float>(v));
+    }
+    case MYSQL_TYPE_DOUBLE: {
+      const double v = field->val_real();
+      return duckdb::Value::DOUBLE(v);
+    }
+    case MYSQL_TYPE_YEAR: {
+      const longlong v = field->val_int();
+      return duckdb::Value::SMALLINT(static_cast<int16_t>(v));
+    }
+    default:
+      break;
+  }
+
+  String tmp;
+  field->val_str(&tmp);
   return duckdb::Value(std::string(tmp.ptr(), tmp.length()));
+}
+
+void store_duckdb_value(Field *field, const duckdb::Value &value) {
+  if (value.IsNull()) {
+    field->set_null();
+    return;
+  }
+  field->set_notnull();
+
+  if (is_binary_field(field)) {
+    const auto &str = duckdb::StringValue::Get(value);
+    field->store(str.data(), str.size(), field->charset());
+    return;
+  }
+
+  const bool unsigned_flag = field->unsigned_flag;
+  switch (field->type()) {
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+    case MYSQL_TYPE_LONGLONG:
+    case MYSQL_TYPE_YEAR: {
+      if (unsigned_flag) {
+        const uint64_t v = duckdb::UBigIntValue::Get(value);
+        field->store(static_cast<longlong>(v), true);
+      } else {
+        const int64_t v = duckdb::BigIntValue::Get(value);
+        field->store(static_cast<longlong>(v), false);
+      }
+      return;
+    }
+    case MYSQL_TYPE_FLOAT:
+    case MYSQL_TYPE_DOUBLE: {
+      const double v = duckdb::DoubleValue::Get(value);
+      field->store(v);
+      return;
+    }
+    default:
+      break;
+  }
+
+  std::string text;
+  const auto physical = value.type().InternalType();
+  if (physical == duckdb::PhysicalType::VARCHAR ||
+      physical == duckdb::PhysicalType::BLOB) {
+    text = duckdb::StringValue::Get(value);
+  } else {
+    text = value.ToString();
+  }
+  field->store(text.data(), text.size(), field->charset());
 }
 
 std::string value_to_sql(const duckdb::Value &val) {
@@ -629,19 +722,7 @@ static bool DuckdbExecuteQuery(JOIN *join, Query_result *query_result) {
         for (duckdb::idx_t col = 0; col < chunk->ColumnCount(); ++col) {
           Field *field = out_fields[col];
           const duckdb::Value value = chunk->GetValue(col, row);
-          if (value.IsNull()) {
-            field->set_null();
-            continue;
-          }
-          field->set_notnull();
-          std::string text;
-          const auto physical = value.type().InternalType();
-          if (physical == duckdb::PhysicalType::VARCHAR) {
-            text = duckdb::StringValue::Get(value);
-          } else {
-            text = value.ToString();
-          }
-          field->store(text.data(), text.size(), field->charset());
+          store_duckdb_value(field, value);
         }
 
         if (query_result->send_data(thd, *join->fields)) return true;
@@ -1225,18 +1306,7 @@ int ha_duckdb::load_table(const TABLE &table) {
       appender.BeginRow();
       for (uint i = 0; i < table.s->fields; ++i) {
         Field *field = mutable_table.field[i];
-        if (field->is_null()) {
-          appender.Append(duckdb::Value());
-          continue;
-        }
-        String tmp;
-        field->val_str(&tmp);
-        if (is_binary_field(field)) {
-          std::string data(tmp.ptr(), tmp.length());
-          appender.Append(duckdb::Value::BLOB(data));
-        } else {
-          appender.Append(tmp.ptr(), static_cast<uint32_t>(tmp.length()));
-        }
+        appender.Append(field_value(field));
       }
       appender.EndRow();
     }
