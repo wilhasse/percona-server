@@ -699,4 +699,35 @@ Status DuckDBAdapter::GetAppliedGtids(std::vector<Gtid> *gtids) {
   return Status::Ok();
 }
 
+Status DuckDBAdapter::IsGtidApplied(const Gtid &gtid, bool *applied) {
+  if (!applied) {
+    return Status::Error(StatusCode::kInvalid, "Applied flag is null");
+  }
+  *applied = false;
+
+  auto st = EnsureInitialized();
+  if (!st.ok()) return st;
+
+  try {
+    const std::string sql =
+        "SELECT 1 FROM __repl_watermark WHERE gtid = '" +
+        EscapeLiteral(gtid.value) + "' LIMIT 1";
+    auto result = conn_->Query(sql);
+    if (result->HasError()) {
+      if (IsMissingTableError(result->GetError(), "__repl_watermark")) {
+        return Status::Ok();
+      }
+      return Status::Error(StatusCode::kDuckDBError, result->GetError());
+    }
+    auto chunk = result->Fetch();
+    if (chunk && chunk->size() > 0) {
+      *applied = true;
+    }
+  } catch (const std::exception &ex) {
+    return Status::Error(StatusCode::kDuckDBError, ex.what());
+  }
+
+  return Status::Ok();
+}
+
 }  // namespace duckdb_se

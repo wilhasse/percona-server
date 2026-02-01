@@ -215,4 +215,34 @@ TEST(DuckDBBinlogApplierTest, KillDuringApplyKeepsCommittedData) {
 #endif
 }
 
+TEST(DuckDBBinlogApplierTest, IdempotentReplaySkipsAppliedGtid) {
+  const std::string path = MakeTempPath("duckdb_idempotent");
+  CleanupDuckdbFiles(path);
+
+  DuckDBAdapter adapter;
+  DuckDBConfig cfg;
+  cfg.read_only = false;
+  ExpectOk(adapter.Init(path, cfg));
+  ExpectOk(adapter.CreateTable(MakeSimpleTable()));
+
+  DuckDBBinlogApplier applier(&adapter);
+  ExpectOk(applier.BeginTransaction(Gtid{"gtid:replay"}));
+  ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
+  ExpectOk(applier.CommitTransaction());
+
+  // Reapply the same GTID with a different row: should be ignored.
+  ExpectOk(applier.BeginTransaction(Gtid{"gtid:replay"}));
+  ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("2", "beta")));
+  ExpectOk(applier.CommitTransaction());
+
+  EXPECT_EQ(1, QueryCount(adapter, "SELECT COUNT(*) FROM t"));
+
+  Gtid latest;
+  ExpectOk(adapter.GetLatestWatermark(&latest));
+  EXPECT_EQ("gtid:replay", latest.value);
+
+  adapter.Shutdown();
+  CleanupDuckdbFiles(path);
+}
+
 }  // namespace

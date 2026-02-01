@@ -84,6 +84,7 @@ class DuckDBBinlogApplier {
   DuckDBAdapter *adapter_{nullptr};
   Options options_{};
   bool in_txn_{false};
+  bool skip_txn_{false};
   bool have_buffered_{false};
   Gtid current_gtid_{};
   ApplyTxn apply_txn_{};

@@ -162,6 +162,7 @@ class DuckDBAdapter {
   QueryResult ExecuteQuery(std::string mysql_sql, SessionCtx ctx);
   Status GetLatestWatermark(Gtid *gtid);
   Status GetAppliedGtids(std::vector<Gtid> *gtids);
+  Status IsGtidApplied(const Gtid &gtid, bool *applied);
 
  private:
   Status EnsureInitialized() const;

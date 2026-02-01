@@ -78,12 +78,25 @@ Status DuckDBBinlogApplier::BeginTransaction(Gtid gtid) {
 
   current_gtid_ = std::move(gtid);
   in_txn_ = true;
+  skip_txn_ = false;
   ResetBuffers();
   apply_txn_ = ApplyTxn{};
+  bool already_applied = false;
+  Status st = adapter_->IsGtidApplied(current_gtid_, &already_applied);
+  if (!st.ok()) {
+    in_txn_ = false;
+    return st;
+  }
+  if (already_applied) {
+    skip_txn_ = true;
+  }
   return Status::Ok();
 }
 
 Status DuckDBBinlogApplier::AppendInsert(TableId table, Row row) {
+  if (skip_txn_) {
+    return Status::Ok();
+  }
   RowBatch batch;
   batch.table = table;  // Copy table ID to batch
   batch.rows.emplace_back(std::move(row));
@@ -93,6 +106,9 @@ Status DuckDBBinlogApplier::AppendInsert(TableId table, Row row) {
 Status DuckDBBinlogApplier::AppendInsertBatch(TableId table, RowBatch batch) {
   if (!in_txn_) {
     return Status::Error(StatusCode::kInvalid, "No active binlog transaction");
+  }
+  if (skip_txn_) {
+    return Status::Ok();
   }
   if (batch.rows.empty()) {
     return Status::Ok();
@@ -132,6 +148,9 @@ Status DuckDBBinlogApplier::AddUpdateStatement(TableId table, std::string sql) {
   if (!in_txn_) {
     return Status::Error(StatusCode::kInvalid, "No active binlog transaction");
   }
+  if (skip_txn_) {
+    return Status::Ok();
+  }
   if (sql.empty()) {
     return Status::Error(StatusCode::kInvalid, "Empty UPDATE statement");
   }
@@ -160,6 +179,9 @@ Status DuckDBBinlogApplier::AddDeleteStatement(TableId table, std::string sql) {
   if (!in_txn_) {
     return Status::Error(StatusCode::kInvalid, "No active binlog transaction");
   }
+  if (skip_txn_) {
+    return Status::Ok();
+  }
   if (sql.empty()) {
     return Status::Error(StatusCode::kInvalid, "Empty DELETE statement");
   }
@@ -187,6 +209,13 @@ Status DuckDBBinlogApplier::AddDeleteStatement(TableId table, std::string sql) {
 Status DuckDBBinlogApplier::CommitTransaction() {
   if (!in_txn_) {
     return Status::Error(StatusCode::kInvalid, "No active binlog transaction");
+  }
+  if (skip_txn_) {
+    in_txn_ = false;
+    skip_txn_ = false;
+    apply_txn_ = ApplyTxn{};
+    ResetBuffers();
+    return Status::Ok();
   }
 
   Status st = FlushBuffered(true);
@@ -225,12 +254,15 @@ Status DuckDBBinlogApplier::RollbackTransaction() {
   }
 
   Status st = Status::Ok();
-  if (apply_txn_.active) {
+  if (skip_txn_) {
+    st = Status::Ok();
+  } else if (apply_txn_.active) {
     st = adapter_->RollbackApplyTxn(apply_txn_);
   }
 
   apply_txn_ = ApplyTxn{};
   in_txn_ = false;
+  skip_txn_ = false;
   ResetBuffers();
   return st;
 }
