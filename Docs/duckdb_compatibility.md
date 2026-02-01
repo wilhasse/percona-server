@@ -9,6 +9,13 @@ runs in the server process (no runtime LLM).
 - `LIMIT offset, count` is rewritten to `LIMIT count OFFSET offset`.
 - Function name mapping is applied where DuckDB has an equivalent.
 
+## Coverage Snapshot (2026-02-01)
+- Rules tracked: 11
+- Supported: 4
+- Partial: 5
+- Not supported: 2
+- Rewrite coverage (supported + partial): 9/11 = 82%
+
 ## Function Compatibility Matrix
 Legend: SUPPORTED, PARTIAL (differences), NOT SUPPORTED
 
@@ -39,3 +46,4 @@ Legend: SUPPORTED, PARTIAL (differences), NOT SUPPORTED
   projections. Complex projections may be added later.
 - Unsupported rewrites fall back to the primary engine when
   `use_secondary_engine=ON`, or raise an error if `FORCED`.
+- See `Docs/duckdb_compatibility_gaps.md` for current gaps and next steps.
