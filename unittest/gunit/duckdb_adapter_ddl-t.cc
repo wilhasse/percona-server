@@ -257,7 +257,10 @@ TEST(DuckDBAdapterDDLTest, UnsupportedAlterUsesCopyFallback) {
   ExpectOk(txn.status);
   RowBatch batch;
   batch.table = TableId{"", "t"};
-  batch.rows.push_back(MakeRow("1", "alpha"));
+  Row row;
+  row.push_back(Cell{false, false, "1"});
+  row.push_back(Cell{false, false, "alpha"});
+  batch.rows.push_back(std::move(row));
   TableId table_id = batch.table;  // Copy before move to avoid UB
   ExpectOk(adapter.AppendRows(txn, std::move(table_id), std::move(batch)));
   ExpectOk(adapter.CommitApplyTxn(txn));
