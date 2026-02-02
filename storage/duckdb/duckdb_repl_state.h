@@ -24,12 +24,34 @@
 #ifndef PLUGIN_DUCKDB_REPL_STATE_H_
 #define PLUGIN_DUCKDB_REPL_STATE_H_
 
+#include <chrono>
+#include <cstdio>
+#include <ctime>
 #include <string>
 #include <vector>
 
 #include "duckdb.hpp"
 
 namespace duckdb_se {
+
+// Generate a DuckDB-compatible timestamp literal for the current time.
+// Uses C++ chrono to avoid reliance on DuckDB's now()/CURRENT_TIMESTAMP
+// functions which may require core_functions extension.
+inline std::string ReplStateTimestampLiteral() {
+  auto now = std::chrono::system_clock::now();
+  auto time_t_now = std::chrono::system_clock::to_time_t(now);
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now.time_since_epoch()) %
+            1000;
+  std::tm tm_buf;
+  gmtime_r(&time_t_now, &tm_buf);
+  char buf[80];
+  std::snprintf(buf, sizeof(buf), "'%04d-%02d-%02d %02d:%02d:%02d.%03d'",
+                tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
+                tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec,
+                static_cast<int>(ms.count()));
+  return buf;
+}
 
 inline std::string EscapeReplStateLiteral(const std::string &value) {
   std::string out;
@@ -187,7 +209,7 @@ inline bool EnsureReplStateTable(duckdb::Connection &conn,
     std::string snapshot_sql =
         snapshot.empty() ? "NULL" : "'" + EscapeReplStateLiteral(snapshot) + "'";
     std::string ts_sql = updated.empty()
-                             ? "CURRENT_TIMESTAMP"
+                             ? ReplStateTimestampLiteral()
                              : "'" + EscapeReplStateLiteral(updated) + "'";
     const std::string insert_sql =
         "INSERT INTO __repl_state_new (channel, snapshot_gtid_set, "

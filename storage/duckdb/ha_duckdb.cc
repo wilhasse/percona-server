@@ -24,6 +24,7 @@
 #include "storage/duckdb/ha_duckdb.h"
 
 #include <cctype>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -71,6 +72,25 @@
 static char *duckdb_db_dir = nullptr;
 
 namespace {
+
+// Generate a DuckDB-compatible timestamp literal for the current time.
+// Uses C++ chrono to avoid reliance on DuckDB's now()/CURRENT_TIMESTAMP
+// functions which may require core_functions extension.
+std::string CurrentTimestampLiteral() {
+  auto now = std::chrono::system_clock::now();
+  auto time_t_now = std::chrono::system_clock::to_time_t(now);
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now.time_since_epoch()) %
+            1000;
+  std::tm tm_buf;
+  gmtime_r(&time_t_now, &tm_buf);
+  char buf[80];
+  std::snprintf(buf, sizeof(buf), "'%04d-%02d-%02d %02d:%02d:%02d.%03d'",
+                tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
+                tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec,
+                static_cast<int>(ms.count()));
+  return buf;
+}
 
 struct DuckdbTableState {
   explicit DuckdbTableState(std::string path_in) : path(std::move(path_in)) {
@@ -147,6 +167,23 @@ bool is_binary_field(const Field *field) {
     case MYSQL_TYPE_BIT:
     case MYSQL_TYPE_JSON:
       return true;
+    // Numeric types are never binary even if field->binary() returns true
+    // (which can happen during table scans due to MySQL's internal state)
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+    case MYSQL_TYPE_LONGLONG:
+    case MYSQL_TYPE_FLOAT:
+    case MYSQL_TYPE_DOUBLE:
+    case MYSQL_TYPE_DECIMAL:
+    case MYSQL_TYPE_NEWDECIMAL:
+    case MYSQL_TYPE_YEAR:
+    case MYSQL_TYPE_DATE:
+    case MYSQL_TYPE_TIME:
+    case MYSQL_TYPE_DATETIME:
+    case MYSQL_TYPE_TIMESTAMP:
+      return false;
     default:
       break;
   }
@@ -582,11 +619,12 @@ bool store_snapshot_gtid(duckdb::Connection &con,
   if (!duckdb_se::EnsureReplStateTable(con, &error)) return false;
 
   const std::string gtid_sql = value_to_sql(duckdb::Value(snapshot_gtid));
+  const std::string ts_sql = CurrentTimestampLiteral();
   const std::string sql =
       "INSERT INTO __repl_state (channel, snapshot_gtid_set, applied_gtid_set, "
       "last_commit_ts) "
       "VALUES ('default', " +
-      gtid_sql + ", " + gtid_sql + ", CURRENT_TIMESTAMP) "
+      gtid_sql + ", " + gtid_sql + ", " + ts_sql + ") "
       "ON CONFLICT(channel) DO UPDATE SET "
       "snapshot_gtid_set = excluded.snapshot_gtid_set, "
       "applied_gtid_set = excluded.applied_gtid_set, "

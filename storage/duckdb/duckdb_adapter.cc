@@ -35,6 +35,25 @@
 namespace duckdb_se {
 namespace {
 
+// Generate a DuckDB-compatible timestamp literal for the current time.
+// Uses C++ chrono to avoid reliance on DuckDB's now()/CURRENT_TIMESTAMP
+// functions which may require core_functions extension.
+std::string CurrentTimestampLiteral() {
+  auto now = std::chrono::system_clock::now();
+  auto time_t_now = std::chrono::system_clock::to_time_t(now);
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now.time_since_epoch()) %
+            1000;
+  std::tm tm_buf;
+  gmtime_r(&time_t_now, &tm_buf);
+  char buf[80];
+  std::snprintf(buf, sizeof(buf), "'%04d-%02d-%02d %02d:%02d:%02d.%03d'",
+                tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
+                tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec,
+                static_cast<int>(ms.count()));
+  return buf;
+}
+
 bool IsMissingTableError(const std::string &error, const std::string &table) {
   return error.find("does not exist") != std::string::npos &&
          error.find(table) != std::string::npos;
@@ -119,11 +138,12 @@ Status PersistReplStateFromWatermark(duckdb::Connection &conn,
   Status st = ReadReplStateRow(conn, nullptr, nullptr, nullptr, &found);
   if (!st.ok()) return st;
   if (found) return Status::Ok();
+  const std::string ts_sql = CurrentTimestampLiteral();
   const std::string sql =
       "INSERT INTO __repl_state (channel, snapshot_gtid_set, "
       "applied_gtid_set, last_commit_ts) VALUES ('" +
       std::string(kReplChannel) + "', NULL, '" + EscapeReplStateLiteral(applied_set) +
-      "', CURRENT_TIMESTAMP)";
+      "', " + ts_sql + ")";
   auto result = conn.Query(sql);
   if (result->HasError()) {
     return Status::Error(StatusCode::kDuckDBError, result->GetError());

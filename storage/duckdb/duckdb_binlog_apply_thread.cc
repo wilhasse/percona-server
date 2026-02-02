@@ -71,6 +71,13 @@ ApplyThreadState &GetThreadState() {
   return state;
 }
 
+// Forward declaration for EnsureSchemaApplier used before definition
+Status EnsureSchemaApplier(const std::string &schema,
+                           const BinlogApplyThreadOptions &options,
+                           const DuckDBBinlogApplier::Options &applier_options,
+                           std::map<std::string, SchemaApplierState> *states,
+                           SchemaApplierState **out_state);
+
 std::string DuckdbPathForSchema(const BinlogApplyThreadOptions &options,
                                 const std::string &schema) {
   const char *base_dir = options.duckdb_dir.empty()
