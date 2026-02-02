@@ -203,6 +203,69 @@ bool EncodeGtidSet(const Gtid_set &gtids, std::vector<uint8_t> *out) {
   return true;
 }
 
+// Helper to query a single string value from MySQL
+bool QuerySingleStringValue(MYSQL *mysql, const char *sql,
+                            std::string *value_out) {
+  if (!mysql || !value_out) return false;
+  if (mysql_real_query(mysql, sql, std::strlen(sql)) != 0) return false;
+  MYSQL_RES *res = mysql_store_result(mysql);
+  if (!res) return false;
+  MYSQL_ROW row = mysql_fetch_row(res);
+  bool success = false;
+  if (row && row[0]) {
+    *value_out = row[0];
+    success = true;
+  }
+  mysql_free_result(res);
+  return success;
+}
+
+// Validate required binlog configuration on the source server
+duckdb_se::Status ValidateBinlogConfig(MYSQL *mysql) {
+  std::string value;
+
+  // Check GTID mode - must be ON for GTID-based replication
+  if (!QuerySingleStringValue(mysql, "SELECT @@GLOBAL.gtid_mode", &value)) {
+    return duckdb_se::Status::Error(duckdb_se::StatusCode::kInvalid,
+                                    "Failed to query @@GLOBAL.gtid_mode");
+  }
+  if (value != "ON") {
+    return duckdb_se::Status::Error(
+        duckdb_se::StatusCode::kInvalid,
+        "gtid_mode must be ON for DuckDB binlog replication (current: " +
+            value + ")");
+  }
+
+  // Check binlog_format - must be ROW for row-based replication
+  if (!QuerySingleStringValue(mysql, "SELECT @@GLOBAL.binlog_format", &value)) {
+    return duckdb_se::Status::Error(duckdb_se::StatusCode::kInvalid,
+                                    "Failed to query @@GLOBAL.binlog_format");
+  }
+  if (value != "ROW") {
+    return duckdb_se::Status::Error(
+        duckdb_se::StatusCode::kInvalid,
+        "binlog_format must be ROW for DuckDB binlog replication (current: " +
+            value + ")");
+  }
+
+  // Check binlog_row_image - must be FULL for complete row data
+  if (!QuerySingleStringValue(mysql, "SELECT @@GLOBAL.binlog_row_image",
+                              &value)) {
+    return duckdb_se::Status::Error(
+        duckdb_se::StatusCode::kInvalid,
+        "Failed to query @@GLOBAL.binlog_row_image");
+  }
+  if (value != "FULL") {
+    return duckdb_se::Status::Error(
+        duckdb_se::StatusCode::kInvalid,
+        "binlog_row_image must be FULL for DuckDB binlog replication "
+        "(current: " +
+            value + ")");
+  }
+
+  return duckdb_se::Status::Ok();
+}
+
 }  // namespace
 
 namespace duckdb_se {
@@ -234,6 +297,16 @@ Status DuckDBBinlogStreamer::Open(const BinlogStreamOptions &options) {
     mysql_ = nullptr;
     return Status::Error(StatusCode::kInvalid,
                          "mysql_real_connect failed: " + msg);
+  }
+
+  // Validate required binlog configuration before proceeding
+  {
+    Status st = ValidateBinlogConfig(mysql_);
+    if (!st.ok()) {
+      mysql_close(mysql_);
+      mysql_ = nullptr;
+      return st;
+    }
   }
 
   const std::string checksum_sql =
