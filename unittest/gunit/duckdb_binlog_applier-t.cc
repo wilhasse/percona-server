@@ -33,6 +33,7 @@
 
 #include "storage/duckdb/duckdb_adapter.h"
 #include "storage/duckdb/duckdb_binlog_applier.h"
+#include "storage/duckdb/duckdb_gtid_utils.h"
 
 #ifdef _WIN32
 #include <process.h>
@@ -59,11 +60,85 @@ using duckdb_se::TableId;
 using duckdb_se::GetBinlogApplyMetrics;
 using duckdb_se::SetBinlogApplyPaused;
 using duckdb_se::SetBinlogApplyThrottleRowsPerSec;
+using duckdb_se::BuildGtidSetFromList;
+using duckdb_se::GtidSetContains;
+using duckdb_se::MergeGtidIntoSet;
 
 const std::string kTestUuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 
 std::string MakeGtid(int seq) {
   return kTestUuid + ":" + std::to_string(seq);
+}
+
+TEST(DuckDBGtidUtilsTest, MergeAndContains) {
+  std::string set;
+  std::string error;
+  EXPECT_TRUE(MergeGtidIntoSet("", MakeGtid(1), &set, &error)) << error;
+  bool contains = false;
+  EXPECT_TRUE(GtidSetContains(set, MakeGtid(1), &contains, &error)) << error;
+  EXPECT_TRUE(contains);
+  contains = false;
+  EXPECT_TRUE(GtidSetContains(set, MakeGtid(2), &contains, &error)) << error;
+  EXPECT_FALSE(contains);
+
+  EXPECT_TRUE(MergeGtidIntoSet(set, MakeGtid(2), &set, &error)) << error;
+  contains = false;
+  EXPECT_TRUE(GtidSetContains(set, MakeGtid(2), &contains, &error)) << error;
+  EXPECT_TRUE(contains);
+}
+
+TEST(DuckDBGtidUtilsTest, BuildSetFromList) {
+  std::vector<std::string> gtids{MakeGtid(3), MakeGtid(5)};
+  std::string set;
+  std::string error;
+  EXPECT_TRUE(BuildGtidSetFromList(gtids, &set, &error)) << error;
+  bool contains = false;
+  EXPECT_TRUE(GtidSetContains(set, MakeGtid(3), &contains, &error)) << error;
+  EXPECT_TRUE(contains);
+  contains = false;
+  EXPECT_TRUE(GtidSetContains(set, MakeGtid(4), &contains, &error)) << error;
+  EXPECT_FALSE(contains);
+}
+
+TEST(DuckDBGtidUtilsTest, AdapterIsGtidAppliedUsesSet) {
+  const std::string path = MakeTempPath("duckdb_gtid_set");
+  CleanupDuckdbFiles(path);
+
+  DuckDBAdapter adapter;
+  DuckDBConfig cfg;
+  cfg.read_only = false;
+  ExpectOk(adapter.Init(path, cfg));
+
+  std::vector<std::string> gtids{MakeGtid(7), MakeGtid(9)};
+  std::string set;
+  std::string error;
+  ASSERT_TRUE(BuildGtidSetFromList(gtids, &set, &error)) << error;
+
+  const std::string create_sql =
+      "CREATE TABLE IF NOT EXISTS __repl_state ("
+      "channel VARCHAR PRIMARY KEY, "
+      "snapshot_gtid_set VARCHAR, "
+      "applied_gtid_set VARCHAR, "
+      "last_commit_ts TIMESTAMP)";
+  auto create = adapter.ExecuteQuery(create_sql, {});
+  ASSERT_TRUE(create.ok) << create.error;
+
+  const std::string insert_sql =
+      "INSERT INTO __repl_state (channel, snapshot_gtid_set, applied_gtid_set, "
+      "last_commit_ts) VALUES ('default', NULL, '" +
+      set + "', CURRENT_TIMESTAMP)";
+  auto insert = adapter.ExecuteQuery(insert_sql, {});
+  ASSERT_TRUE(insert.ok) << insert.error;
+
+  bool applied = false;
+  ExpectOk(adapter.IsGtidApplied(Gtid{MakeGtid(7)}, &applied));
+  EXPECT_TRUE(applied);
+  applied = false;
+  ExpectOk(adapter.IsGtidApplied(Gtid{MakeGtid(8)}, &applied));
+  EXPECT_FALSE(applied);
+
+  adapter.Shutdown();
+  CleanupDuckdbFiles(path);
 }
 
 std::string TempDirectory() {
