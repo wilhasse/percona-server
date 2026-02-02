@@ -502,6 +502,9 @@ Status EnsureRowEventTable(const BinlogApplyThreadOptions &options,
 
   bool exists = DuckdbTableExists(*state.adapter, map.table);
   if (!exists) {
+    sql_print_warning(
+        "DuckDB binlog applier: Table %s.%s missing, creating from source",
+        map.schema.c_str(), map.table.c_str());
     MySQLTableDef def;
     Status st =
         FetchTableDefFromSource(options, map.schema, map.table, &def);
@@ -512,20 +515,18 @@ Status EnsureRowEventTable(const BinlogApplyThreadOptions &options,
     change.table = TableId{map.schema, map.table};
     change.new_def = std::move(def);
     st = state.applier->ApplyDDL(std::move(change));
-    if (!st.ok()) return st;
+    if (!st.ok()) {
+      sql_print_warning(
+          "DuckDB binlog applier: Create table failed for %s.%s (%s)",
+          map.schema.c_str(), map.table.c_str(), st.message.c_str());
+      return st;
+    }
 
     state.schema_version = state.schema_version_loaded
                                ? state.schema_version + 1
                                : 1;
     state.schema_version_loaded = true;
 
-    exists = DuckdbTableExists(*state.adapter, map.table);
-    if (!exists) {
-      return Status::Error(
-          StatusCode::kInvalid,
-          "Table missing after create attempt: " + map.schema + "." +
-              map.table);
-    }
     sql_print_information(
         "DuckDB binlog applier: Created missing table %s.%s from source "
         "definition",
@@ -653,7 +654,7 @@ Status EnsureSchemaApplier(const std::string &schema,
     const std::string path = DuckdbPathForSchema(options, schema);
     Status st = entry.adapter->Init(path, cfg);
     if (!st.ok()) return st;
-    sql_print_information(
+    sql_print_warning(
         "DuckDB binlog applier: Using DuckDB file %s for schema %s",
         path.c_str(), schema.c_str());
     entry.applier = std::make_unique<DuckDBBinlogApplier>(entry.adapter.get(),

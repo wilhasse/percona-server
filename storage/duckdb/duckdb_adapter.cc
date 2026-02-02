@@ -29,6 +29,7 @@
 #include <sstream>
 #include <unordered_set>
 
+#include "sql/log.h"
 #include "storage/duckdb/duckdb_gtid_utils.h"
 #include "storage/duckdb/duckdb_repl_state.h"
 
@@ -617,6 +618,7 @@ Status DuckDBAdapter::CreateTableOn(duckdb::Connection &conn,
     sql = ddl.str();
   }
 
+  sql_print_warning("DuckDB create table DDL: %s", sql.c_str());
   try {
     auto result = conn.Query(sql);
     if (result->HasError()) {
