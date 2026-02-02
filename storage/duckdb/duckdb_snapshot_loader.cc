@@ -92,6 +92,29 @@ constexpr const char *kReplChannel = "default";
 constexpr size_t kDefaultMaxBufferEvents = 200000;
 constexpr size_t kDefaultMaxBufferBytes = 64 * 1024 * 1024;
 
+// Generate a DuckDB-compatible timestamp literal for the current time.
+// Uses C++ chrono to avoid reliance on DuckDB's now()/CURRENT_TIMESTAMP
+// functions which may require core_functions extension.
+std::string CurrentTimestampLiteral() {
+  auto now = std::chrono::system_clock::now();
+  auto time_t_now = std::chrono::system_clock::to_time_t(now);
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now.time_since_epoch()) %
+            1000;
+  std::tm tm_buf;
+#ifdef _WIN32
+  gmtime_s(&tm_buf, &time_t_now);
+#else
+  gmtime_r(&time_t_now, &tm_buf);
+#endif
+  char buf[80];
+  std::snprintf(buf, sizeof(buf), "'%04d-%02d-%02d %02d:%02d:%02d.%03d'",
+                tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
+                tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec,
+                static_cast<int>(ms.count()));
+  return buf;
+}
+
 struct Options {
   std::string host{"127.0.0.1"};
   std::string user{"root"};
@@ -635,13 +658,14 @@ bool ApplyReplStateOperations(const Options &opts,
     }
 
     if (opts.reset_applied_gtid) {
+      const std::string ts_sql = CurrentTimestampLiteral();
       const std::string sql =
           "INSERT INTO __repl_state (channel, snapshot_gtid_set, "
           "applied_gtid_set, last_commit_ts) "
           "VALUES ('" +
-          std::string(kReplChannel) + "', NULL, NULL, CURRENT_TIMESTAMP) "
+          std::string(kReplChannel) + "', NULL, NULL, " + ts_sql + ") "
           "ON CONFLICT(channel) DO UPDATE SET applied_gtid_set = NULL, "
-          "last_commit_ts = CURRENT_TIMESTAMP";
+          "last_commit_ts = " + ts_sql;
       auto result = conn.Query(sql);
       if (result->HasError()) {
         std::cerr << "Failed to reset applied_gtid_set: "
@@ -652,14 +676,15 @@ bool ApplyReplStateOperations(const Options &opts,
 
     if (opts.set_applied_gtid) {
       const std::string gtid_sql = QuoteDuckdbLiteral(opts.applied_gtid_set);
+      const std::string ts_sql = CurrentTimestampLiteral();
       const std::string sql =
           "INSERT INTO __repl_state (channel, snapshot_gtid_set, "
           "applied_gtid_set, last_commit_ts) "
           "VALUES ('" +
           std::string(kReplChannel) + "', NULL, " + gtid_sql +
-          ", CURRENT_TIMESTAMP) "
+          ", " + ts_sql + ") "
           "ON CONFLICT(channel) DO UPDATE SET applied_gtid_set = " + gtid_sql +
-          ", last_commit_ts = CURRENT_TIMESTAMP";
+          ", last_commit_ts = " + ts_sql;
       auto result = conn.Query(sql);
       if (result->HasError()) {
         std::cerr << "Failed to set applied_gtid_set: " << result->GetError()
@@ -1049,11 +1074,12 @@ bool StoreSnapshotGtid(DuckDBAdapter &adapter, const std::string &gtid,
       binlog_file.empty() ? "NULL" : QuoteDuckdbLiteral(binlog_file);
   const std::string pos_sql =
       binlog_pos == 0 ? "NULL" : std::to_string(binlog_pos);
+  const std::string ts_sql = CurrentTimestampLiteral();
   const std::string upsert_sql =
       "INSERT INTO __repl_state (channel, snapshot_gtid_set, applied_gtid_set, "
       "last_commit_ts, binlog_file, binlog_pos) "
       "VALUES ('default', " +
-      gtid_sql + ", " + gtid_sql + ", CURRENT_TIMESTAMP, " + file_sql + ", " +
+      gtid_sql + ", " + gtid_sql + ", " + ts_sql + ", " + file_sql + ", " +
       pos_sql + ") "
       "ON CONFLICT(channel) DO UPDATE SET "
       "snapshot_gtid_set = excluded.snapshot_gtid_set, "
@@ -1100,7 +1126,7 @@ bool StoreSnapshotGtid(DuckDBAdapter &adapter, const std::string &gtid,
     const std::string snapshot_sql =
         snapshot.empty() ? "NULL" : QuoteDuckdbLiteral(snapshot);
     const std::string ts_sql =
-        updated_ts.empty() ? "CURRENT_TIMESTAMP" : QuoteDuckdbLiteral(updated_ts);
+        updated_ts.empty() ? CurrentTimestampLiteral() : QuoteDuckdbLiteral(updated_ts);
     const std::string insert_sql =
         "INSERT INTO __repl_state_new (channel, snapshot_gtid_set, "
         "applied_gtid_set, last_commit_ts, schema_version, binlog_file, "
