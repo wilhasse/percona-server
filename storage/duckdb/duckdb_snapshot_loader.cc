@@ -65,6 +65,7 @@ namespace {
 
 using duckdb_se::ApplyTxn;
 using duckdb_se::Cell;
+using duckdb_se::DDLChange;
 using duckdb_se::DuckDBBinlogApplier;
 using duckdb_se::DuckDBAdapter;
 using duckdb_se::DuckDBBinlogStreamer;
@@ -76,8 +77,16 @@ using duckdb_se::MySQLTableDef;
 using duckdb_se::ParsedDdl;
 using duckdb_se::Row;
 using duckdb_se::RowBatch;
+using duckdb_se::ShouldCopyAlter;
 using duckdb_se::Status;
 using duckdb_se::TableId;
+
+// Forward declarations for functions used before definition
+bool FetchTableDef(MYSQL *mysql, const std::string &schema,
+                   const std::string &table, MySQLTableDef *def,
+                   std::vector<bool> *blob_flags);
+bool ShouldApplyEvent(const BinlogEvent &event, const std::string &schema,
+                      const std::string &table);
 
 constexpr const char *kReplChannel = "default";
 constexpr size_t kDefaultMaxBufferEvents = 200000;
