@@ -33,6 +33,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "mysql.h"
@@ -57,6 +58,7 @@ struct SchemaApplierState {
   bool txn_active{false};
   int64_t schema_version{0};
   bool schema_version_loaded{false};
+  std::unordered_set<std::string> known_tables;
 };
 
 struct ApplyThreadState {
@@ -477,6 +479,63 @@ bool DuckdbTableExists(DuckDBAdapter &adapter, const std::string &table) {
   return chunk && chunk->size() > 0;
 }
 
+bool IsTableCached(const SchemaApplierState &state, const std::string &table) {
+  if (table.empty()) return false;
+  return state.known_tables.find(table) != state.known_tables.end();
+}
+
+void CacheTable(SchemaApplierState &state, const std::string &table) {
+  if (!table.empty()) state.known_tables.insert(table);
+}
+
+void UncacheTable(SchemaApplierState &state, const std::string &table) {
+  if (!table.empty()) state.known_tables.erase(table);
+}
+
+Status EnsureRowEventTable(const BinlogApplyThreadOptions &options,
+                           const BinlogTableMap &map,
+                           SchemaApplierState &state) {
+  if (!state.adapter || !state.applier) {
+    return Status::Error(StatusCode::kInvalid, "Missing applier state");
+  }
+  if (IsTableCached(state, map.table)) return Status::Ok();
+
+  bool exists = DuckdbTableExists(*state.adapter, map.table);
+  if (!exists) {
+    MySQLTableDef def;
+    Status st =
+        FetchTableDefFromSource(options, map.schema, map.table, &def);
+    if (!st.ok()) return st;
+
+    DDLChange change;
+    change.type = DDLChange::Type::kCreate;
+    change.table = TableId{map.schema, map.table};
+    change.new_def = std::move(def);
+    st = state.applier->ApplyDDL(std::move(change));
+    if (!st.ok()) return st;
+
+    state.schema_version = state.schema_version_loaded
+                               ? state.schema_version + 1
+                               : 1;
+    state.schema_version_loaded = true;
+
+    exists = DuckdbTableExists(*state.adapter, map.table);
+    if (!exists) {
+      return Status::Error(
+          StatusCode::kInvalid,
+          "Table missing after create attempt: " + map.schema + "." +
+              map.table);
+    }
+    sql_print_information(
+        "DuckDB binlog applier: Created missing table %s.%s from source "
+        "definition",
+        map.schema.c_str(), map.table.c_str());
+  }
+
+  CacheTable(state, map.table);
+  return Status::Ok();
+}
+
 Status ApplyDdlEvent(const BinlogEvent &event,
                      const BinlogApplyThreadOptions &options,
                      const DuckDBBinlogApplier::Options &applier_options,
@@ -518,6 +577,7 @@ Status ApplyDdlEvent(const BinlogEvent &event,
   if (change.type == DDLChange::Type::kCreate) {
     if (parsed.if_not_exists &&
         DuckdbTableExists(*state->adapter, change.table.table)) {
+      CacheTable(*state, change.table.table);
       return Status::Ok();
     }
     MySQLTableDef def;
@@ -531,6 +591,7 @@ Status ApplyDdlEvent(const BinlogEvent &event,
                                 ? state->schema_version + 1
                                 : 1;
     state->schema_version_loaded = true;
+    CacheTable(*state, change.table.table);
     return Status::Ok();
   }
 
@@ -555,6 +616,7 @@ Status ApplyDdlEvent(const BinlogEvent &event,
                                 ? state->schema_version + 1
                                 : 1;
     state->schema_version_loaded = true;
+    CacheTable(*state, change.table.table);
     return Status::Ok();
   }
 
@@ -563,6 +625,14 @@ Status ApplyDdlEvent(const BinlogEvent &event,
   state->schema_version =
       state->schema_version_loaded ? state->schema_version + 1 : 1;
   state->schema_version_loaded = true;
+  if (change.type == DDLChange::Type::kDrop) {
+    UncacheTable(*state, change.table.table);
+  } else if (change.type == DDLChange::Type::kRename) {
+    UncacheTable(*state, change.table.table);
+    CacheTable(*state, change.new_table.table);
+  } else {
+    CacheTable(*state, change.table.table);
+  }
   return Status::Ok();
 }
 
@@ -583,6 +653,9 @@ Status EnsureSchemaApplier(const std::string &schema,
     const std::string path = DuckdbPathForSchema(options, schema);
     Status st = entry.adapter->Init(path, cfg);
     if (!st.ok()) return st;
+    sql_print_information(
+        "DuckDB binlog applier: Using DuckDB file %s for schema %s",
+        path.c_str(), schema.c_str());
     entry.applier = std::make_unique<DuckDBBinlogApplier>(entry.adapter.get(),
                                                           applier_options);
     st = LoadSchemaVersion(&entry);
@@ -613,6 +686,7 @@ Status CommitActiveTransactions(
 }
 
 Status ApplyRowEvent(const BinlogEvent &event, const BinlogTableMap &map,
+                     const BinlogApplyThreadOptions &options,
                      SchemaApplierState &state, const std::string &gtid) {
   if (!state.applier) {
     return Status::Error(StatusCode::kInvalid, "Missing applier state");
@@ -625,13 +699,16 @@ Status ApplyRowEvent(const BinlogEvent &event, const BinlogTableMap &map,
     state.txn_active = true;
   }
 
+  Status st = EnsureRowEventTable(options, map, state);
+  if (!st.ok()) return st;
+
   TableId table_id{map.schema, map.table};
   if (event.type == BinlogEvent::Type::kWriteRows) {
     std::vector<Row> rows;
     const auto &columns = event.columns_after.empty()
                               ? event.columns_before
                               : event.columns_after;
-    Status st = DecodeWriteRows(map, columns, event.row_data, &rows);
+    st = DecodeWriteRows(map, columns, event.row_data, &rows);
     if (!st.ok()) return st;
     RowBatch batch;
     batch.table = table_id;
@@ -641,8 +718,8 @@ Status ApplyRowEvent(const BinlogEvent &event, const BinlogTableMap &map,
   if (event.type == BinlogEvent::Type::kUpdateRows) {
     std::vector<Row> before_rows;
     std::vector<Row> after_rows;
-    Status st = DecodeUpdateRows(map, event.columns_before, event.columns_after,
-                                 event.row_data, &before_rows, &after_rows);
+    st = DecodeUpdateRows(map, event.columns_before, event.columns_after,
+                          event.row_data, &before_rows, &after_rows);
     if (!st.ok()) return st;
     BulkUpdateBatch batch;
     batch.table = table_id;
@@ -655,7 +732,7 @@ Status ApplyRowEvent(const BinlogEvent &event, const BinlogTableMap &map,
     const auto &columns = event.columns_before.empty()
                               ? event.columns_after
                               : event.columns_before;
-    Status st = DecodeDeleteRows(map, columns, event.row_data, &rows);
+    st = DecodeDeleteRows(map, columns, event.row_data, &rows);
     if (!st.ok()) return st;
     BulkDeleteBatch batch;
     batch.table = table_id;
@@ -845,7 +922,7 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
         st = EnsureSchemaApplier(map->schema, options, applier_options,
                                  &schema_states, &state);
         if (!st.ok()) return st;
-        st = ApplyRowEvent(event, *map, *state, current_gtid);
+        st = ApplyRowEvent(event, *map, options, *state, current_gtid);
         if (!st.ok()) return st;
         break;
       }
