@@ -62,6 +62,7 @@ using duckdb_se::SetBinlogApplyPaused;
 using duckdb_se::SetBinlogApplyThrottleRowsPerSec;
 using duckdb_se::BuildGtidSetFromList;
 using duckdb_se::GtidSetContains;
+using duckdb_se::IsGtidSetSubset;
 using duckdb_se::MergeGtidIntoSet;
 
 const std::string kTestUuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
@@ -104,6 +105,23 @@ TEST(DuckDBGtidUtilsTest, BuildSetFromList) {
   contains = false;
   EXPECT_TRUE(GtidSetContains(set, MakeGtid(4), &contains, &error)) << error;
   EXPECT_FALSE(contains);
+}
+
+TEST(DuckDBGtidUtilsTest, SubsetChecks) {
+  std::string error;
+  std::string superset;
+  std::string candidate;
+  EXPECT_TRUE(MergeGtidIntoSet("", MakeGtid(1), &superset, &error)) << error;
+  EXPECT_TRUE(MergeGtidIntoSet(superset, MakeGtid(2), &superset, &error))
+      << error;
+  EXPECT_TRUE(MergeGtidIntoSet("", MakeGtid(1), &candidate, &error)) << error;
+  bool subset = false;
+  EXPECT_TRUE(IsGtidSetSubset(candidate, superset, &subset, &error)) << error;
+  EXPECT_TRUE(subset);
+
+  subset = false;
+  EXPECT_TRUE(IsGtidSetSubset(superset, candidate, &subset, &error)) << error;
+  EXPECT_FALSE(subset);
 }
 
 TEST(DuckDBGtidUtilsTest, AdapterIsGtidAppliedUsesSet) {

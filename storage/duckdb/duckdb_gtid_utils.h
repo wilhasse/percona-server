@@ -223,6 +223,59 @@ inline bool GtidSetContains(const std::string &gtid_set,
   return true;
 }
 
+inline bool IsGtidSetSubset(const std::string &candidate_set,
+                            const std::string &superset,
+                            bool *is_subset, std::string *error) {
+  if (!is_subset) return false;
+  *is_subset = true;
+  if (candidate_set.empty()) return true;
+  binary_log::gtids::Gtid_set candidate;
+  if (!ParseGtidSetString(candidate_set, &candidate, error)) return false;
+  binary_log::gtids::Gtid_set sup;
+  if (!ParseGtidSetString(superset, &sup, error)) return false;
+
+  const auto &candidate_map = candidate.get_gtid_set();
+  const auto &sup_map = sup.get_gtid_set();
+  for (const auto &entry : candidate_map) {
+    const auto &uuid = entry.first;
+    const auto &intervals = entry.second;
+    auto sup_it = sup_map.find(uuid);
+    if (sup_it == sup_map.end()) {
+      *is_subset = false;
+      return true;
+    }
+    const auto &sup_intervals = sup_it->second;
+    for (const auto &interval : intervals) {
+      binary_log::gtids::gno_t needed_start = interval.get_start();
+      const binary_log::gtids::gno_t needed_end = interval.get_end();
+      bool covered = false;
+      for (const auto &sup_interval : sup_intervals) {
+        const auto sup_start = sup_interval.get_start();
+        const auto sup_end = sup_interval.get_end();
+        if (sup_end < needed_start) continue;
+        if (sup_start > needed_start) {
+          covered = false;
+          break;
+        }
+        if (sup_end >= needed_end) {
+          covered = true;
+          break;
+        }
+        needed_start = sup_end + 1;
+        if (needed_start > needed_end) {
+          covered = true;
+          break;
+        }
+      }
+      if (!covered) {
+        *is_subset = false;
+        return true;
+      }
+    }
+  }
+  return true;
+}
+
 }  // namespace duckdb_se
 
 #endif  // PLUGIN_DUCKDB_GTID_UTILS_H_

@@ -27,6 +27,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -40,6 +41,8 @@
 #include "storage/duckdb/duckdb_adapter.h"
 #include "storage/duckdb/duckdb_binlog_applier.h"
 #include "storage/duckdb/duckdb_binlog_streamer.h"
+#include "storage/duckdb/duckdb_gtid_utils.h"
+#include "storage/duckdb/duckdb_repl_state.h"
 #include "storage/duckdb/duckdb_row_decoder.h"
 
 namespace duckdb_se {
@@ -68,6 +71,149 @@ std::string DuckdbPathForSchema(const std::string &schema) {
   std::string dir = mysql_real_data_home;
   if (!dir.empty() && dir.back() != FN_LIBCHAR) dir.push_back(FN_LIBCHAR);
   return dir + schema + ".duckdb";
+}
+
+struct ReplStateSnapshot {
+  std::string applied_gtid_set;
+  std::string snapshot_gtid_set;
+  std::string last_commit_ts;
+  std::string source_path;
+};
+
+bool IsDuckdbFile(const std::filesystem::path &path) {
+  return path.has_extension() && path.extension() == ".duckdb";
+}
+
+Status LoadReplStateFromFile(const std::string &path,
+                             ReplStateSnapshot *out_state) {
+  if (!out_state) {
+    return Status::Error(StatusCode::kInvalid, "State output is null");
+  }
+  out_state->applied_gtid_set.clear();
+  out_state->snapshot_gtid_set.clear();
+  out_state->last_commit_ts.clear();
+  out_state->source_path.clear();
+
+  try {
+    duckdb::DBConfig cfg(true);
+    duckdb::DuckDB db(path, &cfg);
+    duckdb::Connection conn(db);
+
+    auto result = conn.Query(
+        "SELECT snapshot_gtid_set, applied_gtid_set, last_commit_ts "
+        "FROM __repl_state WHERE channel = 'default' LIMIT 1");
+    if (result->HasError()) {
+      if (!IsMissingReplTableError(result->GetError(), "__repl_state")) {
+        return Status::Error(StatusCode::kDuckDBError, result->GetError());
+      }
+    } else {
+      auto chunk = result->Fetch();
+      if (chunk && chunk->size() > 0) {
+        auto snap_val = chunk->GetValue(0, 0);
+        if (!snap_val.IsNull()) {
+          out_state->snapshot_gtid_set = snap_val.ToString();
+        }
+        auto applied_val = chunk->GetValue(1, 0);
+        if (!applied_val.IsNull()) {
+          out_state->applied_gtid_set = applied_val.ToString();
+        }
+        auto ts_val = chunk->GetValue(2, 0);
+        if (!ts_val.IsNull()) {
+          out_state->last_commit_ts = ts_val.ToString();
+        }
+      }
+    }
+
+    if (out_state->applied_gtid_set.empty()) {
+      auto wm = conn.Query(
+          "SELECT gtid FROM __repl_watermark ORDER BY commit_ts");
+      if (!wm->HasError()) {
+        std::vector<std::string> gtids;
+        while (true) {
+          auto chunk = wm->Fetch();
+          if (!chunk || chunk->size() == 0) break;
+          for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
+            auto val = chunk->GetValue(0, row);
+            if (!val.IsNull()) {
+              gtids.push_back(val.ToString());
+            }
+          }
+        }
+        if (!gtids.empty()) {
+          std::string error;
+          std::string set;
+          if (!BuildGtidSetFromList(gtids, &set, &error)) {
+            return Status::Error(StatusCode::kInvalid,
+                                 error.empty() ? "Failed to build GTID set"
+                                               : error);
+          }
+          out_state->applied_gtid_set = std::move(set);
+        }
+      } else if (!IsMissingReplTableError(wm->GetError(),
+                                          "__repl_watermark")) {
+        return Status::Error(StatusCode::kDuckDBError, wm->GetError());
+      }
+    }
+  } catch (const std::exception &ex) {
+    return Status::Error(StatusCode::kDuckDBError, ex.what());
+  }
+
+  if (!out_state->applied_gtid_set.empty() ||
+      !out_state->snapshot_gtid_set.empty()) {
+    out_state->source_path = path;
+  }
+  return Status::Ok();
+}
+
+Status ResolveReplState(const BinlogApplyThreadOptions &options,
+                        ReplStateSnapshot *state) {
+  if (!state) {
+    return Status::Error(StatusCode::kInvalid, "State output is null");
+  }
+  state->applied_gtid_set.clear();
+  state->snapshot_gtid_set.clear();
+  state->last_commit_ts.clear();
+  state->source_path.clear();
+
+  if (!options.schema_filter.empty()) {
+    const std::string path = DuckdbPathForSchema(options.schema_filter);
+    if (std::filesystem::exists(path)) {
+      return LoadReplStateFromFile(path, state);
+    }
+    return Status::Ok();
+  }
+
+  std::string dir = mysql_real_data_home;
+  if (dir.empty()) return Status::Ok();
+  std::error_code ec;
+  for (const auto &entry : std::filesystem::directory_iterator(dir, ec)) {
+    if (ec) break;
+    if (!entry.is_regular_file()) continue;
+    const auto &path = entry.path();
+    if (!IsDuckdbFile(path)) continue;
+    ReplStateSnapshot candidate;
+    Status st = LoadReplStateFromFile(path.string(), &candidate);
+    if (!st.ok()) return st;
+    if (candidate.applied_gtid_set.empty() &&
+        candidate.snapshot_gtid_set.empty()) {
+      continue;
+    }
+    if (state->applied_gtid_set.empty() &&
+        state->snapshot_gtid_set.empty()) {
+      *state = std::move(candidate);
+      continue;
+    }
+    if (state->applied_gtid_set.empty() &&
+        !candidate.applied_gtid_set.empty()) {
+      *state = std::move(candidate);
+      continue;
+    }
+    if (!candidate.last_commit_ts.empty() &&
+        candidate.last_commit_ts > state->last_commit_ts) {
+      *state = std::move(candidate);
+    }
+  }
+  return Status::Ok();
 }
 
 uint32_t ResolveServerId(uint32_t configured) {
@@ -210,11 +356,49 @@ Status ApplyRowEvent(const BinlogEvent &event, const BinlogTableMap &map,
 
 Status RunApplyLoop(const BinlogApplyThreadOptions &options,
                     std::atomic<bool> *stop_flag) {
-  std::string gtid_set = options.start_gtid_set;
-  if (gtid_set.empty()) {
-    if (!FetchGtidExecuted(options, &gtid_set)) {
-      return Status::Error(StatusCode::kInvalid,
-                           "Failed to fetch @@GLOBAL.GTID_EXECUTED");
+  std::string gtid_set;
+  std::string source_gtid_set;
+  if (!FetchGtidExecuted(options, &source_gtid_set)) {
+    return Status::Error(StatusCode::kInvalid,
+                         "Failed to fetch @@GLOBAL.GTID_EXECUTED");
+  }
+  if (source_gtid_set.empty()) {
+    return Status::Error(StatusCode::kInvalid,
+                         "Source GTID_EXECUTED is empty; cannot resume");
+  }
+
+  if (!options.start_gtid_set.empty()) {
+    gtid_set = options.start_gtid_set;
+    sql_print_information(
+        "DuckDB binlog applier: Using configured start GTID set override");
+  } else {
+    ReplStateSnapshot state;
+    Status st = ResolveReplState(options, &state);
+    if (!st.ok()) return st;
+    if (!state.applied_gtid_set.empty()) {
+      bool subset = false;
+      std::string error;
+      if (!IsGtidSetSubset(state.applied_gtid_set, source_gtid_set, &subset,
+                           &error)) {
+        return Status::Error(StatusCode::kInvalid,
+                             error.empty() ? "Failed to compare GTID sets"
+                                           : error);
+      }
+      if (!subset) {
+        return Status::Error(
+            StatusCode::kInvalid,
+            "DuckDB applied GTID set is not a subset of source GTID_EXECUTED; "
+            "refusing to start to avoid data loss");
+      }
+      if (state.applied_gtid_set != source_gtid_set) {
+        sql_print_information(
+            "DuckDB binlog applier: Resuming from applied_gtid_set in %s "
+            "(source has additional transactions)",
+            state.source_path.empty() ? "(unknown)" : state.source_path.c_str());
+      }
+      gtid_set = std::move(state.applied_gtid_set);
+    } else {
+      gtid_set = source_gtid_set;
     }
   }
 
