@@ -257,6 +257,41 @@ duckdb::Value QuerySingleValue(DuckDBAdapter &adapter,
   return chunk->GetValue(0, 0);
 }
 
+std::vector<std::string> ColumnNames(DuckDBAdapter &adapter,
+                                     const std::string &table) {
+  SessionCtx ctx;
+  std::vector<std::string> names;
+  auto result =
+      adapter.ExecuteQuery("PRAGMA table_info('" + table + "')", ctx);
+  if (!result.ok || !result.result) {
+    ADD_FAILURE() << "PRAGMA table_info failed: " << result.error;
+    return names;
+  }
+
+  while (true) {
+    auto chunk = result.result->Fetch();
+    if (!chunk || chunk->size() == 0) break;
+    for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
+      names.push_back(chunk->GetValue(1, row).GetValue<std::string>());
+    }
+  }
+  return names;
+}
+
+bool QueryFails(DuckDBAdapter &adapter, const std::string &sql) {
+  SessionCtx ctx;
+  auto result = adapter.ExecuteQuery(sql, ctx);
+  return !result.ok;
+}
+
+int64_t GetSchemaVersion(DuckDBAdapter &adapter) {
+  int64_t version = 0;
+  bool found = false;
+  ExpectOk(adapter.GetSchemaVersion(&version, &found));
+  EXPECT_TRUE(found);
+  return version;
+}
+
 TEST(DuckDBBinlogApplierTest, RestartPersistsDataAndWatermark) {
   const std::string path = MakeTempPath("duckdb_restart");
   CleanupDuckdbFiles(path);
@@ -491,6 +526,139 @@ TEST(DuckDBBinlogApplierTest, ApplyDDLInTransaction) {
   ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
   ExpectOk(applier.CommitTransaction());
   EXPECT_EQ(1, QueryCount(adapter, "SELECT COUNT(*) FROM t"));
+
+  adapter.Shutdown();
+  CleanupDuckdbFiles(path);
+}
+
+TEST(DuckDBBinlogApplierTest, DdlSequenceWithDml) {
+  const std::string path = MakeTempPath("duckdb_apply_ddl_seq");
+  CleanupDuckdbFiles(path);
+
+  DuckDBAdapter adapter;
+  DuckDBConfig cfg;
+  cfg.read_only = false;
+  ExpectOk(adapter.Init(path, cfg));
+
+  DuckDBBinlogApplier applier(&adapter);
+
+  DDLChange create_change;
+  create_change.type = DDLChange::Type::kCreate;
+  create_change.new_def = MakeSimpleTable();
+
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(70)}));
+  ExpectOk(applier.ApplyDDL(std::move(create_change)));
+  ExpectOk(applier.CommitTransaction());
+  EXPECT_EQ(1, GetSchemaVersion(adapter));
+
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(71)}));
+  ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
+  ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("2", "beta")));
+  ExpectOk(applier.CommitTransaction());
+
+  DDLChange add_col;
+  add_col.type = DDLChange::Type::kAlter;
+  add_col.sql = "ALTER TABLE t ADD COLUMN extra VARCHAR";
+  add_col.table = TableId{"", "t"};
+
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(72)}));
+  ExpectOk(applier.ApplyDDL(std::move(add_col)));
+  ExpectOk(applier.CommitTransaction());
+  EXPECT_EQ(2, GetSchemaVersion(adapter));
+
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(73)}));
+  Row row3;
+  row3.push_back(Cell{false, false, "3"});
+  row3.push_back(Cell{false, false, "gamma"});
+  row3.push_back(Cell{false, false, "x"});
+  ExpectOk(applier.AppendInsert(TableId{"", "t"}, std::move(row3)));
+  ExpectOk(applier.CommitTransaction());
+
+  DDLChange rename;
+  rename.type = DDLChange::Type::kRename;
+  rename.table = TableId{"", "t"};
+  rename.new_table = TableId{"", "t2"};
+
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(74)}));
+  ExpectOk(applier.ApplyDDL(std::move(rename)));
+  ExpectOk(applier.CommitTransaction());
+  EXPECT_EQ(3, GetSchemaVersion(adapter));
+
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(75)}));
+  Row row4;
+  row4.push_back(Cell{false, false, "4"});
+  row4.push_back(Cell{false, false, "delta"});
+  row4.push_back(Cell{false, false, "y"});
+  ExpectOk(applier.AppendInsert(TableId{"", "t2"}, std::move(row4)));
+  ExpectOk(applier.CommitTransaction());
+
+  auto cols = ColumnNames(adapter, "t2");
+  ASSERT_EQ(3u, cols.size());
+  EXPECT_EQ("id", cols[0]);
+  EXPECT_EQ("val", cols[1]);
+  EXPECT_EQ("extra", cols[2]);
+  EXPECT_EQ(4, QueryCount(adapter, "SELECT COUNT(*) FROM t2"));
+
+  DDLChange drop;
+  drop.type = DDLChange::Type::kDrop;
+  drop.table = TableId{"", "t2"};
+
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(76)}));
+  ExpectOk(applier.ApplyDDL(std::move(drop)));
+  ExpectOk(applier.CommitTransaction());
+  EXPECT_EQ(4, GetSchemaVersion(adapter));
+  EXPECT_TRUE(QueryFails(adapter, "SELECT COUNT(*) FROM t2"));
+
+  adapter.Shutdown();
+  CleanupDuckdbFiles(path);
+}
+
+TEST(DuckDBBinlogApplierTest, CopyFallbackPreservesData) {
+  const std::string path = MakeTempPath("duckdb_apply_copy");
+  CleanupDuckdbFiles(path);
+
+  DuckDBAdapter adapter;
+  DuckDBConfig cfg;
+  cfg.read_only = false;
+  ExpectOk(adapter.Init(path, cfg));
+
+  DuckDBBinlogApplier applier(&adapter);
+  DDLChange create_change;
+  create_change.type = DDLChange::Type::kCreate;
+  create_change.new_def = MakeSimpleTable();
+
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(80)}));
+  ExpectOk(applier.ApplyDDL(std::move(create_change)));
+  ExpectOk(applier.CommitTransaction());
+
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(81)}));
+  ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
+  ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("2", "beta")));
+  ExpectOk(applier.CommitTransaction());
+
+  MySQLTableDef new_def;
+  new_def.name = "t";
+  new_def.columns.push_back({"val", "VARCHAR", false});
+  new_def.columns.push_back({"id", "INTEGER", true});
+  new_def.columns.push_back({"extra", "VARCHAR", false});
+
+  DDLChange copy;
+  copy.type = DDLChange::Type::kAlter;
+  copy.copy_ddl = true;
+  copy.table = TableId{"", "t"};
+  copy.new_def = std::move(new_def);
+
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(82)}));
+  ExpectOk(applier.ApplyDDL(std::move(copy)));
+  ExpectOk(applier.CommitTransaction());
+
+  auto cols = ColumnNames(adapter, "t");
+  ASSERT_EQ(3u, cols.size());
+  EXPECT_EQ("val", cols[0]);
+  EXPECT_EQ("id", cols[1]);
+  EXPECT_EQ("extra", cols[2]);
+  EXPECT_EQ(2, QueryCount(adapter, "SELECT COUNT(*) FROM t"));
+  EXPECT_EQ(1, QueryCount(adapter, "SELECT COUNT(*) FROM t WHERE val = 'alpha'"));
 
   adapter.Shutdown();
   CleanupDuckdbFiles(path);
