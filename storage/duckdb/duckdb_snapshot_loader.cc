@@ -1939,6 +1939,7 @@ int main(int argc, char **argv) {
     stream_opts.port = opts.port;
     stream_opts.server_id = MakeServerId();
     stream_opts.gtid_set = snapshot_gtid;
+    stream_opts.non_blocking = false;
     Status st = binlog_streamer.Open(stream_opts);
     if (!st.ok()) {
       std::cerr << "Binlog stream open failed: " << st.message << "\n";
