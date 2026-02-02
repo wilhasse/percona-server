@@ -36,6 +36,7 @@
 #include "libbinlogevents/include/gtids/gtidset.h"
 #include "libbinlogevents/include/rows_event.h"
 #include "my_byteorder.h"
+#include "storage/duckdb/duckdb_gtid_utils.h"
 
 namespace {
 
@@ -88,96 +89,6 @@ class Delete_rows_event_view : public binary_log::Delete_rows_event {
   const std::vector<uint8_t> &rows() const { return row; }
 };
 
-std::string Trim(std::string value) {
-  auto is_space = [](unsigned char ch) { return std::isspace(ch) != 0; };
-  value.erase(value.begin(),
-              std::find_if(value.begin(), value.end(),
-                           [&](unsigned char ch) { return !is_space(ch); }));
-  value.erase(std::find_if(value.rbegin(), value.rend(),
-                           [&](unsigned char ch) { return !is_space(ch); })
-                  .base(),
-              value.end());
-  return value;
-}
-
-bool ParseInterval(const std::string &token, long long *start_out,
-                   long long *end_out) {
-  if (!start_out || !end_out) return false;
-  const auto dash = token.find('-');
-  const std::string start_str =
-      dash == std::string::npos ? token : token.substr(0, dash);
-  const std::string end_str =
-      dash == std::string::npos ? token : token.substr(dash + 1);
-  if (start_str.empty() || end_str.empty()) return false;
-  char *endptr = nullptr;
-  errno = 0;
-  long long start = std::strtoll(start_str.c_str(), &endptr, 10);
-  if (errno != 0 || endptr == start_str.c_str() || *endptr != '\0') {
-    return false;
-  }
-  errno = 0;
-  endptr = nullptr;
-  long long end = std::strtoll(end_str.c_str(), &endptr, 10);
-  if (errno != 0 || endptr == end_str.c_str() || *endptr != '\0') {
-    return false;
-  }
-  if (start <= 0 || end < start) return false;
-  *start_out = start;
-  *end_out = end;
-  return true;
-}
-
-bool ParseGtidSetString(const std::string &input, Gtid_set *out,
-                        std::string *error) {
-  if (!out) return false;
-  if (input.empty()) return true;
-  std::string gtid_set = Trim(input);
-  if (gtid_set.empty()) return true;
-
-  size_t pos = 0;
-  while (pos < gtid_set.size()) {
-    const size_t comma = gtid_set.find(',', pos);
-    const std::string entry = Trim(
-        gtid_set.substr(pos, comma == std::string::npos ? std::string::npos
-                                                        : comma - pos));
-    if (!entry.empty()) {
-      const size_t first_colon = entry.find(':');
-      if (first_colon == std::string::npos) {
-        if (error) *error = "Missing ':' in GTID set entry";
-        return false;
-      }
-      const std::string uuid_str = entry.substr(0, first_colon);
-      Uuid uuid;
-      if (uuid.parse(uuid_str.c_str(), uuid_str.size()) != 0) {
-        if (error) *error = "Invalid UUID in GTID set";
-        return false;
-      }
-      size_t interval_pos = first_colon + 1;
-      while (interval_pos < entry.size()) {
-        const size_t next_colon = entry.find(':', interval_pos);
-        const std::string token = entry.substr(
-            interval_pos, next_colon == std::string::npos
-                              ? std::string::npos
-                              : next_colon - interval_pos);
-        long long start = 0;
-        long long end = 0;
-        if (!ParseInterval(token, &start, &end)) {
-          if (error) *error = "Invalid interval in GTID set";
-          return false;
-        }
-        if (out->add(uuid, Gno_interval(start, end))) {
-          if (error) *error = "Failed to add interval to GTID set";
-          return false;
-        }
-        if (next_colon == std::string::npos) break;
-        interval_pos = next_colon + 1;
-      }
-    }
-    if (comma == std::string::npos) break;
-    pos = comma + 1;
-  }
-  return true;
-}
 
 bool EncodeGtidSet(const Gtid_set &gtids, std::vector<uint8_t> *out) {
   if (!out) return false;

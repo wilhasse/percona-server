@@ -51,6 +51,7 @@
 #include "storage/duckdb/duckdb_binlog_applier.h"
 #include "storage/duckdb/duckdb_binlog_streamer.h"
 #include "storage/duckdb/duckdb_row_decoder.h"
+#include "storage/duckdb/duckdb_repl_state.h"
 
 // Stubs for symbols required by binlogevents_static and my_decimal
 // These are normally provided by mysqld but not available in standalone tools
@@ -611,27 +612,93 @@ bool EnsureDuckdbSchema(DuckDBAdapter &adapter, const std::string &schema) {
 bool StoreSnapshotGtid(DuckDBAdapter &adapter, const std::string &gtid) {
   auto create = adapter.ExecuteQuery(
       "CREATE TABLE IF NOT EXISTS __repl_state ("
-      "id INTEGER PRIMARY KEY, "
+      "channel VARCHAR PRIMARY KEY, "
       "snapshot_gtid_set VARCHAR, "
-      "updated_ts TIMESTAMP)",
+      "applied_gtid_set VARCHAR, "
+      "last_commit_ts TIMESTAMP)",
       {});
   if (!create.ok) {
     std::cerr << "DuckDB __repl_state create failed: " << create.error << "\n";
     return false;
   }
-  const std::string sql =
-      "INSERT INTO __repl_state (id, snapshot_gtid_set, updated_ts) "
-      "VALUES (1, " +
+
+  const std::string upsert_sql =
+      "INSERT INTO __repl_state (channel, snapshot_gtid_set, last_commit_ts) "
+      "VALUES ('default', " +
       QuoteDuckdbLiteral(gtid) + ", CURRENT_TIMESTAMP) "
-      "ON CONFLICT(id) DO UPDATE SET "
+      "ON CONFLICT(channel) DO UPDATE SET "
       "snapshot_gtid_set = excluded.snapshot_gtid_set, "
-      "updated_ts = excluded.updated_ts";
-  auto upsert = adapter.ExecuteQuery(sql, {});
-  if (!upsert.ok) {
-    std::cerr << "DuckDB __repl_state upsert failed: " << upsert.error << "\n";
-    return false;
+      "last_commit_ts = excluded.last_commit_ts";
+  auto upsert = adapter.ExecuteQuery(upsert_sql, {});
+  if (upsert.ok) return true;
+
+  // Legacy schema migration: __repl_state with id/updated_ts.
+  if (upsert.error.find("channel") != std::string::npos ||
+      upsert.error.find("applied_gtid_set") != std::string::npos ||
+      upsert.error.find("last_commit_ts") != std::string::npos) {
+    std::string snapshot;
+    std::string updated_ts;
+    auto legacy = adapter.ExecuteQuery(
+        "SELECT snapshot_gtid_set, updated_ts FROM __repl_state WHERE id = 1",
+        {});
+    if (legacy.ok && legacy.result) {
+      auto chunk = legacy.result->Fetch();
+      if (chunk && chunk->size() > 0) {
+        auto snap_val = chunk->GetValue(0, 0);
+        if (!snap_val.IsNull()) snapshot = snap_val.ToString();
+        auto ts_val = chunk->GetValue(1, 0);
+        if (!ts_val.IsNull()) updated_ts = ts_val.ToString();
+      }
+    }
+    auto create_new = adapter.ExecuteQuery(
+        "CREATE TABLE __repl_state_new ("
+        "channel VARCHAR PRIMARY KEY, "
+        "snapshot_gtid_set VARCHAR, "
+        "applied_gtid_set VARCHAR, "
+        "last_commit_ts TIMESTAMP)",
+        {});
+    if (!create_new.ok) {
+      std::cerr << "DuckDB __repl_state_new create failed: "
+                << create_new.error << "\n";
+      return false;
+    }
+    const std::string snapshot_sql =
+        snapshot.empty() ? "NULL" : QuoteDuckdbLiteral(snapshot);
+    const std::string ts_sql =
+        updated_ts.empty() ? "CURRENT_TIMESTAMP" : QuoteDuckdbLiteral(updated_ts);
+    const std::string insert_sql =
+        "INSERT INTO __repl_state_new (channel, snapshot_gtid_set, "
+        "applied_gtid_set, last_commit_ts) VALUES ('default', " +
+        snapshot_sql + ", NULL, " + ts_sql + ")";
+    auto insert = adapter.ExecuteQuery(insert_sql, {});
+    if (!insert.ok) {
+      std::cerr << "DuckDB __repl_state_new insert failed: " << insert.error
+                << "\n";
+      return false;
+    }
+    auto drop_old = adapter.ExecuteQuery("DROP TABLE __repl_state", {});
+    if (!drop_old.ok) {
+      std::cerr << "DuckDB __repl_state drop failed: " << drop_old.error
+                << "\n";
+      return false;
+    }
+    auto rename = adapter.ExecuteQuery(
+        "ALTER TABLE __repl_state_new RENAME TO __repl_state", {});
+    if (!rename.ok) {
+      std::cerr << "DuckDB __repl_state rename failed: " << rename.error
+                << "\n";
+      return false;
+    }
+    auto retry = adapter.ExecuteQuery(upsert_sql, {});
+    if (!retry.ok) {
+      std::cerr << "DuckDB __repl_state upsert failed: " << retry.error << "\n";
+      return false;
+    }
+    return true;
   }
-  return true;
+
+  std::cerr << "DuckDB __repl_state upsert failed: " << upsert.error << "\n";
+  return false;
 }
 
 bool ValidateRowCount(MYSQL *mysql, DuckDBAdapter &adapter,

@@ -60,6 +60,12 @@ using duckdb_se::GetBinlogApplyMetrics;
 using duckdb_se::SetBinlogApplyPaused;
 using duckdb_se::SetBinlogApplyThrottleRowsPerSec;
 
+const std::string kTestUuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+
+std::string MakeGtid(int seq) {
+  return kTestUuid + ":" + std::to_string(seq);
+}
+
 std::string TempDirectory() {
   try {
     return std::filesystem::temp_directory_path().string();
@@ -145,7 +151,7 @@ TEST(DuckDBBinlogApplierTest, RestartPersistsDataAndWatermark) {
   ExpectOk(adapter.CreateTable(MakeSimpleTable()));
 
   DuckDBBinlogApplier applier(&adapter);
-  ExpectOk(applier.BeginTransaction(Gtid{"gtid:1"}));
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(1)}));
   ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
   ExpectOk(applier.CommitTransaction());
   adapter.Shutdown();
@@ -158,7 +164,7 @@ TEST(DuckDBBinlogApplierTest, RestartPersistsDataAndWatermark) {
 
   Gtid latest;
   ExpectOk(reader.GetLatestWatermark(&latest));
-  EXPECT_EQ("gtid:1", latest.value);
+  EXPECT_EQ(MakeGtid(1), latest.value);
   reader.Shutdown();
 
   CleanupDuckdbFiles(path);
@@ -178,7 +184,7 @@ TEST(DuckDBBinlogApplierTest, KillDuringApplyKeepsCommittedData) {
   ExpectOk(adapter.CreateTable(MakeSimpleTable()));
 
   DuckDBBinlogApplier applier(&adapter);
-  ExpectOk(applier.BeginTransaction(Gtid{"gtid:1"}));
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(1)}));
   ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
   ExpectOk(applier.CommitTransaction());
   adapter.Shutdown();
@@ -199,7 +205,7 @@ TEST(DuckDBBinlogApplierTest, KillDuringApplyKeepsCommittedData) {
     BinlogApplierOptions options;
     options.max_rows = 1;
     DuckDBBinlogApplier child_applier(&child_adapter, options);
-    st = child_applier.BeginTransaction(Gtid{"gtid:2"});
+    st = child_applier.BeginTransaction(Gtid{MakeGtid(2)});
     if (!st.ok()) _exit(3);
     st = child_applier.AppendInsert(TableId{"", "t"}, MakeRow("2", "beta"));
     if (!st.ok()) _exit(4);
@@ -230,7 +236,7 @@ TEST(DuckDBBinlogApplierTest, KillDuringApplyKeepsCommittedData) {
 
   Gtid latest;
   ExpectOk(reader.GetLatestWatermark(&latest));
-  EXPECT_EQ("gtid:1", latest.value);
+  EXPECT_EQ(MakeGtid(1), latest.value);
   reader.Shutdown();
 
   CleanupDuckdbFiles(path);
@@ -248,12 +254,12 @@ TEST(DuckDBBinlogApplierTest, IdempotentReplaySkipsAppliedGtid) {
   ExpectOk(adapter.CreateTable(MakeSimpleTable()));
 
   DuckDBBinlogApplier applier(&adapter);
-  ExpectOk(applier.BeginTransaction(Gtid{"gtid:replay"}));
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(10)}));
   ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
   ExpectOk(applier.CommitTransaction());
 
   // Reapply the same GTID with a different row: should be ignored.
-  ExpectOk(applier.BeginTransaction(Gtid{"gtid:replay"}));
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(10)}));
   ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("2", "beta")));
   ExpectOk(applier.CommitTransaction());
 
@@ -261,7 +267,7 @@ TEST(DuckDBBinlogApplierTest, IdempotentReplaySkipsAppliedGtid) {
 
   Gtid latest;
   ExpectOk(adapter.GetLatestWatermark(&latest));
-  EXPECT_EQ("gtid:replay", latest.value);
+  EXPECT_EQ(MakeGtid(10), latest.value);
 
   adapter.Shutdown();
   CleanupDuckdbFiles(path);
@@ -278,14 +284,14 @@ TEST(DuckDBBinlogApplierTest, BulkUpdateDeleteFullRowImage) {
   ExpectOk(adapter.CreateTable(MakeSimpleTable()));
 
   DuckDBBinlogApplier applier(&adapter);
-  ExpectOk(applier.BeginTransaction(Gtid{"gtid:bulk:1"}));
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(20)}));
   ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
   ExpectOk(applier.CommitTransaction());
 
   const std::string update_sql =
       "UPDATE \"t\" SET \"val\" = 'beta' WHERE \"id\" IS NOT DISTINCT FROM '1' "
       "AND \"val\" IS NOT DISTINCT FROM 'alpha'";
-  ExpectOk(applier.BeginTransaction(Gtid{"gtid:bulk:2"}));
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(21)}));
   ExpectOk(applier.AddUpdateStatement(TableId{"", "t"}, update_sql));
   ExpectOk(applier.CommitTransaction());
   EXPECT_EQ(1, QueryCount(adapter,
@@ -294,7 +300,7 @@ TEST(DuckDBBinlogApplierTest, BulkUpdateDeleteFullRowImage) {
   const std::string delete_sql =
       "DELETE FROM \"t\" WHERE \"id\" IS NOT DISTINCT FROM '1' AND \"val\" IS "
       "NOT DISTINCT FROM 'beta'";
-  ExpectOk(applier.BeginTransaction(Gtid{"gtid:bulk:3"}));
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(22)}));
   ExpectOk(applier.AddDeleteStatement(TableId{"", "t"}, delete_sql));
   ExpectOk(applier.CommitTransaction());
   EXPECT_EQ(0, QueryCount(adapter, "SELECT COUNT(*) FROM t"));
@@ -314,7 +320,7 @@ TEST(DuckDBBinlogApplierTest, BulkUpdatePreservesOrderOnChainedUpdates) {
   ExpectOk(adapter.CreateTable(MakeSimpleTable()));
 
   DuckDBBinlogApplier applier(&adapter);
-  ExpectOk(applier.BeginTransaction(Gtid{"gtid:chain:1"}));
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(30)}));
   ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
   ExpectOk(applier.CommitTransaction());
 
@@ -324,7 +330,7 @@ TEST(DuckDBBinlogApplierTest, BulkUpdatePreservesOrderOnChainedUpdates) {
   const std::string update2 =
       "UPDATE \"t\" SET \"val\" = 'gamma' WHERE \"id\" IS NOT DISTINCT FROM '1' "
       "AND \"val\" IS NOT DISTINCT FROM 'beta'";
-  ExpectOk(applier.BeginTransaction(Gtid{"gtid:chain:2"}));
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(31)}));
   ExpectOk(applier.AddUpdateStatement(TableId{"", "t"}, update1));
   ExpectOk(applier.AddUpdateStatement(TableId{"", "t"}, update2));
   ExpectOk(applier.CommitTransaction());
@@ -352,13 +358,13 @@ TEST(DuckDBBinlogApplierTest, ApplyDDLInTransaction) {
   create_change.type = DDLChange::Type::kCreate;
   create_change.new_def = MakeSimpleTable();
 
-  ExpectOk(applier.BeginTransaction(Gtid{"gtid:ddl:1"}));
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(40)}));
   ExpectOk(applier.ApplyDDL(std::move(create_change)));
   ExpectOk(applier.CommitTransaction());
 
   EXPECT_EQ(0, QueryCount(adapter, "SELECT COUNT(*) FROM t"));
 
-  ExpectOk(applier.BeginTransaction(Gtid{"gtid:ddl:2"}));
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(41)}));
   ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
   ExpectOk(applier.CommitTransaction());
   EXPECT_EQ(1, QueryCount(adapter, "SELECT COUNT(*) FROM t"));
@@ -385,7 +391,7 @@ TEST(DuckDBBinlogApplierTest, PauseResumeBlocksApply) {
 
   std::thread worker([&]() {
     started.set_value();
-    Status st = applier.BeginTransaction(Gtid{"gtid:pause"});
+    Status st = applier.BeginTransaction(Gtid{MakeGtid(50)});
     if (st.ok()) {
       st = applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha"));
     }
@@ -419,7 +425,7 @@ TEST(DuckDBBinlogApplierTest, ThrottleAppliesSleep) {
 
   SetBinlogApplyThrottleRowsPerSec(1);
   DuckDBBinlogApplier applier(&adapter);
-  ExpectOk(applier.BeginTransaction(Gtid{"gtid:throttle"}));
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(60)}));
   ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
   const auto start = std::chrono::steady_clock::now();
   ExpectOk(applier.CommitTransaction());
@@ -447,7 +453,7 @@ TEST(DuckDBBinlogApplierTest, LagMetricsUpdateOnCommit) {
   ExpectOk(adapter.CreateTable(MakeSimpleTable()));
 
   DuckDBBinlogApplier applier(&adapter);
-  ExpectOk(applier.BeginTransaction(Gtid{"gtid:lag"}));
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(70)}));
   ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
   ExpectOk(applier.CommitTransaction());
 
@@ -475,7 +481,7 @@ TEST(DuckDBBinlogApplierTest, FlushDoesNotCommitMidTransaction) {
   options.max_delay = std::chrono::milliseconds(0);
   DuckDBBinlogApplier applier(&adapter, options);
 
-  ExpectOk(applier.BeginTransaction(Gtid{"gtid:boundary"}));
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(80)}));
   ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
   EXPECT_EQ(0, QueryCount(adapter, "SELECT COUNT(*) FROM t"));
 
@@ -487,7 +493,7 @@ TEST(DuckDBBinlogApplierTest, FlushDoesNotCommitMidTransaction) {
 
   auto value = QuerySingleValue(
       adapter,
-      "SELECT commit_ts FROM __repl_watermark WHERE gtid='gtid:boundary'");
+      "SELECT last_commit_ts FROM __repl_state WHERE channel='default'");
   EXPECT_FALSE(value.IsNull());
   EXPECT_FALSE(value.ToString().empty());
 

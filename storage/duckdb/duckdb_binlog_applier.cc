@@ -23,6 +23,9 @@
 
 #include "storage/duckdb/duckdb_binlog_applier.h"
 
+#include "storage/duckdb/duckdb_gtid_utils.h"
+#include "storage/duckdb/duckdb_repl_state.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -66,6 +69,70 @@ struct BinlogApplyState {
   std::string last_gtid;
   std::string stop_at_gtid;
 };
+
+constexpr const char *kReplChannel = "default";
+
+Status ReadReplStateRow(duckdb::Connection &conn, std::string *snapshot,
+                        std::string *applied, bool *found) {
+  if (snapshot) snapshot->clear();
+  if (applied) applied->clear();
+  if (found) *found = false;
+  auto result = conn.Query(
+      "SELECT snapshot_gtid_set, applied_gtid_set "
+      "FROM __repl_state WHERE channel = '" +
+      std::string(kReplChannel) + "' LIMIT 1");
+  if (result->HasError()) {
+    return Status::Error(StatusCode::kDuckDBError, result->GetError());
+  }
+  auto chunk = result->Fetch();
+  if (!chunk || chunk->size() == 0) {
+    return Status::Ok();
+  }
+  if (found) *found = true;
+  auto snap_val = chunk->GetValue(0, 0);
+  if (snapshot && !snap_val.IsNull()) {
+    *snapshot = snap_val.ToString();
+  }
+  auto applied_val = chunk->GetValue(1, 0);
+  if (applied && !applied_val.IsNull()) {
+    *applied = applied_val.ToString();
+  }
+  return Status::Ok();
+}
+
+Status LoadWatermarkGtidSet(duckdb::Connection &conn, std::string *out_set) {
+  if (!out_set) {
+    return Status::Error(StatusCode::kInvalid, "GTID set output is null");
+  }
+  out_set->clear();
+  auto result =
+      conn.Query("SELECT gtid FROM __repl_watermark ORDER BY commit_ts");
+  if (result->HasError()) {
+    if (IsMissingReplTableError(result->GetError(), "__repl_watermark")) {
+      return Status::Ok();
+    }
+    return Status::Error(StatusCode::kDuckDBError, result->GetError());
+  }
+  std::vector<std::string> gtids;
+  while (true) {
+    auto chunk = result->Fetch();
+    if (!chunk || chunk->size() == 0) break;
+    for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
+      auto gtid_val = chunk->GetValue(0, row);
+      if (!gtid_val.IsNull()) {
+        gtids.push_back(gtid_val.ToString());
+      }
+    }
+  }
+  if (gtids.empty()) return Status::Ok();
+  std::string error;
+  if (!BuildGtidSetFromList(gtids, out_set, &error)) {
+    return Status::Error(StatusCode::kInvalid,
+                         error.empty() ? "Failed to build GTID set"
+                                       : error);
+  }
+  return Status::Ok();
+}
 
 BinlogApplyState &GetApplyState() {
   static BinlogApplyState state;
@@ -1207,29 +1274,54 @@ Status DuckDBBinlogApplier::ApplyWatermark() {
   if (!apply_txn_.active || !apply_txn_.conn) {
     return Status::Error(StatusCode::kInvalid, "Apply transaction not active");
   }
+  std::string error;
+  if (!EnsureReplStateTable(*apply_txn_.conn, &error)) {
+    return Status::Error(StatusCode::kDuckDBError,
+                         error.empty() ? "Failed to ensure __repl_state"
+                                       : error);
+  }
 
-  const std::string create_sql =
-      "CREATE TABLE IF NOT EXISTS __repl_watermark ("
-      "gtid VARCHAR PRIMARY KEY, "
-      "commit_ts TIMESTAMP)";
-  const std::string delete_sql =
-      "DELETE FROM __repl_watermark WHERE gtid = '" +
-      EscapeLiteral(current_gtid_.value) + "'";
-  const std::string insert_sql =
-      "INSERT INTO __repl_watermark (gtid, commit_ts) VALUES ('" +
-      EscapeLiteral(current_gtid_.value) + "', '" +
-      GetCurrentTimestampString() + "')";
+  bool found = false;
+  std::string snapshot;
+  std::string applied_set;
+  Status st = ReadReplStateRow(*apply_txn_.conn, &snapshot, &applied_set, &found);
+  if (!st.ok()) return st;
+
+  if (!found || applied_set.empty()) {
+    std::string watermark_set;
+    st = LoadWatermarkGtidSet(*apply_txn_.conn, &watermark_set);
+    if (!st.ok()) return st;
+    if (!watermark_set.empty()) {
+      applied_set = std::move(watermark_set);
+    }
+  }
+
+  std::string merged_set;
+  if (!MergeGtidIntoSet(applied_set, current_gtid_.value, &merged_set, &error)) {
+    return Status::Error(StatusCode::kInvalid,
+                         error.empty() ? "Failed to merge GTID" : error);
+  }
+
+  const std::string commit_ts = GetCurrentTimestampString();
+  std::string sql;
+  if (found) {
+    sql =
+        "UPDATE __repl_state SET applied_gtid_set = '" +
+        EscapeLiteral(merged_set) + "', last_commit_ts = '" +
+        EscapeLiteral(commit_ts) + "' WHERE channel = '" +
+        std::string(kReplChannel) + "'";
+  } else {
+    const std::string snapshot_sql =
+        snapshot.empty() ? "NULL" : "'" + EscapeLiteral(snapshot) + "'";
+    sql =
+        "INSERT INTO __repl_state (channel, snapshot_gtid_set, "
+        "applied_gtid_set, last_commit_ts) VALUES ('" +
+        std::string(kReplChannel) + "', " + snapshot_sql + ", '" +
+        EscapeLiteral(merged_set) + "', '" + EscapeLiteral(commit_ts) + "')";
+  }
 
   try {
-    auto result = apply_txn_.conn->Query(create_sql);
-    if (result->HasError()) {
-      return Status::Error(StatusCode::kDuckDBError, result->GetError());
-    }
-    result = apply_txn_.conn->Query(delete_sql);
-    if (result->HasError()) {
-      return Status::Error(StatusCode::kDuckDBError, result->GetError());
-    }
-    result = apply_txn_.conn->Query(insert_sql);
+    auto result = apply_txn_.conn->Query(sql);
     if (result->HasError()) {
       return Status::Error(StatusCode::kDuckDBError, result->GetError());
     }

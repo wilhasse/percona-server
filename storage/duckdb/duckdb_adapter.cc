@@ -28,12 +28,106 @@
 #include <sstream>
 #include <unordered_set>
 
+#include "storage/duckdb/duckdb_gtid_utils.h"
+#include "storage/duckdb/duckdb_repl_state.h"
+
 namespace duckdb_se {
 namespace {
 
 bool IsMissingTableError(const std::string &error, const std::string &table) {
   return error.find("does not exist") != std::string::npos &&
          error.find(table) != std::string::npos;
+}
+
+constexpr const char *kReplChannel = "default";
+
+Status ReadReplStateRow(duckdb::Connection &conn, std::string *snapshot,
+                        std::string *applied, std::string *last_commit_ts,
+                        bool *found) {
+  if (snapshot) snapshot->clear();
+  if (applied) applied->clear();
+  if (last_commit_ts) last_commit_ts->clear();
+  if (found) *found = false;
+  auto result = conn.Query(
+      "SELECT snapshot_gtid_set, applied_gtid_set, last_commit_ts "
+      "FROM __repl_state WHERE channel = '" +
+      std::string(kReplChannel) + "' LIMIT 1");
+  if (result->HasError()) {
+    return Status::Error(StatusCode::kDuckDBError, result->GetError());
+  }
+  auto chunk = result->Fetch();
+  if (!chunk || chunk->size() == 0) {
+    return Status::Ok();
+  }
+  if (found) *found = true;
+  auto snap_val = chunk->GetValue(0, 0);
+  if (snapshot && !snap_val.IsNull()) {
+    *snapshot = snap_val.ToString();
+  }
+  auto applied_val = chunk->GetValue(1, 0);
+  if (applied && !applied_val.IsNull()) {
+    *applied = applied_val.ToString();
+  }
+  auto ts_val = chunk->GetValue(2, 0);
+  if (last_commit_ts && !ts_val.IsNull()) {
+    *last_commit_ts = ts_val.ToString();
+  }
+  return Status::Ok();
+}
+
+Status LoadWatermarkGtidSet(duckdb::Connection &conn, std::string *out_set) {
+  if (!out_set) {
+    return Status::Error(StatusCode::kInvalid, "GTID set output is null");
+  }
+  out_set->clear();
+  auto result =
+      conn.Query("SELECT gtid, commit_ts FROM __repl_watermark ORDER BY commit_ts");
+  if (result->HasError()) {
+    if (IsMissingTableError(result->GetError(), "__repl_watermark")) {
+      return Status::Ok();
+    }
+    return Status::Error(StatusCode::kDuckDBError, result->GetError());
+  }
+  std::vector<std::string> gtids;
+  while (true) {
+    auto chunk = result->Fetch();
+    if (!chunk || chunk->size() == 0) break;
+    for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
+      auto gtid_val = chunk->GetValue(0, row);
+      if (!gtid_val.IsNull()) {
+        gtids.push_back(gtid_val.ToString());
+      }
+    }
+  }
+  if (gtids.empty()) {
+    return Status::Ok();
+  }
+  std::string error;
+  if (!BuildGtidSetFromList(gtids, out_set, &error)) {
+    return Status::Error(StatusCode::kInvalid,
+                         error.empty() ? "Failed to build GTID set"
+                                       : error);
+  }
+  return Status::Ok();
+}
+
+Status PersistReplStateFromWatermark(duckdb::Connection &conn,
+                                     const std::string &applied_set) {
+  if (applied_set.empty()) return Status::Ok();
+  bool found = false;
+  Status st = ReadReplStateRow(conn, nullptr, nullptr, nullptr, &found);
+  if (!st.ok()) return st;
+  if (found) return Status::Ok();
+  const std::string sql =
+      "INSERT INTO __repl_state (channel, snapshot_gtid_set, "
+      "applied_gtid_set, last_commit_ts) VALUES ('" +
+      std::string(kReplChannel) + "', NULL, '" + EscapeReplStateLiteral(applied_set) +
+      "', CURRENT_TIMESTAMP)";
+  auto result = conn.Query(sql);
+  if (result->HasError()) {
+    return Status::Error(StatusCode::kDuckDBError, result->GetError());
+  }
+  return Status::Ok();
 }
 
 bool StartsWithCI(const std::string &input, const char *prefix) {
@@ -1156,23 +1250,27 @@ Status DuckDBAdapter::GetLatestWatermark(Gtid *gtid) {
   if (!st.ok()) return st;
 
   try {
-    auto result = conn_->Query(
-        "SELECT gtid FROM __repl_watermark "
-        "ORDER BY commit_ts DESC LIMIT 1");
-    if (result->HasError()) {
-      if (IsMissingTableError(result->GetError(), "__repl_watermark")) {
-        return Status::Ok();
+    std::string error;
+    if (!EnsureReplStateTable(*conn_, &error)) {
+      return Status::Error(StatusCode::kDuckDBError,
+                           error.empty() ? "Failed to ensure __repl_state"
+                                         : error);
+    }
+    bool found = false;
+    std::string applied;
+    st = ReadReplStateRow(*conn_, nullptr, &applied, nullptr, &found);
+    if (!st.ok()) return st;
+    if (!found || applied.empty()) {
+      std::string fallback;
+      st = LoadWatermarkGtidSet(*conn_, &fallback);
+      if (!st.ok()) return st;
+      if (!fallback.empty() && !found) {
+        Status persist = PersistReplStateFromWatermark(*conn_, fallback);
+        if (!persist.ok()) return persist;
       }
-      return Status::Error(StatusCode::kDuckDBError, result->GetError());
+      applied = std::move(fallback);
     }
-    auto chunk = result->Fetch();
-    if (!chunk || chunk->size() == 0) {
-      return Status::Ok();
-    }
-    auto val = chunk->GetValue(0, 0);
-    if (!val.IsNull()) {
-      gtid->value = val.ToString();
-    }
+    gtid->value = applied;
   } catch (const std::exception &ex) {
     return Status::Error(StatusCode::kDuckDBError, ex.what());
   }
@@ -1190,27 +1288,30 @@ Status DuckDBAdapter::GetAppliedGtids(std::vector<Gtid> *gtids) {
   if (!st.ok()) return st;
 
   try {
-    auto result = conn_->Query(
-        "SELECT gtid FROM __repl_watermark ORDER BY commit_ts");
-    if (result->HasError()) {
-      if (IsMissingTableError(result->GetError(), "__repl_watermark")) {
-        return Status::Ok();
-      }
-      return Status::Error(StatusCode::kDuckDBError, result->GetError());
+    std::string error;
+    if (!EnsureReplStateTable(*conn_, &error)) {
+      return Status::Error(StatusCode::kDuckDBError,
+                           error.empty() ? "Failed to ensure __repl_state"
+                                         : error);
     }
-    while (true) {
-      auto chunk = result->Fetch();
-      if (!chunk || chunk->size() == 0) {
-        break;
+    bool found = false;
+    std::string applied;
+    st = ReadReplStateRow(*conn_, nullptr, &applied, nullptr, &found);
+    if (!st.ok()) return st;
+    if (!found || applied.empty()) {
+      std::string fallback;
+      st = LoadWatermarkGtidSet(*conn_, &fallback);
+      if (!st.ok()) return st;
+      if (!fallback.empty() && !found) {
+        Status persist = PersistReplStateFromWatermark(*conn_, fallback);
+        if (!persist.ok()) return persist;
       }
-      for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
-        auto val = chunk->GetValue(0, row);
-        if (!val.IsNull()) {
-          Gtid entry;
-          entry.value = val.ToString();
-          gtids->push_back(std::move(entry));
-        }
-      }
+      applied = std::move(fallback);
+    }
+    if (!applied.empty()) {
+      Gtid entry;
+      entry.value = applied;
+      gtids->push_back(std::move(entry));
     }
   } catch (const std::exception &ex) {
     return Status::Error(StatusCode::kDuckDBError, ex.what());
@@ -1229,20 +1330,34 @@ Status DuckDBAdapter::IsGtidApplied(const Gtid &gtid, bool *applied) {
   if (!st.ok()) return st;
 
   try {
-    const std::string sql =
-        "SELECT 1 FROM __repl_watermark WHERE gtid = '" +
-        EscapeLiteral(gtid.value) + "' LIMIT 1";
-    auto result = conn_->Query(sql);
-    if (result->HasError()) {
-      if (IsMissingTableError(result->GetError(), "__repl_watermark")) {
-        return Status::Ok();
+    std::string error;
+    if (!EnsureReplStateTable(*conn_, &error)) {
+      return Status::Error(StatusCode::kDuckDBError,
+                           error.empty() ? "Failed to ensure __repl_state"
+                                         : error);
+    }
+    bool found = false;
+    std::string applied_set;
+    st = ReadReplStateRow(*conn_, nullptr, &applied_set, nullptr, &found);
+    if (!st.ok()) return st;
+    if (!found || applied_set.empty()) {
+      std::string fallback;
+      st = LoadWatermarkGtidSet(*conn_, &fallback);
+      if (!st.ok()) return st;
+      if (!fallback.empty() && !found) {
+        Status persist = PersistReplStateFromWatermark(*conn_, fallback);
+        if (!persist.ok()) return persist;
       }
-      return Status::Error(StatusCode::kDuckDBError, result->GetError());
+      applied_set = std::move(fallback);
     }
-    auto chunk = result->Fetch();
-    if (chunk && chunk->size() > 0) {
-      *applied = true;
+    if (applied_set.empty()) return Status::Ok();
+    bool contains = false;
+    if (!GtidSetContains(applied_set, gtid.value, &contains, &error)) {
+      return Status::Error(StatusCode::kInvalid,
+                           error.empty() ? "Failed to parse GTID set"
+                                         : error);
     }
+    *applied = contains;
   } catch (const std::exception &ex) {
     return Status::Error(StatusCode::kDuckDBError, ex.what());
   }

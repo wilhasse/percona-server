@@ -61,6 +61,7 @@
 #include "storage/duckdb/duckdb_binlog_applier.h"
 #include "storage/duckdb/duckdb_binlog_apply_thread.h"
 #include "storage/duckdb/duckdb_compat.h"
+#include "storage/duckdb/duckdb_repl_state.h"
 #include "sql/field.h"
 #include "sql/table.h"
 #include "sql_string.h"
@@ -571,20 +572,17 @@ std::string capture_snapshot_gtid() {
 
 bool store_snapshot_gtid(duckdb::Connection &con,
                          const std::string &snapshot_gtid) {
-  auto state_result = con.Query(
-      "CREATE TABLE IF NOT EXISTS __repl_state ("
-      "id INTEGER PRIMARY KEY, "
-      "snapshot_gtid_set VARCHAR, "
-      "updated_ts TIMESTAMP)");
-  if (state_result->HasError()) return false;
+  std::string error;
+  if (!duckdb_se::EnsureReplStateTable(con, &error)) return false;
 
   const std::string sql =
-      "INSERT INTO __repl_state (id, snapshot_gtid_set, updated_ts) "
-      "VALUES (1, " +
-      value_to_sql(duckdb::Value(snapshot_gtid)) + ", CURRENT_TIMESTAMP) "
-      "ON CONFLICT(id) DO UPDATE SET "
+      "INSERT INTO __repl_state (channel, snapshot_gtid_set, last_commit_ts) "
+      "VALUES ('default', " +
+      value_to_sql(duckdb::Value(snapshot_gtid)) +
+      ", CURRENT_TIMESTAMP) "
+      "ON CONFLICT(channel) DO UPDATE SET "
       "snapshot_gtid_set = excluded.snapshot_gtid_set, "
-      "updated_ts = excluded.updated_ts";
+      "last_commit_ts = excluded.last_commit_ts";
   auto upsert_result = con.Query(sql);
   return !upsert_result->HasError();
 }
