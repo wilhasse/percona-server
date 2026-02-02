@@ -907,6 +907,11 @@ bool store_duckdb_result_value(THD *thd, Item *item, Item_cache *cache,
 static bool DuckdbExecuteQuery(JOIN *join, Query_result *query_result) {
   if (join == nullptr || query_result == nullptr) return true;
   THD *thd = join->thd;
+  if (thd == nullptr || thd->lex == nullptr) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "DuckDB thread context missing");
+    return true;
+  }
   if (join->fields == nullptr) {
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
              "DuckDB select list not available");
@@ -932,33 +937,23 @@ static bool DuckdbExecuteQuery(JOIN *join, Query_result *query_result) {
       return true;
     }
 
-    std::vector<Item *> visible_items;
-    std::string field_reason;
-    if (!collect_visible_fields(*join->fields, &visible_items, &field_reason)) {
-      const std::string err =
-          field_reason.empty()
-              ? "DuckDB select list could not be enumerated"
-              : field_reason;
-      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), err.c_str());
-      return true;
-    }
-
-    const size_t field_count = visible_items.size();
-    if (result->ColumnCount() != field_count) {
-      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-               "DuckDB result column count mismatch");
-      return true;
-    }
+    size_t field_count = 0;
 
     std::vector<Item *> out_items;
     std::vector<Item_cache *> out_caches;
     std::vector<std::unique_ptr<Item_cache>> cache_storage;
     mem_root_deque<Item *> cache_items(thd->mem_root);
-    out_items.reserve(field_count);
-    out_caches.reserve(field_count);
-    cache_storage.reserve(field_count);
 
-    for (Item *item : visible_items) {
+    for (Item *item : *join->fields) {
+      if (item == nullptr) {
+        my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+                 "DuckDB select list contains null item");
+        return true;
+      }
+      if (item->hidden) {
+        cache_items.push_back(item);
+        continue;
+      }
       std::string reason;
       Item_cache *cache = create_duckdb_output_cache(item, &reason);
       if (cache == nullptr) {
@@ -977,6 +972,18 @@ static bool DuckdbExecuteQuery(JOIN *join, Query_result *query_result) {
       cache_items.push_back(cache);
       out_items.push_back(item);
       out_caches.push_back(cache);
+      ++field_count;
+    }
+
+    if (field_count == 0) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               "DuckDB select list is empty");
+      return true;
+    }
+    if (result->ColumnCount() != field_count) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               "DuckDB result column count mismatch");
+      return true;
     }
 
     ha_rows sent = 0;
