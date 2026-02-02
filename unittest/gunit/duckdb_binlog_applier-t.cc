@@ -223,6 +223,24 @@ int64_t QueryCount(DuckDBAdapter &adapter, const std::string &sql) {
   return chunk->GetValue(0, 0).GetValue<int64_t>();
 }
 
+int64_t QueryChecksum(DuckDBAdapter &adapter) {
+  const std::string sql =
+      "SELECT COALESCE(SUM(CAST(\"id\" AS BIGINT)), 0) + "
+      "COALESCE(SUM(LENGTH(\"val\")), 0) FROM t";
+  SessionCtx ctx;
+  auto result = adapter.ExecuteQuery(sql, ctx);
+  if (!result.ok || !result.result) {
+    ADD_FAILURE() << "DuckDB query failed: " << result.error;
+    return 0;
+  }
+  auto chunk = result.result->Fetch();
+  if (!chunk || chunk->size() == 0) {
+    ADD_FAILURE() << "DuckDB checksum query returned no rows";
+    return 0;
+  }
+  return chunk->GetValue(0, 0).GetValue<int64_t>();
+}
+
 duckdb::Value QuerySingleValue(DuckDBAdapter &adapter,
                                const std::string &sql) {
   SessionCtx ctx;
@@ -253,6 +271,7 @@ TEST(DuckDBBinlogApplierTest, RestartPersistsDataAndWatermark) {
   ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(1)}));
   ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
   ExpectOk(applier.CommitTransaction());
+  const int64_t checksum_before = QueryChecksum(adapter);
   adapter.Shutdown();
 
   DuckDBAdapter reader;
@@ -260,6 +279,7 @@ TEST(DuckDBBinlogApplierTest, RestartPersistsDataAndWatermark) {
   ro_cfg.read_only = true;
   ExpectOk(reader.Init(path, ro_cfg));
   EXPECT_EQ(1, QueryCount(reader, "SELECT COUNT(*) FROM t"));
+  EXPECT_EQ(checksum_before, QueryChecksum(reader));
 
   Gtid latest;
   ExpectOk(reader.GetLatestWatermark(&latest));
@@ -286,6 +306,7 @@ TEST(DuckDBBinlogApplierTest, KillDuringApplyKeepsCommittedData) {
   ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(1)}));
   ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
   ExpectOk(applier.CommitTransaction());
+  const int64_t checksum_before = QueryChecksum(adapter);
   adapter.Shutdown();
 
   int pipe_fds[2];
@@ -332,6 +353,7 @@ TEST(DuckDBBinlogApplierTest, KillDuringApplyKeepsCommittedData) {
   ro_cfg.read_only = true;
   ExpectOk(reader.Init(path, ro_cfg));
   EXPECT_EQ(1, QueryCount(reader, "SELECT COUNT(*) FROM t"));
+  EXPECT_EQ(checksum_before, QueryChecksum(reader));
 
   Gtid latest;
   ExpectOk(reader.GetLatestWatermark(&latest));
@@ -356,6 +378,7 @@ TEST(DuckDBBinlogApplierTest, IdempotentReplaySkipsAppliedGtid) {
   ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(10)}));
   ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
   ExpectOk(applier.CommitTransaction());
+  const int64_t checksum_before = QueryChecksum(adapter);
 
   // Reapply the same GTID with a different row: should be ignored.
   ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(10)}));
@@ -363,6 +386,7 @@ TEST(DuckDBBinlogApplierTest, IdempotentReplaySkipsAppliedGtid) {
   ExpectOk(applier.CommitTransaction());
 
   EXPECT_EQ(1, QueryCount(adapter, "SELECT COUNT(*) FROM t"));
+  EXPECT_EQ(checksum_before, QueryChecksum(adapter));
 
   Gtid latest;
   ExpectOk(adapter.GetLatestWatermark(&latest));
