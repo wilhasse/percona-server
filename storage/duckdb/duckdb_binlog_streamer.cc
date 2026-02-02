@@ -136,6 +136,24 @@ bool QuerySingleStringValue(MYSQL *mysql, const char *sql,
   return success;
 }
 
+bool ConfigureBinlogChecksum(MYSQL *mysql, std::string *error_out) {
+  if (!mysql) return false;
+  std::string checksum;
+  if (!QuerySingleStringValue(mysql, "SELECT @@GLOBAL.binlog_checksum",
+                              &checksum)) {
+    checksum = "NONE";
+  }
+  if (checksum.empty()) checksum = "NONE";
+  const std::string sql =
+      "SET @master_binlog_checksum = '" + checksum +
+      "', @source_binlog_checksum = '" + checksum + "'";
+  if (mysql_real_query(mysql, sql.c_str(), sql.size()) != 0) {
+    if (error_out) *error_out = mysql_error(mysql);
+    return false;
+  }
+  return true;
+}
+
 // Validate required binlog configuration on the source server
 duckdb_se::Status ValidateBinlogConfig(MYSQL *mysql, bool require_gtid) {
   std::string value;
@@ -263,15 +281,14 @@ Status DuckDBBinlogStreamer::Open(const BinlogStreamOptions &options) {
     current_binlog_pos_ = options_.start_position;
   }
 
-  const std::string checksum_sql =
-      "SET @master_binlog_checksum = 'NONE', "
-      "@source_binlog_checksum = 'NONE'";
-  if (mysql_real_query(mysql_, checksum_sql.c_str(), checksum_sql.size()) != 0) {
-    const std::string msg = mysql_error(mysql_);
-    mysql_close(mysql_);
-    mysql_ = nullptr;
-    return Status::Error(StatusCode::kInvalid,
-                         "Failed to set binlog checksum: " + msg);
+  {
+    std::string error;
+    if (!ConfigureBinlogChecksum(mysql_, &error)) {
+      mysql_close(mysql_);
+      mysql_ = nullptr;
+      return Status::Error(StatusCode::kInvalid,
+                           "Failed to set binlog checksum: " + error);
+    }
   }
 
   rpl_ = MYSQL_RPL{};
@@ -282,7 +299,7 @@ Status DuckDBBinlogStreamer::Open(const BinlogStreamOptions &options) {
   rpl_.start_position = options_.start_position == 0 ? 4
                                                     : options_.start_position;
   rpl_.server_id = options_.server_id;
-  rpl_.flags = MYSQL_RPL_SKIP_HEARTBEAT;
+  rpl_.flags = USE_HEARTBEAT_EVENT_V2;
   if (use_gtid_) {
     rpl_.flags |= MYSQL_RPL_GTID;
   }
