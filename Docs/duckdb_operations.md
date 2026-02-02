@@ -29,6 +29,10 @@
 - Use `SECONDARY_UNLOAD` to discard the DuckDB copy before reloading.
 - After backfill, the binlog applier keeps the DuckDB table in sync.
 
+## DuckDB File Location
+- Default per-schema files live under `@@datadir`.
+- Override the base directory at startup with `duckdb_db_dir=/path`.
+
 ## Resume After Stop-at-GTID
 - Clear the GTID stop and resume:
   `SET GLOBAL duckdb_binlog_apply_stop_at_gtid = '';`

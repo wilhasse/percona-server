@@ -68,6 +68,8 @@
 #include "template_utils.h"
 #include "thr_lock.h"
 
+static char *duckdb_db_dir = nullptr;
+
 namespace {
 
 struct DuckdbTableState {
@@ -110,6 +112,11 @@ class LoadedTables {
 };
 
 LoadedTables *loaded_tables{nullptr};
+
+struct QualifiedTableRef {
+  std::string db;
+  std::string table;
+};
 
 class Duckdb_execution_context : public Secondary_engine_execution_context {
  public:
@@ -505,7 +512,11 @@ std::string build_where_clause(const std::vector<Field *> &fields,
 }
 
 std::string default_duckdb_path(const TABLE_SHARE *share) {
-  std::string dir = mysql_real_data_home;
+  const char *base_dir =
+      (duckdb_db_dir != nullptr && duckdb_db_dir[0] != '\0')
+          ? duckdb_db_dir
+          : mysql_real_data_home;
+  std::string dir = base_dir ? base_dir : "";
   if (!dir.empty() && dir.back() != FN_LIBCHAR) dir.push_back(FN_LIBCHAR);
   std::string file;
   file.append(share->db.str, share->db.length);
@@ -604,13 +615,29 @@ bool match_ci(const std::string &sql, size_t pos, const std::string &token) {
   return true;
 }
 
-std::string rewrite_qualified_table(std::string sql, const std::string &db,
-                                    const std::string &table) {
-  if (db.empty() || table.empty()) return sql;
+std::string rewrite_qualified_tables(
+    std::string sql, const std::vector<QualifiedTableRef> &tables) {
+  if (tables.empty()) return sql;
 
-  const std::string quoted_table = quote_ident(table.c_str(), table.size());
-  const std::string quoted_db = quote_ident(db.c_str(), db.size());
-  const std::string quoted_pattern = quoted_db + "." + quoted_table;
+  struct Pattern {
+    std::string db;
+    std::string table;
+    std::string quoted_table;
+    std::string quoted_pattern;
+  };
+  std::vector<Pattern> patterns;
+  patterns.reserve(tables.size());
+  for (const auto &entry : tables) {
+    if (entry.db.empty() || entry.table.empty()) continue;
+    Pattern pattern;
+    pattern.db = entry.db;
+    pattern.table = entry.table;
+    pattern.quoted_table = quote_ident(entry.table.c_str(), entry.table.size());
+    const std::string quoted_db = quote_ident(entry.db.c_str(), entry.db.size());
+    pattern.quoted_pattern = quoted_db + "." + pattern.quoted_table;
+    patterns.emplace_back(std::move(pattern));
+  }
+  if (patterns.empty()) return sql;
 
   std::string out;
   out.reserve(sql.size());
@@ -636,27 +663,32 @@ std::string rewrite_qualified_table(std::string sql, const std::string &db,
       continue;
     }
 
-    if (match_ci(sql, i, quoted_pattern)) {
-      out.append(quoted_table);
-      i += quoted_pattern.size();
-      continue;
-    }
-
-    if (match_ci(sql, i, db)) {
-      const size_t db_end = i + db.size();
-      if (db_end < len && sql[db_end] == '.' &&
-          match_ci(sql, db_end + 1, table)) {
-        const size_t table_end = db_end + 1 + table.size();
-        const bool left_ok = (i == 0) || !is_ident_char(sql[i - 1]);
-        const bool right_ok =
-            (table_end >= len) || !is_ident_char(sql[table_end]);
-        if (left_ok && right_ok) {
-          out.append(table);
-          i = table_end;
-          continue;
+    bool matched = false;
+    for (const auto &pattern : patterns) {
+      if (match_ci(sql, i, pattern.quoted_pattern)) {
+        out.append(pattern.quoted_table);
+        i += pattern.quoted_pattern.size();
+        matched = true;
+        break;
+      }
+      if (match_ci(sql, i, pattern.db)) {
+        const size_t db_end = i + pattern.db.size();
+        if (db_end < len && sql[db_end] == '.' &&
+            match_ci(sql, db_end + 1, pattern.table)) {
+          const size_t table_end = db_end + 1 + pattern.table.size();
+          const bool left_ok = (i == 0) || !is_ident_char(sql[i - 1]);
+          const bool right_ok =
+              (table_end >= len) || !is_ident_char(sql[table_end]);
+          if (left_ok && right_ok) {
+            out.append(pattern.table);
+            i = table_end;
+            matched = true;
+            break;
+          }
         }
       }
     }
+    if (matched) continue;
 
     out.push_back(ch);
     ++i;
@@ -664,10 +696,12 @@ std::string rewrite_qualified_table(std::string sql, const std::string &db,
   return out;
 }
 
-bool is_simple_select(LEX *lex, Table_ref **base_table,
-                      std::string *reason) {
+bool is_simple_select(LEX *lex, Table_ref **base_table, std::string *reason,
+                      std::string *schema_out, std::string *path_out) {
   if (lex == nullptr || base_table == nullptr) return false;
   *base_table = nullptr;
+  if (schema_out) schema_out->clear();
+  if (path_out) path_out->clear();
 
   if (lex->sql_command != SQLCOM_SELECT) {
     if (reason) *reason = "Only SELECT statements are supported";
@@ -684,6 +718,8 @@ bool is_simple_select(LEX *lex, Table_ref **base_table,
   }
 
   int base_count = 0;
+  std::string base_schema;
+  std::string base_path;
   for (Table_ref *tl = lex->query_tables; tl != nullptr; tl = tl->next_global) {
     if (tl->is_placeholder()) continue;
     if (tl->is_view_or_derived()) {
@@ -694,16 +730,84 @@ bool is_simple_select(LEX *lex, Table_ref **base_table,
       if (reason) *reason = "Schema tables are not supported";
       return false;
     }
-    *base_table = tl;
+
+    if (tl->table == nullptr || tl->table->s == nullptr) {
+      if (reason) *reason = "Table metadata not available for DuckDB offload";
+      return false;
+    }
+
+    std::string schema;
+    if (tl->db != nullptr && tl->db_length > 0) {
+      schema.assign(tl->db, tl->db_length);
+    } else if (tl->table->s->db.str != nullptr &&
+               tl->table->s->db.length > 0) {
+      schema.assign(tl->table->s->db.str, tl->table->s->db.length);
+    }
+    const std::string path = resolve_duckdb_path(tl->table->s);
+
+    if (base_count == 0) {
+      *base_table = tl;
+      base_schema = schema;
+      base_path = path;
+    } else {
+      if (!base_schema.empty() && !schema.empty() && base_schema != schema) {
+        if (reason)
+          *reason = "DuckDB offload requires tables in the same schema";
+        return false;
+      }
+      if (!base_path.empty() && !path.empty() && base_path != path) {
+        if (reason)
+          *reason =
+              "DuckDB offload requires tables in the same DuckDB database";
+        return false;
+      }
+    }
+
     ++base_count;
   }
 
-  if (base_count != 1) {
-    if (reason) *reason = "Only single-table SELECT is supported";
+  if (base_count == 0) {
+    if (reason) *reason = "No base tables found for DuckDB offload";
     return false;
   }
 
+  if (schema_out) *schema_out = base_schema;
+  if (path_out) *path_out = base_path;
+
   return true;
+}
+
+std::vector<QualifiedTableRef> collect_query_tables(LEX *lex) {
+  std::vector<QualifiedTableRef> tables;
+  if (lex == nullptr) return tables;
+  for (Table_ref *tl = lex->query_tables; tl != nullptr; tl = tl->next_global) {
+    if (tl->is_placeholder()) continue;
+    if (tl->is_view_or_derived()) continue;
+    if (tl->schema_table != nullptr) continue;
+    if (tl->table == nullptr || tl->table->s == nullptr) continue;
+
+    std::string schema;
+    if (tl->db != nullptr && tl->db_length > 0) {
+      schema.assign(tl->db, tl->db_length);
+    } else if (tl->table->s->db.str != nullptr &&
+               tl->table->s->db.length > 0) {
+      schema.assign(tl->table->s->db.str, tl->table->s->db.length);
+    }
+
+    std::string table_name;
+    if (tl->table_name != nullptr && tl->table_name_length > 0) {
+      table_name.assign(tl->table_name, tl->table_name_length);
+    } else if (tl->table->s->table_name.str != nullptr &&
+               tl->table->s->table_name.length > 0) {
+      table_name.assign(tl->table->s->table_name.str,
+                        tl->table->s->table_name.length);
+    }
+
+    if (!schema.empty() && !table_name.empty()) {
+      tables.push_back(QualifiedTableRef{schema, table_name});
+    }
+  }
+  return tables;
 }
 
 bool uses_supported_select_items(const mem_root_deque<Item *> &fields,
@@ -934,8 +1038,11 @@ static bool PrepareSecondaryEngine(THD *thd, LEX *lex) {
   lex->set_secondary_engine_execution_context(ctx);
 
   Table_ref *base_table = nullptr;
+  std::string query_schema;
+  std::string duckdb_path;
   std::string reason;
-  if (!is_simple_select(lex, &base_table, &reason)) {
+  if (!is_simple_select(lex, &base_table, &reason, &query_schema,
+                        &duckdb_path)) {
     ctx->eligible = false;
     ctx->fail_reason = reason.empty() ? "Query not eligible for DuckDB" : reason;
     return false;
@@ -948,8 +1055,13 @@ static bool PrepareSecondaryEngine(THD *thd, LEX *lex) {
     return false;
   }
 
-  if (base_table->db != nullptr && base_table->db_length > 0) {
+  if (!query_schema.empty()) {
+    ctx->db = query_schema;
+  } else if (base_table->db != nullptr && base_table->db_length > 0) {
     ctx->db.assign(base_table->db, base_table->db_length);
+  } else if (base_table->table->s->db.str != nullptr &&
+             base_table->table->s->db.length > 0) {
+    ctx->db.assign(base_table->table->s->db.str, base_table->table->s->db.length);
   } else {
     ctx->db.clear();
   }
@@ -958,7 +1070,8 @@ static bool PrepareSecondaryEngine(THD *thd, LEX *lex) {
   } else {
     ctx->table.clear();
   }
-  ctx->db_path = resolve_duckdb_path(base_table->table->s);
+  ctx->db_path =
+      !duckdb_path.empty() ? duckdb_path : resolve_duckdb_path(base_table->table->s);
   ctx->base_table = base_table->table;
   ctx->eligible = true;
 
@@ -1004,8 +1117,8 @@ static bool OptimizeSecondaryEngine(THD *thd, LEX *lex) {
     thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
     return true;
   }
-  ctx->sql =
-      rewrite_qualified_table(std::move(rewrite.sql), ctx->db, ctx->table);
+  const auto tables = collect_query_tables(lex);
+  ctx->sql = rewrite_qualified_tables(std::move(rewrite.sql), tables);
 
   try {
     duckdb::DBConfig config(true);
@@ -1618,6 +1731,7 @@ static duckdb_se::BinlogApplyThreadOptions duckdb_make_binlog_apply_options() {
   options.schema_filter = duckdb_binlog_apply_schema_filter
                               ? duckdb_binlog_apply_schema_filter
                               : "";
+  options.duckdb_dir = duckdb_db_dir ? duckdb_db_dir : "";
   return options;
 }
 
@@ -1673,6 +1787,11 @@ static MYSQL_SYSVAR_BOOL(
     binlog_apply_enabled, duckdb_binlog_apply_enabled, PLUGIN_VAR_RQCMDARG,
     "Enable DuckDB binlog applier thread.",
     nullptr, duckdb_binlog_apply_enabled_update, true);
+
+static MYSQL_SYSVAR_STR(
+    db_dir, duckdb_db_dir, PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
+    "Base directory for per-schema DuckDB files (empty uses @@datadir).",
+    nullptr, nullptr, "");
 
 static MYSQL_SYSVAR_STR(
     binlog_apply_host, duckdb_binlog_apply_host,
@@ -1750,6 +1869,7 @@ static MYSQL_SYSVAR_STR(
     nullptr, duckdb_binlog_apply_stop_at_gtid_update, "");
 
 static SYS_VAR *duckdb_system_variables[] = {
+    MYSQL_SYSVAR(db_dir),
     MYSQL_SYSVAR(binlog_apply_enabled),
     MYSQL_SYSVAR(binlog_apply_host),
     MYSQL_SYSVAR(binlog_apply_user),

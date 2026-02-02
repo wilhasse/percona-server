@@ -101,6 +101,16 @@ while (primary->ha_rnd_next(record) == 0) {
 After the initial load, the DuckDB binlog applier keeps the tables inside the
 schema-level `.duckdb` database in sync with changes on the primary.
 
+## Multi-table Queries
+DuckDB offload can run multi-table SELECTs when all referenced tables resolve
+to the same DuckDB database file (default: per-schema `<schema>.duckdb`).
+If you override paths with `SECONDARY_ENGINE_ATTRIBUTE`, ensure every table in
+the query points to the same file. Cross-schema joins are not yet offloaded.
+
+## DuckDB File Location
+By default, per-schema DuckDB files live under `@@datadir`. To store them
+elsewhere, configure `duckdb_db_dir` at startup (e.g., in `my.cnf`).
+
 ## Legacy Per-table Layout
 If you need to keep existing per-table DuckDB files, set
 `SECONDARY_ENGINE_ATTRIBUTE` to an explicit `.duckdb` path when creating or

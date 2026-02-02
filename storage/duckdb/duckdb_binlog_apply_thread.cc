@@ -71,8 +71,12 @@ ApplyThreadState &GetThreadState() {
   return state;
 }
 
-std::string DuckdbPathForSchema(const std::string &schema) {
-  std::string dir = mysql_real_data_home;
+std::string DuckdbPathForSchema(const BinlogApplyThreadOptions &options,
+                                const std::string &schema) {
+  const char *base_dir = options.duckdb_dir.empty()
+                             ? mysql_real_data_home
+                             : options.duckdb_dir.c_str();
+  std::string dir = base_dir ? base_dir : "";
   if (!dir.empty() && dir.back() != FN_LIBCHAR) dir.push_back(FN_LIBCHAR);
   return dir + schema + ".duckdb";
 }
@@ -180,7 +184,8 @@ Status ResolveReplState(const BinlogApplyThreadOptions &options,
   state->source_path.clear();
 
   if (!options.schema_filter.empty()) {
-    const std::string path = DuckdbPathForSchema(options.schema_filter);
+    const std::string path =
+        DuckdbPathForSchema(options, options.schema_filter);
     if (std::filesystem::exists(path)) {
       return LoadReplStateFromFile(path, state);
     }
@@ -494,7 +499,7 @@ Status EnsureSchemaApplier(const std::string &schema,
     entry.adapter = std::make_unique<DuckDBAdapter>();
     DuckDBConfig cfg;
     cfg.read_only = false;
-    const std::string path = DuckdbPathForSchema(schema);
+    const std::string path = DuckdbPathForSchema(options, schema);
     Status st = entry.adapter->Init(path, cfg);
     if (!st.ok()) return st;
     entry.applier = std::make_unique<DuckDBBinlogApplier>(entry.adapter.get());

@@ -39,6 +39,7 @@ struct BinlogApplyThreadOptions {
   uint32_t server_id{0};
   std::string start_gtid_set;
   std::string schema_filter;
+  std::string duckdb_dir;
 };
 
 bool StartBinlogApplyThread(const BinlogApplyThreadOptions &options);
