@@ -55,6 +55,72 @@ std::string CurrentTimestampLiteral() {
   return buf;
 }
 
+bool IsValidUtf8(const std::string &value) {
+  const unsigned char *data =
+      reinterpret_cast<const unsigned char *>(value.data());
+  size_t i = 0;
+  const size_t len = value.size();
+  while (i < len) {
+    unsigned char c = data[i];
+    if (c <= 0x7F) {
+      ++i;
+      continue;
+    }
+    size_t needed = 0;
+    if ((c & 0xE0) == 0xC0) {
+      needed = 1;
+      if (c < 0xC2) return false;  // overlong
+    } else if ((c & 0xF0) == 0xE0) {
+      needed = 2;
+    } else if ((c & 0xF8) == 0xF0) {
+      needed = 3;
+      if (c > 0xF4) return false;
+    } else {
+      return false;
+    }
+    if (i + needed >= len) return false;
+    for (size_t j = 1; j <= needed; ++j) {
+      if ((data[i + j] & 0xC0) != 0x80) return false;
+    }
+    i += needed + 1;
+  }
+  return true;
+}
+
+std::string Latin1ToUtf8(const std::string &value) {
+  std::string out;
+  out.reserve(value.size() * 2);
+  for (unsigned char ch : value) {
+    if (ch < 0x80) {
+      out.push_back(static_cast<char>(ch));
+    } else {
+      out.push_back(static_cast<char>(0xC0 | (ch >> 6)));
+      out.push_back(static_cast<char>(0x80 | (ch & 0x3F)));
+    }
+  }
+  return out;
+}
+
+Status AppendCellValue(duckdb::Appender &appender, const Cell &cell) {
+  if (cell.is_null) {
+    appender.Append(duckdb::Value());
+    return Status::Ok();
+  }
+  if (cell.is_blob) {
+    appender.Append(duckdb::Value::BLOB(cell.value));
+    return Status::Ok();
+  }
+  if (IsValidUtf8(cell.value)) {
+    appender.Append(cell.value.c_str(),
+                    static_cast<uint32_t>(cell.value.size()));
+    return Status::Ok();
+  }
+  const std::string converted = Latin1ToUtf8(cell.value);
+  appender.Append(converted.c_str(),
+                  static_cast<uint32_t>(converted.size()));
+  return Status::Ok();
+}
+
 bool IsMissingTableError(const std::string &error, const std::string &table) {
   return error.find("does not exist") != std::string::npos &&
          error.find(table) != std::string::npos;
@@ -1147,14 +1213,8 @@ Status DuckDBAdapter::AppendRows(ApplyTxn &txn, TableId table, RowBatch batch) {
     for (const auto &row : batch.rows) {
       appender->BeginRow();
       for (const auto &cell : row) {
-        if (cell.is_null) {
-          appender->Append(duckdb::Value());
-        } else if (cell.is_blob) {
-          appender->Append(duckdb::Value::BLOB(cell.value));
-        } else {
-          appender->Append(cell.value.c_str(),
-                           static_cast<uint32_t>(cell.value.size()));
-        }
+        Status st = AppendCellValue(*appender, cell);
+        if (!st.ok()) return st;
       }
       appender->EndRow();
     }
@@ -1212,14 +1272,8 @@ Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
     for (const auto &row : batch.old_rows) {
       appender->BeginRow();
       for (const auto &cell : row) {
-        if (cell.is_null) {
-          appender->Append(duckdb::Value());
-        } else if (cell.is_blob) {
-          appender->Append(duckdb::Value::BLOB(cell.value));
-        } else {
-          appender->Append(cell.value.c_str(),
-                           static_cast<uint32_t>(cell.value.size()));
-        }
+        Status st = AppendCellValue(*appender, cell);
+        if (!st.ok()) return st;
       }
       appender->EndRow();
     }
@@ -1304,14 +1358,8 @@ Status DuckDBAdapter::ApplyBulkDeletes(ApplyTxn &txn, TableId table,
     for (const auto &row : batch.old_rows) {
       appender->BeginRow();
       for (const auto &cell : row) {
-        if (cell.is_null) {
-          appender->Append(duckdb::Value());
-        } else if (cell.is_blob) {
-          appender->Append(duckdb::Value::BLOB(cell.value));
-        } else {
-          appender->Append(cell.value.c_str(),
-                           static_cast<uint32_t>(cell.value.size()));
-        }
+        Status st = AppendCellValue(*appender, cell);
+        if (!st.ok()) return st;
       }
       appender->EndRow();
     }
