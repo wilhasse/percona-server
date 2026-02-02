@@ -142,9 +142,9 @@ bool ConfigureBinlogChecksum(MYSQL *mysql, std::string *error_out,
   std::string checksum;
   if (!QuerySingleStringValue(mysql, "SELECT @@GLOBAL.binlog_checksum",
                               &checksum)) {
-    checksum = "NONE";
+    checksum = "CRC32";
   }
-  if (checksum.empty()) checksum = "NONE";
+  if (checksum.empty()) checksum = "CRC32";
   if (alg_out) {
     std::string upper = checksum;
     std::transform(upper.begin(), upper.end(), upper.begin(),
@@ -232,7 +232,8 @@ duckdb_se::Status ValidateBinlogConfig(MYSQL *mysql, bool require_gtid) {
 
 namespace duckdb_se {
 
-DuckDBBinlogStreamer::DuckDBBinlogStreamer() = default;
+DuckDBBinlogStreamer::DuckDBBinlogStreamer()
+    : checksum_alg_(binary_log::BINLOG_CHECKSUM_ALG_CRC32) {}
 
 DuckDBBinlogStreamer::~DuckDBBinlogStreamer() { (void)Close(); }
 
@@ -375,7 +376,9 @@ Status DuckDBBinlogStreamer::Open(const BinlogStreamOptions &options) {
 
   fde_ = std::make_unique<Format_description_event>(BINLOG_VERSION, "8.0.0");
   // Use the configured checksum algorithm for early events (e.g., ROTATE).
-  fde_->footer()->checksum_alg = checksum_alg;
+  checksum_alg_ = static_cast<uint8_t>(checksum_alg);
+  fde_->footer()->checksum_alg =
+      static_cast<binary_log::enum_binlog_checksum_alg>(checksum_alg_);
   open_ = true;
   return Status::Ok();
 }
@@ -394,6 +397,7 @@ Status DuckDBBinlogStreamer::Close() {
   table_maps_.clear();
   current_gtid_.clear();
   fde_.reset();
+  checksum_alg_ = static_cast<uint8_t>(binary_log::BINLOG_CHECKSUM_ALG_CRC32);
   open_ = false;
   return Status::Ok();
 }
@@ -459,8 +463,8 @@ Status DuckDBBinlogStreamer::NextEvent(BinlogEvent *event) {
 
   if (!fde_) {
     fde_ = std::make_unique<Format_description_event>(BINLOG_VERSION, "8.0.0");
-    // Default to CRC32 when checksum algorithm is unknown.
-    fde_->footer()->checksum_alg = binary_log::BINLOG_CHECKSUM_ALG_CRC32;
+    fde_->footer()->checksum_alg =
+        static_cast<binary_log::enum_binlog_checksum_alg>(checksum_alg_);
   }
 
   for (;;) {

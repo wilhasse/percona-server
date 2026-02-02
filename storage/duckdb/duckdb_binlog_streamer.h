@@ -115,6 +115,7 @@ class DuckDBBinlogStreamer {
   MYSQL_RPL rpl_{};
   std::map<uint64_t, BinlogTableMap> table_maps_;
   std::unique_ptr<binary_log::Format_description_event> fde_;
+  uint8_t checksum_alg_{0};
 };
 
 }  // namespace duckdb_se
