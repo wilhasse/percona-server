@@ -136,7 +136,8 @@ bool QuerySingleStringValue(MYSQL *mysql, const char *sql,
   return success;
 }
 
-bool ConfigureBinlogChecksum(MYSQL *mysql, std::string *error_out) {
+bool ConfigureBinlogChecksum(MYSQL *mysql, std::string *error_out,
+                             binary_log::enum_binlog_checksum_alg *alg_out) {
   if (!mysql) return false;
   std::string checksum;
   if (!QuerySingleStringValue(mysql, "SELECT @@GLOBAL.binlog_checksum",
@@ -144,6 +145,16 @@ bool ConfigureBinlogChecksum(MYSQL *mysql, std::string *error_out) {
     checksum = "NONE";
   }
   if (checksum.empty()) checksum = "NONE";
+  if (alg_out) {
+    std::string upper = checksum;
+    std::transform(upper.begin(), upper.end(), upper.begin(),
+                   [](unsigned char c) { return std::toupper(c); });
+    if (upper == "CRC32") {
+      *alg_out = binary_log::BINLOG_CHECKSUM_ALG_CRC32;
+    } else {
+      *alg_out = binary_log::BINLOG_CHECKSUM_ALG_OFF;
+    }
+  }
   const std::string sql =
       "SET @master_binlog_checksum = '" + checksum +
       "', @source_binlog_checksum = '" + checksum + "'";
@@ -296,9 +307,11 @@ Status DuckDBBinlogStreamer::Open(const BinlogStreamOptions &options) {
     current_binlog_pos_ = options_.start_position;
   }
 
+  binary_log::enum_binlog_checksum_alg checksum_alg =
+      binary_log::BINLOG_CHECKSUM_ALG_CRC32;
   {
     std::string error;
-    if (!ConfigureBinlogChecksum(mysql_, &error)) {
+    if (!ConfigureBinlogChecksum(mysql_, &error, &checksum_alg)) {
       mysql_close(mysql_);
       mysql_ = nullptr;
       return Status::Error(StatusCode::kInvalid,
@@ -361,10 +374,8 @@ Status DuckDBBinlogStreamer::Open(const BinlogStreamOptions &options) {
   }
 
   fde_ = std::make_unique<Format_description_event>(BINLOG_VERSION, "8.0.0");
-  // MySQL 8.0 uses CRC32 checksums by default. Set this on the default FDE
-  // so that events processed before the real FDE is received (e.g., ROTATE
-  // events) will have checksum bytes properly excluded.
-  fde_->footer()->checksum_alg = binary_log::BINLOG_CHECKSUM_ALG_CRC32;
+  // Use the configured checksum algorithm for early events (e.g., ROTATE).
+  fde_->footer()->checksum_alg = checksum_alg;
   open_ = true;
   return Status::Ok();
 }
@@ -448,9 +459,7 @@ Status DuckDBBinlogStreamer::NextEvent(BinlogEvent *event) {
 
   if (!fde_) {
     fde_ = std::make_unique<Format_description_event>(BINLOG_VERSION, "8.0.0");
-    // MySQL 8.0 uses CRC32 checksums by default. Set this on the default FDE
-    // so that events processed before the real FDE is received (e.g., ROTATE
-    // events) will have checksum bytes properly excluded.
+    // Default to CRC32 when checksum algorithm is unknown.
     fde_->footer()->checksum_alg = binary_log::BINLOG_CHECKSUM_ALG_CRC32;
   }
 
