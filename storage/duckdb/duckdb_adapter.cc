@@ -710,13 +710,15 @@ Status DuckDBAdapter::GetTableInfo(TableId table,
     return Status::Error(StatusCode::kInvalid, "Table info output is null");
   }
   columns->clear();
+  if (table.table.empty()) {
+    return Status::Error(StatusCode::kInvalid, "Missing table name");
+  }
 
   auto st = EnsureInitialized();
   if (!st.ok()) return st;
 
-  const std::string qualified = QualifiedName(table);
   const std::string sql =
-      "PRAGMA table_info('" + EscapeLiteral(qualified) + "')";
+      "PRAGMA table_info('" + EscapeLiteral(table.table) + "')";
 
   try {
     auto result = conn_->Query(sql);
