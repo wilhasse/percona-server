@@ -309,6 +309,28 @@ Status DuckDBBinlogStreamer::Open(const BinlogStreamOptions &options) {
     }
   }
 
+  // Enforce GTID auto-position by ensuring a GTID set is provided.
+  if (options_.gtid_set.empty()) {
+    std::string executed;
+    if (!QuerySingleStringValue(mysql_, "SELECT @@GLOBAL.GTID_EXECUTED",
+                                &executed)) {
+      mysql_close(mysql_);
+      mysql_ = nullptr;
+      return Status::Error(StatusCode::kInvalid,
+                           "Failed to query @@GLOBAL.GTID_EXECUTED for "
+                           "auto-position");
+    }
+    if (executed.empty()) {
+      mysql_close(mysql_);
+      mysql_ = nullptr;
+      return Status::Error(StatusCode::kInvalid,
+                           "GTID_EXECUTED is empty; auto-position requires a "
+                           "GTID set. Run a transaction or set "
+                           "duckdb_binlog_apply_start_gtid.");
+    }
+    options_.gtid_set = std::move(executed);
+  }
+
   const std::string checksum_sql =
       "SET @master_binlog_checksum = 'NONE', "
       "@source_binlog_checksum = 'NONE'";
