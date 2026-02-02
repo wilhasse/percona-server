@@ -72,6 +72,7 @@ struct MySQLTableDef {
   std::string schema;
   std::string name;
   std::vector<ColumnDef> columns;
+  std::vector<std::string> primary_key;
   std::string ddl_sql;
 };
 
@@ -198,12 +199,19 @@ class DuckDBAdapter {
   std::string DeltaTableName(const TableId &table) const;
   Status RenameTable(TableId from, TableId to);
   Status TruncateTable(TableId table);
-  Status CopyTable(TableId source, const MySQLTableDef &target_def);
+ Status CopyTable(TableId source, const MySQLTableDef &target_def);
   std::string QuoteIdent(const std::string &name) const;
   std::string QualifiedName(const TableId &table) const;
   std::string EscapeLiteral(const std::string &value) const;
   std::string NormalizeDDL(const std::string &sql) const;
   DDLChange::Type InferDDLType(const std::string &sql) const;
+  struct ColumnInfo {
+    std::string name;
+    std::string type;
+    int pk{0};
+  };
+  Status GetTableInfo(TableId table, std::vector<ColumnInfo> *columns);
+  Status GetPrimaryKeyColumns(TableId table, std::vector<std::string> *columns);
 
   std::string db_path_;
   DuckDBConfig cfg_{};

@@ -806,6 +806,7 @@ bool FetchTableDef(MYSQL *mysql, const std::string &schema,
   def->schema = schema;
   def->name = table;
   def->columns.clear();
+  def->primary_key.clear();
   blob_flags->clear();
 
   const std::string sql =
@@ -836,6 +837,29 @@ bool FetchTableDef(MYSQL *mysql, const std::string &schema,
     blob_flags->push_back(IsBlobTypeString(col.type));
   }
   mysql_free_result(res);
+  if (!def->columns.empty()) {
+    const std::string pk_sql =
+        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE "
+        "WHERE TABLE_SCHEMA = " +
+        QuoteMySQLLiteral(mysql, schema) +
+        " AND TABLE_NAME = " + QuoteMySQLLiteral(mysql, table) +
+        " AND CONSTRAINT_NAME = 'PRIMARY' "
+        "ORDER BY ORDINAL_POSITION";
+    if (mysql_real_query(mysql, pk_sql.c_str(), pk_sql.size()) != 0) {
+      std::cerr << "MySQL query failed: " << mysql_error(mysql) << "\n";
+      return false;
+    }
+    MYSQL_RES *pk_res = mysql_store_result(mysql);
+    if (!pk_res) {
+      std::cerr << "MySQL store_result failed: " << mysql_error(mysql) << "\n";
+      return false;
+    }
+    MYSQL_ROW pk_row;
+    while ((pk_row = mysql_fetch_row(pk_res))) {
+      if (pk_row[0]) def->primary_key.push_back(pk_row[0]);
+    }
+    mysql_free_result(pk_res);
+  }
   return !def->columns.empty();
 }
 

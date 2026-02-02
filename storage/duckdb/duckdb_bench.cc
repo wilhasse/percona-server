@@ -42,6 +42,8 @@
 namespace {
 
 using duckdb_se::BinlogApplierOptions;
+using duckdb_se::BulkDeleteBatch;
+using duckdb_se::BulkUpdateBatch;
 using duckdb_se::Cell;
 using duckdb_se::DuckDBAdapter;
 using duckdb_se::DuckDBBinlogApplier;
@@ -114,6 +116,7 @@ MySQLTableDef MakeTableDef() {
   def.name = "t";
   def.columns.push_back({"id", "INTEGER", true});
   def.columns.push_back({"val", "VARCHAR", false});
+  def.primary_key.push_back("id");
   return def;
 }
 
@@ -127,6 +130,123 @@ Row MakeRow(size_t id) {
   row.push_back(Cell{false, false, std::to_string(id)});
   row.push_back(Cell{false, false, "val_" + std::to_string(id)});
   return row;
+}
+
+bool QuerySingleValue(DuckDBAdapter &adapter, const std::string &sql,
+                      std::string *out) {
+  if (!out) return false;
+  SessionCtx ctx;
+  auto result = adapter.ExecuteQuery(sql, ctx);
+  if (!result.ok || !result.result) {
+    std::cerr << "ExecuteQuery failed: " << result.error << "\n";
+    return false;
+  }
+  auto chunk = result.result->Fetch();
+  if (!chunk || chunk->size() == 0) {
+    out->clear();
+    return true;
+  }
+  auto val = chunk->GetValue(0, 0);
+  if (val.IsNull()) {
+    out->clear();
+  } else {
+    *out = val.ToString();
+  }
+  return true;
+}
+
+bool RunPkUpdateDeleteTest(DuckDBAdapter &adapter, Result *res) {
+  if (res) {
+    res->name = "pk_update_delete";
+    res->metric = "ok";
+  }
+  const auto start = std::chrono::steady_clock::now();
+
+  if (!ResetTable(adapter)) return false;
+
+  TableId table{"", "t"};
+  auto insert_txn = adapter.BeginApplyTxn(Gtid{"bench:pk:insert"});
+  if (!EnsureOk(insert_txn.status, "BeginApplyTxn(pk_insert)")) return false;
+
+  RowBatch batch;
+  batch.table = table;
+  batch.rows.push_back(Row{Cell{false, false, "1"},
+                           Cell{false, false, "same"}});
+  batch.rows.push_back(Row{Cell{false, false, "2"},
+                           Cell{false, false, "same"}});
+  batch.rows.push_back(Row{Cell{false, false, "3"},
+                           Cell{false, false, "other"}});
+  if (!EnsureOk(adapter.AppendRows(insert_txn, table, std::move(batch)),
+                "AppendRows(pk_insert)")) {
+    return false;
+  }
+  if (!EnsureOk(adapter.CommitApplyTxn(insert_txn),
+                "CommitApplyTxn(pk_insert)")) {
+    return false;
+  }
+
+  auto update_txn = adapter.BeginApplyTxn(Gtid{"bench:pk:update"});
+  if (!EnsureOk(update_txn.status, "BeginApplyTxn(pk_update)")) return false;
+  BulkUpdateBatch update;
+  update.table = table;
+  update.old_rows.push_back(
+      Row{Cell{false, false, "1"}, Cell{false, false, "same"}});
+  update.new_rows.push_back(
+      Row{Cell{false, false, "1"}, Cell{false, false, "updated"}});
+  if (!EnsureOk(adapter.ApplyBulkUpdates(update_txn, table, std::move(update)),
+                "ApplyBulkUpdates(pk_update)")) {
+    return false;
+  }
+  if (!EnsureOk(adapter.CommitApplyTxn(update_txn),
+                "CommitApplyTxn(pk_update)")) {
+    return false;
+  }
+
+  auto delete_txn = adapter.BeginApplyTxn(Gtid{"bench:pk:delete"});
+  if (!EnsureOk(delete_txn.status, "BeginApplyTxn(pk_delete)")) return false;
+  BulkDeleteBatch del;
+  del.table = table;
+  del.old_rows.push_back(
+      Row{Cell{false, false, "2"}, Cell{false, false, "same"}});
+  if (!EnsureOk(adapter.ApplyBulkDeletes(delete_txn, table, std::move(del)),
+                "ApplyBulkDeletes(pk_delete)")) {
+    return false;
+  }
+  if (!EnsureOk(adapter.CommitApplyTxn(delete_txn),
+                "CommitApplyTxn(pk_delete)")) {
+    return false;
+  }
+
+  std::string value;
+  if (!QuerySingleValue(adapter, "SELECT COUNT(*) FROM t", &value)) {
+    return false;
+  }
+  if (value != "2") {
+    std::cerr << "pk_test failed: expected 2 rows, got " << value << "\n";
+    return false;
+  }
+  if (!QuerySingleValue(adapter, "SELECT COUNT(*) FROM t WHERE id = 2",
+                        &value)) {
+    return false;
+  }
+  if (value != "0") {
+    std::cerr << "pk_test failed: expected id=2 deleted, got " << value
+              << " rows\n";
+    return false;
+  }
+  if (!QuerySingleValue(adapter, "SELECT val FROM t WHERE id = 1", &value)) {
+    return false;
+  }
+  if (value != "updated") {
+    std::cerr << "pk_test failed: expected updated val, got " << value << "\n";
+    return false;
+  }
+
+  if (res) {
+    res->rows = 1;
+    res->seconds = SecondsSince(start);
+  }
+  return true;
 }
 
 double SecondsSince(const std::chrono::steady_clock::time_point &start) {
@@ -313,7 +433,7 @@ Options ParseArgs(int argc, char **argv) {
 
 void PrintUsage() {
   std::cout << "duckdb_bench [--rows N] [--batch N] [--db PATH] "
-               "[--mode all|sql|appender|applier|query] [--out CSV] "
+               "[--mode all|sql|appender|applier|query|pk_test] [--out CSV] "
                "[--query-iters N]\n";
 }
 
@@ -337,6 +457,21 @@ int main(int argc, char **argv) {
   cfg.read_only = false;
   if (!EnsureOk(adapter.Init(opts.db_path, cfg), "Init")) return 1;
   if (!ResetTable(adapter)) return 1;
+
+  if (opts.mode == "pk_test") {
+    Result res;
+    const bool ok = RunPkUpdateDeleteTest(adapter, &res);
+    std::vector<Result> results{res};
+    if (!opts.output.empty()) {
+      std::ofstream out(opts.output);
+      WriteCsv(out, results);
+    } else {
+      WriteCsv(std::cout, results);
+    }
+    adapter.Shutdown();
+    CleanupDuckdbFiles(opts.db_path);
+    return ok ? 0 : 1;
+  }
 
   std::vector<Result> results;
   if (MatchesMode(opts.mode, "sql")) {

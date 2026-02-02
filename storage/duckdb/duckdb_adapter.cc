@@ -23,6 +23,7 @@
 
 #include "storage/duckdb/duckdb_adapter.h"
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <sstream>
@@ -467,8 +468,8 @@ Status DuckDBAdapter::EnsureDeltaTable(duckdb::Connection &conn,
     return Status::Error(StatusCode::kInvalid, "Missing table name");
   }
 
-  std::vector<std::string> columns;
-  Status st = GetTableColumns(table, &columns);
+  std::vector<ColumnInfo> columns;
+  Status st = GetTableInfo(table, &columns);
   if (!st.ok()) return st;
   if (columns.empty()) {
     return Status::Error(StatusCode::kInvalid, "No columns for delta table");
@@ -479,7 +480,9 @@ Status DuckDBAdapter::EnsureDeltaTable(duckdb::Connection &conn,
   sql += QualifiedName(delta);
   sql += " (";
   for (size_t i = 0; i < columns.size(); ++i) {
-    sql += QuoteIdent(columns[i]) + " VARCHAR";
+    const std::string type =
+        columns[i].type.empty() ? "VARCHAR" : columns[i].type;
+    sql += QuoteIdent(columns[i].name) + " " + type;
     if (i + 1 < columns.size()) sql += ", ";
   }
   sql += ")";
@@ -573,6 +576,14 @@ Status DuckDBAdapter::CreateTableOn(duckdb::Connection &conn,
       if (col.not_null) ddl << " NOT NULL";
       if (i + 1 < def.columns.size()) ddl << ", ";
     }
+    if (!def.primary_key.empty()) {
+      ddl << ", PRIMARY KEY (";
+      for (size_t i = 0; i < def.primary_key.size(); ++i) {
+        ddl << QuoteIdent(def.primary_key[i]);
+        if (i + 1 < def.primary_key.size()) ddl << ", ";
+      }
+      ddl << ")";
+    }
     ddl << ")";
     sql = ddl.str();
   }
@@ -655,6 +666,22 @@ Status DuckDBAdapter::GetTableColumns(TableId table,
   }
   columns->clear();
 
+  std::vector<ColumnInfo> info;
+  auto st = GetTableInfo(table, &info);
+  if (!st.ok()) return st;
+  for (const auto &col : info) {
+    columns->push_back(col.name);
+  }
+  return Status::Ok();
+}
+
+Status DuckDBAdapter::GetTableInfo(TableId table,
+                                   std::vector<ColumnInfo> *columns) {
+  if (!columns) {
+    return Status::Error(StatusCode::kInvalid, "Table info output is null");
+  }
+  columns->clear();
+
   auto st = EnsureInitialized();
   if (!st.ok()) return st;
 
@@ -673,16 +700,58 @@ Status DuckDBAdapter::GetTableColumns(TableId table,
         break;
       }
       for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
-        auto name = chunk->GetValue(1, row);
-        if (!name.IsNull()) {
-          columns->push_back(name.ToString());
+        auto name_val = chunk->GetValue(1, row);
+        if (name_val.IsNull()) continue;
+        ColumnInfo info;
+        info.name = name_val.ToString();
+        auto type_val = chunk->GetValue(2, row);
+        if (!type_val.IsNull()) {
+          info.type = type_val.ToString();
         }
+        auto pk_val = chunk->GetValue(5, row);
+        if (!pk_val.IsNull()) {
+          try {
+            info.pk = pk_val.GetValue<int32_t>();
+          } catch (...) {
+            const std::string pk_str = pk_val.ToString();
+            if (!pk_str.empty()) {
+              info.pk = std::stoi(pk_str);
+            }
+          }
+        }
+        columns->push_back(std::move(info));
       }
     }
   } catch (const std::exception &ex) {
     return Status::Error(StatusCode::kDuckDBError, ex.what());
   }
 
+  return Status::Ok();
+}
+
+Status DuckDBAdapter::GetPrimaryKeyColumns(
+    TableId table, std::vector<std::string> *columns) {
+  if (!columns) {
+    return Status::Error(StatusCode::kInvalid, "PK output is null");
+  }
+  columns->clear();
+  std::vector<ColumnInfo> info;
+  Status st = GetTableInfo(table, &info);
+  if (!st.ok()) return st;
+
+  std::vector<std::pair<int, std::string>> pk;
+  pk.reserve(info.size());
+  for (const auto &col : info) {
+    if (col.pk > 0) {
+      pk.emplace_back(col.pk, col.name);
+    }
+  }
+  if (pk.empty()) return Status::Ok();
+  std::sort(pk.begin(), pk.end(),
+            [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
+  for (const auto &entry : pk) {
+    columns->push_back(entry.second);
+  }
   return Status::Ok();
 }
 
@@ -1080,6 +1149,9 @@ Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
       return Status::Error(StatusCode::kInvalid,
                            "No columns available for bulk update");
     }
+    std::vector<std::string> pk_columns;
+    st = GetPrimaryKeyColumns(table, &pk_columns);
+    if (!st.ok()) return st;
 
     for (const auto &row : batch.old_rows) {
       if (row.size() != columns.size()) {
@@ -1097,10 +1169,12 @@ Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
     const std::string target = QualifiedName(table);
     const std::string delta_quoted = QuoteIdent(delta_name);
 
+    const std::vector<std::string> &join_columns =
+        pk_columns.empty() ? columns : pk_columns;
     std::string join_sql;
-    for (size_t i = 0; i < columns.size(); ++i) {
+    for (size_t i = 0; i < join_columns.size(); ++i) {
       if (i > 0) join_sql += " AND ";
-      const std::string col = QuoteIdent(columns[i]);
+      const std::string col = QuoteIdent(join_columns[i]);
       join_sql += target + "." + col + " IS NOT DISTINCT FROM " + delta_quoted +
                   "." + col;
     }
@@ -1167,6 +1241,9 @@ Status DuckDBAdapter::ApplyBulkDeletes(ApplyTxn &txn, TableId table,
       return Status::Error(StatusCode::kInvalid,
                            "No columns available for bulk delete");
     }
+    std::vector<std::string> pk_columns;
+    st = GetPrimaryKeyColumns(table, &pk_columns);
+    if (!st.ok()) return st;
 
     for (const auto &row : batch.old_rows) {
       if (row.size() != columns.size()) {
@@ -1178,10 +1255,12 @@ Status DuckDBAdapter::ApplyBulkDeletes(ApplyTxn &txn, TableId table,
     const std::string target = QualifiedName(table);
     const std::string delta_quoted = QuoteIdent(delta_name);
 
+    const std::vector<std::string> &join_columns =
+        pk_columns.empty() ? columns : pk_columns;
     std::string join_sql;
-    for (size_t i = 0; i < columns.size(); ++i) {
+    for (size_t i = 0; i < join_columns.size(); ++i) {
       if (i > 0) join_sql += " AND ";
-      const std::string col = QuoteIdent(columns[i]);
+      const std::string col = QuoteIdent(join_columns[i]);
       join_sql += target + "." + col + " IS NOT DISTINCT FROM " + delta_quoted +
                   "." + col;
     }
