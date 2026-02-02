@@ -730,6 +730,15 @@ bool is_simple_select(LEX *lex, Table_ref **base_table, std::string *reason,
       if (reason) *reason = "Schema tables are not supported";
       return false;
     }
+    if (tl->is_sj_or_aj_nest()) {
+      if (reason) *reason = "Semi/anti joins are not supported";
+      return false;
+    }
+    if (tl->is_natural_join || tl->natural_join != nullptr ||
+        tl->join_using_fields != nullptr) {
+      if (reason) *reason = "NATURAL/USING joins are not supported";
+      return false;
+    }
 
     if (tl->table == nullptr || tl->table->s == nullptr) {
       if (reason) *reason = "Table metadata not available for DuckDB offload";

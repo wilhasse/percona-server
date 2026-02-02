@@ -106,6 +106,8 @@ DuckDB offload can run multi-table SELECTs when all referenced tables resolve
 to the same DuckDB database file (default: per-schema `<schema>.duckdb`).
 If you override paths with `SECONDARY_ENGINE_ATTRIBUTE`, ensure every table in
 the query points to the same file. Cross-schema joins are not yet offloaded.
+Only INNER and LEFT joins are currently eligible; NATURAL/USING and semi/anti
+joins fall back to the primary engine.
 
 ## DuckDB File Location
 By default, per-schema DuckDB files live under `@@datadir`. To store them
