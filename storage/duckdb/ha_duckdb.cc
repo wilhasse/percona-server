@@ -1141,15 +1141,22 @@ static bool OptimizeSecondaryEngine(THD *thd, LEX *lex) {
 static const char *DuckdbGetOffloadFailReason(THD *thd) {
   auto *ctx = down_cast<Duckdb_execution_context *>(
       thd->lex->secondary_engine_execution_context());
-  if (ctx == nullptr || ctx->fail_reason.empty()) return nullptr;
+  if (ctx == nullptr || ctx->fail_reason.empty()) {
+    return "DuckDB secondary engine could not execute query";
+  }
   return ctx->fail_reason.c_str();
 }
 
 static void DuckdbSetOffloadFailReason(THD *thd, const char *reason) {
+  if (thd == nullptr || thd->lex == nullptr) return;
   auto *ctx = down_cast<Duckdb_execution_context *>(
       thd->lex->secondary_engine_execution_context());
-  if (ctx == nullptr) return;
-  ctx->fail_reason = reason ? reason : "";
+  if (ctx == nullptr) {
+    ctx = new (thd->mem_root) Duckdb_execution_context;
+    if (ctx == nullptr) return;
+    thd->lex->set_secondary_engine_execution_context(ctx);
+  }
+  ctx->fail_reason = reason ? reason : "DuckDB secondary engine failed";
 }
 
 }  // namespace
