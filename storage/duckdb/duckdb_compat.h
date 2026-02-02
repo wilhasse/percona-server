@@ -25,8 +25,14 @@
 #define PLUGIN_DUCKDB_COMPAT_H_
 
 #include <string>
+#include <vector>
 
 namespace duckdb_se {
+
+struct QualifiedTableRef {
+  std::string schema;
+  std::string table;
+};
 
 struct DuckdbRewriteResult {
   bool ok{true};
@@ -35,6 +41,8 @@ struct DuckdbRewriteResult {
 };
 
 DuckdbRewriteResult RewriteForDuckdb(const std::string &sql);
+std::string RewriteQualifiedTables(
+    const std::string &sql, const std::vector<QualifiedTableRef> &tables);
 
 }  // namespace duckdb_se
 

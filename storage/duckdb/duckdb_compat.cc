@@ -34,6 +34,18 @@ bool IsIdentChar(char ch) {
   return std::isalnum(static_cast<unsigned char>(ch)) || ch == '_';
 }
 
+bool MatchCI(const std::string &sql, size_t pos, const std::string &token) {
+  if (pos + token.size() > sql.size()) return false;
+  for (size_t i = 0; i < token.size(); ++i) {
+    const char lhs = static_cast<char>(
+        std::toupper(static_cast<unsigned char>(sql[pos + i])));
+    const char rhs = static_cast<char>(
+        std::toupper(static_cast<unsigned char>(token[i])));
+    if (lhs != rhs) return false;
+  }
+  return true;
+}
+
 bool IsSpace(char ch) {
   return std::isspace(static_cast<unsigned char>(ch));
 }
@@ -150,6 +162,18 @@ std::string Trim(std::string_view input) {
   size_t end = input.size();
   while (end > start && IsSpace(input[end - 1])) --end;
   return std::string(input.substr(start, end - start));
+}
+
+std::string QuoteIdent(std::string_view input) {
+  std::string out;
+  out.reserve(input.size() + 2);
+  out.push_back('"');
+  for (char ch : input) {
+    if (ch == '"') out.push_back('"');
+    out.push_back(ch);
+  }
+  out.push_back('"');
+  return out;
 }
 
 std::string NormalizeBackticks(const std::string &input) {
@@ -322,6 +346,88 @@ bool RewriteLimitClause(const std::string &sql, std::string *out) {
 }
 
 }  // namespace
+
+std::string RewriteQualifiedTables(
+    const std::string &sql, const std::vector<QualifiedTableRef> &tables) {
+  if (tables.empty()) return sql;
+
+  struct Pattern {
+    std::string db;
+    std::string table;
+    std::string quoted_table;
+    std::string quoted_pattern;
+  };
+
+  std::vector<Pattern> patterns;
+  patterns.reserve(tables.size());
+  for (const auto &entry : tables) {
+    if (entry.schema.empty() || entry.table.empty()) continue;
+    Pattern pattern;
+    pattern.db = entry.schema;
+    pattern.table = entry.table;
+    pattern.quoted_table = QuoteIdent(entry.table);
+    pattern.quoted_pattern =
+        QuoteIdent(entry.schema) + "." + pattern.quoted_table;
+    patterns.emplace_back(std::move(pattern));
+  }
+  if (patterns.empty()) return sql;
+
+  std::string out;
+  out.reserve(sql.size());
+  const size_t len = sql.size();
+  for (size_t i = 0; i < len;) {
+    const char ch = sql[i];
+    if (ch == '\'') {
+      out.push_back(ch);
+      ++i;
+      while (i < len) {
+        out.push_back(sql[i]);
+        if (sql[i] == '\'') {
+          ++i;
+          if (i < len && sql[i] == '\'') {
+            out.push_back(sql[i]);
+            ++i;
+            continue;
+          }
+          break;
+        }
+        ++i;
+      }
+      continue;
+    }
+
+    bool matched = false;
+    for (const auto &pattern : patterns) {
+      if (MatchCI(sql, i, pattern.quoted_pattern)) {
+        out.append(pattern.quoted_table);
+        i += pattern.quoted_pattern.size();
+        matched = true;
+        break;
+      }
+      if (MatchCI(sql, i, pattern.db)) {
+        const size_t db_end = i + pattern.db.size();
+        if (db_end < len && sql[db_end] == '.' &&
+            MatchCI(sql, db_end + 1, pattern.table)) {
+          const size_t table_end = db_end + 1 + pattern.table.size();
+          const bool left_ok = (i == 0) || !IsIdentChar(sql[i - 1]);
+          const bool right_ok =
+              (table_end >= len) || !IsIdentChar(sql[table_end]);
+          if (left_ok && right_ok) {
+            out.append(pattern.table);
+            i = table_end;
+            matched = true;
+            break;
+          }
+        }
+      }
+    }
+    if (matched) continue;
+
+    out.push_back(ch);
+    ++i;
+  }
+  return out;
+}
 
 DuckdbRewriteResult RewriteForDuckdb(const std::string &sql) {
   DuckdbRewriteResult result;

@@ -113,11 +113,6 @@ class LoadedTables {
 
 LoadedTables *loaded_tables{nullptr};
 
-struct QualifiedTableRef {
-  std::string db;
-  std::string table;
-};
-
 class Duckdb_execution_context : public Secondary_engine_execution_context {
  public:
   std::string db;
@@ -598,104 +593,6 @@ bool store_snapshot_gtid(duckdb::Connection &con,
   return !upsert_result->HasError();
 }
 
-bool is_ident_char(char ch) {
-  return (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') ||
-         (ch >= 'a' && ch <= 'z') || ch == '_';
-}
-
-bool match_ci(const std::string &sql, size_t pos, const std::string &token) {
-  if (pos + token.size() > sql.size()) return false;
-  for (size_t i = 0; i < token.size(); ++i) {
-    const char lhs = static_cast<char>(
-        std::toupper(static_cast<unsigned char>(sql[pos + i])));
-    const char rhs = static_cast<char>(
-        std::toupper(static_cast<unsigned char>(token[i])));
-    if (lhs != rhs) return false;
-  }
-  return true;
-}
-
-std::string rewrite_qualified_tables(
-    std::string sql, const std::vector<QualifiedTableRef> &tables) {
-  if (tables.empty()) return sql;
-
-  struct Pattern {
-    std::string db;
-    std::string table;
-    std::string quoted_table;
-    std::string quoted_pattern;
-  };
-  std::vector<Pattern> patterns;
-  patterns.reserve(tables.size());
-  for (const auto &entry : tables) {
-    if (entry.db.empty() || entry.table.empty()) continue;
-    Pattern pattern;
-    pattern.db = entry.db;
-    pattern.table = entry.table;
-    pattern.quoted_table = quote_ident(entry.table.c_str(), entry.table.size());
-    const std::string quoted_db = quote_ident(entry.db.c_str(), entry.db.size());
-    pattern.quoted_pattern = quoted_db + "." + pattern.quoted_table;
-    patterns.emplace_back(std::move(pattern));
-  }
-  if (patterns.empty()) return sql;
-
-  std::string out;
-  out.reserve(sql.size());
-  const size_t len = sql.size();
-  for (size_t i = 0; i < len;) {
-    const char ch = sql[i];
-    if (ch == '\'') {
-      out.push_back(ch);
-      ++i;
-      while (i < len) {
-        out.push_back(sql[i]);
-        if (sql[i] == '\'') {
-          ++i;
-          if (i < len && sql[i] == '\'') {
-            out.push_back(sql[i]);
-            ++i;
-            continue;
-          }
-          break;
-        }
-        ++i;
-      }
-      continue;
-    }
-
-    bool matched = false;
-    for (const auto &pattern : patterns) {
-      if (match_ci(sql, i, pattern.quoted_pattern)) {
-        out.append(pattern.quoted_table);
-        i += pattern.quoted_pattern.size();
-        matched = true;
-        break;
-      }
-      if (match_ci(sql, i, pattern.db)) {
-        const size_t db_end = i + pattern.db.size();
-        if (db_end < len && sql[db_end] == '.' &&
-            match_ci(sql, db_end + 1, pattern.table)) {
-          const size_t table_end = db_end + 1 + pattern.table.size();
-          const bool left_ok = (i == 0) || !is_ident_char(sql[i - 1]);
-          const bool right_ok =
-              (table_end >= len) || !is_ident_char(sql[table_end]);
-          if (left_ok && right_ok) {
-            out.append(pattern.table);
-            i = table_end;
-            matched = true;
-            break;
-          }
-        }
-      }
-    }
-    if (matched) continue;
-
-    out.push_back(ch);
-    ++i;
-  }
-  return out;
-}
-
 bool is_simple_select(LEX *lex, Table_ref **base_table, std::string *reason,
                       std::string *schema_out, std::string *path_out) {
   if (lex == nullptr || base_table == nullptr) return false;
@@ -786,8 +683,8 @@ bool is_simple_select(LEX *lex, Table_ref **base_table, std::string *reason,
   return true;
 }
 
-std::vector<QualifiedTableRef> collect_query_tables(LEX *lex) {
-  std::vector<QualifiedTableRef> tables;
+std::vector<duckdb_se::QualifiedTableRef> collect_query_tables(LEX *lex) {
+  std::vector<duckdb_se::QualifiedTableRef> tables;
   if (lex == nullptr) return tables;
   for (Table_ref *tl = lex->query_tables; tl != nullptr; tl = tl->next_global) {
     if (tl->is_placeholder()) continue;
@@ -813,7 +710,7 @@ std::vector<QualifiedTableRef> collect_query_tables(LEX *lex) {
     }
 
     if (!schema.empty() && !table_name.empty()) {
-      tables.push_back(QualifiedTableRef{schema, table_name});
+      tables.push_back(duckdb_se::QualifiedTableRef{schema, table_name});
     }
   }
   return tables;
@@ -1127,7 +1024,7 @@ static bool OptimizeSecondaryEngine(THD *thd, LEX *lex) {
     return true;
   }
   const auto tables = collect_query_tables(lex);
-  ctx->sql = rewrite_qualified_tables(std::move(rewrite.sql), tables);
+  ctx->sql = duckdb_se::RewriteQualifiedTables(std::move(rewrite.sql), tables);
 
   try {
     duckdb::DBConfig config(true);
