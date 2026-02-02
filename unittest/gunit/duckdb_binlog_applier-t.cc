@@ -66,6 +66,12 @@ using duckdb_se::MergeGtidIntoSet;
 
 const std::string kTestUuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 
+// Forward declarations of helper functions
+std::string TempDirectory();
+std::string MakeTempPath(const std::string &prefix);
+void CleanupDuckdbFiles(const std::string &path);
+void ExpectOk(const Status &st);
+
 std::string MakeGtid(int seq) {
   return kTestUuid + ":" + std::to_string(seq);
 }
@@ -126,7 +132,7 @@ TEST(DuckDBGtidUtilsTest, AdapterIsGtidAppliedUsesSet) {
   const std::string insert_sql =
       "INSERT INTO __repl_state (channel, snapshot_gtid_set, applied_gtid_set, "
       "last_commit_ts) VALUES ('default', NULL, '" +
-      set + "', CURRENT_TIMESTAMP)";
+      set + "', '2026-01-01 00:00:00')";
   auto insert = adapter.ExecuteQuery(insert_sql, {});
   ASSERT_TRUE(insert.ok) << insert.error;
 
