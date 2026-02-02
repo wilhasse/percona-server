@@ -61,28 +61,70 @@ bool IsValidUtf8(const std::string &value) {
   size_t i = 0;
   const size_t len = value.size();
   while (i < len) {
-    unsigned char c = data[i];
+    const unsigned char c = data[i];
     if (c <= 0x7F) {
       ++i;
       continue;
     }
-    size_t needed = 0;
-    if ((c & 0xE0) == 0xC0) {
-      needed = 1;
-      if (c < 0xC2) return false;  // overlong
-    } else if ((c & 0xF0) == 0xE0) {
-      needed = 2;
-    } else if ((c & 0xF8) == 0xF0) {
-      needed = 3;
-      if (c > 0xF4) return false;
-    } else {
-      return false;
+    if (c >= 0xC2 && c <= 0xDF) {
+      if (i + 1 >= len) return false;
+      if ((data[i + 1] & 0xC0) != 0x80) return false;
+      i += 2;
+      continue;
     }
-    if (i + needed >= len) return false;
-    for (size_t j = 1; j <= needed; ++j) {
-      if ((data[i + j] & 0xC0) != 0x80) return false;
+    if (c == 0xE0) {
+      if (i + 2 >= len) return false;
+      if (data[i + 1] < 0xA0 || data[i + 1] > 0xBF) return false;
+      if ((data[i + 2] & 0xC0) != 0x80) return false;
+      i += 3;
+      continue;
     }
-    i += needed + 1;
+    if (c >= 0xE1 && c <= 0xEC) {
+      if (i + 2 >= len) return false;
+      if ((data[i + 1] & 0xC0) != 0x80) return false;
+      if ((data[i + 2] & 0xC0) != 0x80) return false;
+      i += 3;
+      continue;
+    }
+    if (c == 0xED) {
+      if (i + 2 >= len) return false;
+      if (data[i + 1] < 0x80 || data[i + 1] > 0x9F) return false;
+      if ((data[i + 2] & 0xC0) != 0x80) return false;
+      i += 3;
+      continue;
+    }
+    if (c >= 0xEE && c <= 0xEF) {
+      if (i + 2 >= len) return false;
+      if ((data[i + 1] & 0xC0) != 0x80) return false;
+      if ((data[i + 2] & 0xC0) != 0x80) return false;
+      i += 3;
+      continue;
+    }
+    if (c == 0xF0) {
+      if (i + 3 >= len) return false;
+      if (data[i + 1] < 0x90 || data[i + 1] > 0xBF) return false;
+      if ((data[i + 2] & 0xC0) != 0x80) return false;
+      if ((data[i + 3] & 0xC0) != 0x80) return false;
+      i += 4;
+      continue;
+    }
+    if (c >= 0xF1 && c <= 0xF3) {
+      if (i + 3 >= len) return false;
+      if ((data[i + 1] & 0xC0) != 0x80) return false;
+      if ((data[i + 2] & 0xC0) != 0x80) return false;
+      if ((data[i + 3] & 0xC0) != 0x80) return false;
+      i += 4;
+      continue;
+    }
+    if (c == 0xF4) {
+      if (i + 3 >= len) return false;
+      if (data[i + 1] < 0x80 || data[i + 1] > 0x8F) return false;
+      if ((data[i + 2] & 0xC0) != 0x80) return false;
+      if ((data[i + 3] & 0xC0) != 0x80) return false;
+      i += 4;
+      continue;
+    }
+    return false;
   }
   return true;
 }
