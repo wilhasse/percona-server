@@ -407,6 +407,15 @@ std::string UnsupportedDDLReason(const std::string &sql,
 
 }  // namespace
 
+TypeCheck CheckMySQLTypeString(const std::string &mysql_type) {
+  const auto mapping = MapMySQLTypeString(mysql_type);
+  TypeCheck out;
+  out.type = mapping.type;
+  out.lossy = mapping.severity == TypeSeverity::kLossy;
+  out.reason = mapping.reason;
+  return out;
+}
+
 Status DuckDBAdapter::Init(std::string db_path, DuckDBConfig cfg) {
   if (initialized_) {
     return Status::Error(StatusCode::kAlreadyInitialized,
@@ -566,7 +575,7 @@ Status DuckDBAdapter::CreateTableOn(duckdb::Connection &conn,
     for (size_t i = 0; i < def.columns.size(); ++i) {
       const auto &col = def.columns[i];
       const auto mapping = MapMySQLTypeString(col.type);
-      if (mapping.severity == TypeSeverity::kLossy) {
+      if (mapping.severity == TypeSeverity::kLossy && !def.allow_lossy) {
         return Status::Error(
             StatusCode::kInvalid,
             "Unsupported or lossy column type for " + col.name + ": " +

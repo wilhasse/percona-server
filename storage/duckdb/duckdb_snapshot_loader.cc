@@ -100,6 +100,7 @@ struct Options {
   bool validate_sum{false};
   size_t max_buffer_events{kDefaultMaxBufferEvents};
   size_t max_buffer_bytes{kDefaultMaxBufferBytes};
+  bool allow_lossy{false};
   std::string applied_gtid_set;
   bool set_applied_gtid{false};
   bool reset_applied_gtid{false};
@@ -133,6 +134,7 @@ void PrintUsage(const char *argv0) {
       << kDefaultMaxBufferEvents << ")\n"
          "  --max-buffer-bytes <n>   Max buffered bytes (default "
       << kDefaultMaxBufferBytes << ")\n"
+         "  --allow-lossy            Allow lossy type mappings (warn only)\n"
          "  --set-applied-gtid-set <set>  Force applied_gtid_set value\n"
          "  --reset-applied-gtid-set      Clear applied_gtid_set\n"
          "  --drop-watermark              Drop legacy __repl_watermark table\n"
@@ -140,7 +142,10 @@ void PrintUsage(const char *argv0) {
          "  --show-state                  Print current __repl_state values\n"
          "  --consistent-gtid-snapshot    Use FTWRL to tie GTID set to snapshot\n"
          "  --verbose                Verbose output\n"
-         "  --help                   Show this help\n";
+         "  --help                   Show this help\n\n"
+         "Supported types (test phase): integer types, float/double, "
+         "DECIMAL(<=38), DATE/DATETIME/TIMESTAMP, CHAR/VARCHAR/TEXT, and "
+         "BLOB (insert-heavy tables).\n";
 }
 
 int GetPid() {
@@ -265,6 +270,10 @@ bool ParseArgs(int argc, char **argv, Options *opts) {
     }
     if (arg == "--max-buffer-bytes") {
       if (!consume_size(&opts->max_buffer_bytes)) return false;
+      continue;
+    }
+    if (arg == "--allow-lossy") {
+      opts->allow_lossy = true;
       continue;
     }
     if (arg == "--set-applied-gtid-set") {
@@ -429,6 +438,12 @@ struct ReplStateRow {
   std::string schema_version;
 };
 
+struct TablePrep {
+  std::string name;
+  MySQLTableDef def;
+  std::vector<bool> blob_flags;
+};
+
 bool HasStateOperations(const Options &opts) {
   return opts.reset_applied_gtid || opts.set_applied_gtid || opts.drop_watermark ||
          opts.show_state;
@@ -447,6 +462,54 @@ bool ValidateAppliedGtidSet(const Options &opts) {
     std::cerr << "Invalid GTID set: "
               << (error.empty() ? "parse error" : error) << "\n";
     return false;
+  }
+  return true;
+}
+
+bool PreflightTables(MYSQL *mysql, const Options &opts,
+                     const std::vector<std::string> &tables,
+                     std::vector<TablePrep> *out) {
+  if (!out) return false;
+  out->clear();
+  std::vector<std::string> issues;
+  for (const auto &table : tables) {
+    TablePrep prep;
+    prep.name = table;
+    if (!FetchTableDef(mysql, opts.schema, table, &prep.def,
+                       &prep.blob_flags)) {
+      std::cerr << "Failed to fetch columns for " << opts.schema << "."
+                << table << "\n";
+      return false;
+    }
+    prep.def.allow_lossy = opts.allow_lossy;
+    for (const auto &col : prep.def.columns) {
+      const auto check = duckdb_se::CheckMySQLTypeString(col.type);
+      if (!check.lossy) continue;
+      std::ostringstream oss;
+      oss << opts.schema << "." << table << "." << col.name << " type "
+          << col.type << " -> " << check.type;
+      if (!check.reason.empty()) {
+        oss << " (" << check.reason << ")";
+      }
+      issues.push_back(oss.str());
+    }
+    out->push_back(std::move(prep));
+  }
+
+  if (!issues.empty()) {
+    if (opts.allow_lossy) {
+      std::cerr << "Lossy type mappings detected (continuing due to "
+                   "--allow-lossy):\n";
+    } else {
+      std::cerr << "Unsupported/lossy types detected:\n";
+    }
+    for (const auto &issue : issues) {
+      std::cerr << "  - " << issue << "\n";
+    }
+    if (!opts.allow_lossy) {
+      std::cerr << "Re-run with --allow-lossy to proceed anyway.\n";
+      return false;
+    }
   }
   return true;
 }
@@ -1376,7 +1439,8 @@ Status ApplyBufferedEvents(MYSQL *mysql, DuckDBAdapter &adapter,
                            DuckDBBinlogStreamer &streamer,
                            const std::vector<BinlogEvent> &events,
                            const std::string &schema_filter,
-                           const std::string &table_filter, bool verbose) {
+                           const std::string &table_filter, bool allow_lossy,
+                           bool verbose) {
   DuckDBBinlogApplier applier(&adapter);
   bool txn_active = false;
   std::string active_gtid;
@@ -1526,6 +1590,7 @@ Status ApplyBufferedEvents(MYSQL *mysql, DuckDBAdapter &adapter,
             return Status::Error(duckdb_se::StatusCode::kInvalid,
                                  "Failed to fetch table definition for DDL");
           }
+          def.allow_lossy = allow_lossy;
           change.new_def = std::move(def);
         } else if (change.type == DDLChange::Type::kAlter) {
           std::string reason;
@@ -1547,6 +1612,7 @@ Status ApplyBufferedEvents(MYSQL *mysql, DuckDBAdapter &adapter,
                   duckdb_se::StatusCode::kInvalid,
                   "Failed to fetch table definition for DDL");
             }
+            def.allow_lossy = allow_lossy;
             change.new_def = std::move(def);
             change.copy_ddl = true;
           }
@@ -1730,6 +1796,13 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  std::vector<TablePrep> table_preflight;
+  if (!PreflightTables(mysql, opts, tables, &table_preflight)) {
+    mysql_close(mysql);
+    mysql_library_end();
+    return 1;
+  }
+
   DuckDBAdapter adapter;
   DuckDBConfig cfg;
   cfg.read_only = false;
@@ -1757,7 +1830,9 @@ int main(int argc, char **argv) {
 
   size_t total_rows = 0;
   bool validation_ok = true;
-  for (const auto &table : tables) {
+  for (size_t i = 0; i < tables.size(); ++i) {
+    const auto &table = tables[i];
+    const auto &prep = table_preflight[i];
     if (opts.verbose) {
       std::cerr << "Loading " << opts.schema << "." << table << "...\n";
     }
@@ -1778,16 +1853,8 @@ int main(int argc, char **argv) {
       return 1;
     }
 
-    MySQLTableDef def;
-    std::vector<bool> blob_flags;
-    if (!FetchTableDef(mysql, opts.schema, table, &def, &blob_flags)) {
-      std::cerr << "Failed to fetch columns for " << opts.schema << "." << table
-                << "\n";
-      adapter.Shutdown();
-      mysql_close(mysql);
-      mysql_library_end();
-      return 1;
-    }
+    MySQLTableDef def = prep.def;
+    const std::vector<bool> &blob_flags = prep.blob_flags;
 
     const std::string temp_table = MakeLoadingTableName(table);
     adapter.DropTable(opts.schema, temp_table);
@@ -1874,7 +1941,8 @@ int main(int argc, char **argv) {
   if (!buffered_events.empty()) {
     Status st =
         ApplyBufferedEvents(mysql, adapter, binlog_streamer, buffered_events,
-                            opts.schema, opts.table, opts.verbose);
+                            opts.schema, opts.table, opts.allow_lossy,
+                            opts.verbose);
     if (!st.ok()) {
       std::cerr << "Applying buffered binlog events failed: " << st.message
                 << "\n";

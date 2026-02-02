@@ -73,8 +73,17 @@ struct MySQLTableDef {
   std::string name;
   std::vector<ColumnDef> columns;
   std::vector<std::string> primary_key;
+  bool allow_lossy{false};
   std::string ddl_sql;
 };
+
+struct TypeCheck {
+  std::string type;
+  bool lossy{false};
+  std::string reason;
+};
+
+TypeCheck CheckMySQLTypeString(const std::string &mysql_type);
 
 struct Gtid {
   std::string value;
