@@ -50,6 +50,7 @@
 #include "storage/duckdb/duckdb_adapter.h"
 #include "storage/duckdb/duckdb_binlog_applier.h"
 #include "storage/duckdb/duckdb_binlog_streamer.h"
+#include "storage/duckdb/duckdb_gtid_utils.h"
 #include "storage/duckdb/duckdb_row_decoder.h"
 #include "storage/duckdb/duckdb_repl_state.h"
 
@@ -76,6 +77,8 @@ using duckdb_se::RowBatch;
 using duckdb_se::Status;
 using duckdb_se::TableId;
 
+constexpr const char *kReplChannel = "default";
+
 struct Options {
   std::string host{"127.0.0.1"};
   std::string user{"root"};
@@ -91,6 +94,12 @@ struct Options {
   bool verbose{false};
   bool validate{false};
   bool validate_sum{false};
+  std::string applied_gtid_set;
+  bool set_applied_gtid{false};
+  bool reset_applied_gtid{false};
+  bool drop_watermark{false};
+  bool state_only{false};
+  bool show_state{false};
   bool show_help{false};
 };
 
@@ -113,6 +122,11 @@ void PrintUsage(const char *argv0) {
          "  --overwrite              Drop table if it exists\n"
          "  --validate               Validate row counts after load\n"
          "  --validate-sum           Validate SUM() for up to 3 numeric columns\n"
+         "  --set-applied-gtid-set <set>  Force applied_gtid_set value\n"
+         "  --reset-applied-gtid-set      Clear applied_gtid_set\n"
+         "  --drop-watermark              Drop legacy __repl_watermark table\n"
+         "  --state-only                  Only update/show replication state\n"
+         "  --show-state                  Print current __repl_state values\n"
          "  --verbose                Verbose output\n"
          "  --help                   Show this help\n";
 }
@@ -233,6 +247,27 @@ bool ParseArgs(int argc, char **argv, Options *opts) {
       opts->validate_sum = true;
       continue;
     }
+    if (arg == "--set-applied-gtid-set") {
+      if (!consume_value(&opts->applied_gtid_set)) return false;
+      opts->set_applied_gtid = true;
+      continue;
+    }
+    if (arg == "--reset-applied-gtid-set") {
+      opts->reset_applied_gtid = true;
+      continue;
+    }
+    if (arg == "--drop-watermark") {
+      opts->drop_watermark = true;
+      continue;
+    }
+    if (arg == "--state-only") {
+      opts->state_only = true;
+      continue;
+    }
+    if (arg == "--show-state") {
+      opts->show_state = true;
+      continue;
+    }
 
     if (StartsWith(arg, "--host=")) {
       opts->host = arg.substr(7);
@@ -274,13 +309,18 @@ bool ParseArgs(int argc, char **argv, Options *opts) {
       if (!ParseSizeT(arg.substr(8), &opts->batch_rows)) return false;
       continue;
     }
+    if (StartsWith(arg, "--set-applied-gtid-set=")) {
+      opts->applied_gtid_set = arg.substr(23);
+      opts->set_applied_gtid = true;
+      continue;
+    }
 
     std::cerr << "Unknown argument: " << arg << "\n";
     return false;
   }
 
   if (opts->show_help) return true;
-  if (opts->schema.empty()) {
+  if (!opts->state_only && opts->schema.empty()) {
     std::cerr << "Missing required --schema\n";
     return false;
   }
@@ -288,8 +328,18 @@ bool ParseArgs(int argc, char **argv, Options *opts) {
     std::cerr << "Either --duckdb-path or --duckdb-dir is required\n";
     return false;
   }
+  if (opts->duckdb_path.empty() && !opts->duckdb_dir.empty() &&
+      opts->schema.empty()) {
+    std::cerr << "--schema is required when using --duckdb-dir\n";
+    return false;
+  }
   if (opts->batch_rows == 0) {
     std::cerr << "--batch must be > 0\n";
+    return false;
+  }
+  if (opts->reset_applied_gtid && opts->set_applied_gtid) {
+    std::cerr << "Cannot combine --reset-applied-gtid-set with "
+                 "--set-applied-gtid-set\n";
     return false;
   }
 
@@ -337,6 +387,149 @@ std::string QuoteDuckdbLiteral(const std::string &value) {
     escaped.push_back(ch);
   }
   return "'" + escaped + "'";
+}
+
+struct ReplStateRow {
+  bool found{false};
+  std::string snapshot_gtid_set;
+  std::string applied_gtid_set;
+  std::string last_commit_ts;
+};
+
+bool HasStateOperations(const Options &opts) {
+  return opts.reset_applied_gtid || opts.set_applied_gtid || opts.drop_watermark ||
+         opts.show_state;
+}
+
+bool ValidateAppliedGtidSet(const Options &opts) {
+  if (!opts.set_applied_gtid) return true;
+  if (opts.applied_gtid_set.empty()) {
+    std::cerr << "--set-applied-gtid-set cannot be empty; use "
+                 "--reset-applied-gtid-set to clear\n";
+    return false;
+  }
+  binary_log::gtids::Gtid_set parsed;
+  std::string error;
+  if (!duckdb_se::ParseGtidSetString(opts.applied_gtid_set, &parsed, &error)) {
+    std::cerr << "Invalid GTID set: "
+              << (error.empty() ? "parse error" : error) << "\n";
+    return false;
+  }
+  return true;
+}
+
+bool FetchReplStateRow(duckdb::Connection &conn, ReplStateRow *row,
+                       std::string *error) {
+  if (!row) return false;
+  row->found = false;
+  row->snapshot_gtid_set.clear();
+  row->applied_gtid_set.clear();
+  row->last_commit_ts.clear();
+  auto result = conn.Query(
+      "SELECT snapshot_gtid_set, applied_gtid_set, last_commit_ts "
+      "FROM __repl_state WHERE channel = '" +
+      std::string(kReplChannel) + "' LIMIT 1");
+  if (result->HasError()) {
+    if (error) *error = result->GetError();
+    return false;
+  }
+  auto chunk = result->Fetch();
+  if (!chunk || chunk->size() == 0) return true;
+  row->found = true;
+  auto snap_val = chunk->GetValue(0, 0);
+  if (!snap_val.IsNull()) row->snapshot_gtid_set = snap_val.ToString();
+  auto applied_val = chunk->GetValue(1, 0);
+  if (!applied_val.IsNull()) row->applied_gtid_set = applied_val.ToString();
+  auto ts_val = chunk->GetValue(2, 0);
+  if (!ts_val.IsNull()) row->last_commit_ts = ts_val.ToString();
+  return true;
+}
+
+void PrintReplStateRow(const ReplStateRow &row) {
+  if (!row.found) {
+    std::cout << "__repl_state: <empty>\n";
+    return;
+  }
+  const auto format = [](const std::string &value) {
+    return value.empty() ? "<NULL>" : value;
+  };
+  std::cout << "snapshot_gtid_set: " << format(row.snapshot_gtid_set) << "\n";
+  std::cout << "applied_gtid_set: " << format(row.applied_gtid_set) << "\n";
+  std::cout << "last_commit_ts: " << format(row.last_commit_ts) << "\n";
+}
+
+bool ApplyReplStateOperations(const Options &opts,
+                              const std::string &duckdb_path) {
+  if (!HasStateOperations(opts)) return true;
+  try {
+    duckdb::DuckDB db(duckdb_path);
+    duckdb::Connection conn(db);
+    std::string error;
+    if (opts.reset_applied_gtid || opts.set_applied_gtid || opts.show_state) {
+      if (!duckdb_se::EnsureReplStateTable(conn, &error)) {
+        std::cerr << "Failed to ensure __repl_state: "
+                  << (error.empty() ? "unknown error" : error) << "\n";
+        return false;
+      }
+    }
+
+    if (opts.reset_applied_gtid) {
+      const std::string sql =
+          "INSERT INTO __repl_state (channel, snapshot_gtid_set, "
+          "applied_gtid_set, last_commit_ts) "
+          "VALUES ('" +
+          std::string(kReplChannel) + "', NULL, NULL, CURRENT_TIMESTAMP) "
+          "ON CONFLICT(channel) DO UPDATE SET applied_gtid_set = NULL, "
+          "last_commit_ts = CURRENT_TIMESTAMP";
+      auto result = conn.Query(sql);
+      if (result->HasError()) {
+        std::cerr << "Failed to reset applied_gtid_set: "
+                  << result->GetError() << "\n";
+        return false;
+      }
+    }
+
+    if (opts.set_applied_gtid) {
+      const std::string gtid_sql = QuoteDuckdbLiteral(opts.applied_gtid_set);
+      const std::string sql =
+          "INSERT INTO __repl_state (channel, snapshot_gtid_set, "
+          "applied_gtid_set, last_commit_ts) "
+          "VALUES ('" +
+          std::string(kReplChannel) + "', NULL, " + gtid_sql +
+          ", CURRENT_TIMESTAMP) "
+          "ON CONFLICT(channel) DO UPDATE SET applied_gtid_set = " + gtid_sql +
+          ", last_commit_ts = CURRENT_TIMESTAMP";
+      auto result = conn.Query(sql);
+      if (result->HasError()) {
+        std::cerr << "Failed to set applied_gtid_set: " << result->GetError()
+                  << "\n";
+        return false;
+      }
+    }
+
+    if (opts.drop_watermark) {
+      auto result = conn.Query("DROP TABLE IF EXISTS __repl_watermark");
+      if (result->HasError()) {
+        std::cerr << "Failed to drop __repl_watermark: " << result->GetError()
+                  << "\n";
+        return false;
+      }
+    }
+
+    if (opts.show_state) {
+      ReplStateRow row;
+      if (!FetchReplStateRow(conn, &row, &error)) {
+        std::cerr << "Failed to read __repl_state: "
+                  << (error.empty() ? "unknown error" : error) << "\n";
+        return false;
+      }
+      PrintReplStateRow(row);
+    }
+  } catch (const std::exception &ex) {
+    std::cerr << "DuckDB open failed: " << ex.what() << "\n";
+    return false;
+  }
+  return true;
 }
 
 std::string MakeLoadingTableName(const std::string &base) {
@@ -1152,11 +1345,25 @@ int main(int argc, char **argv) {
     PrintUsage(argv[0]);
     return 0;
   }
+  if (!ValidateAppliedGtidSet(opts)) return 1;
+  const bool has_state_ops = HasStateOperations(opts);
+  if (opts.state_only && !has_state_ops) {
+    std::cerr << "No state operation specified for --state-only\n";
+    return 1;
+  }
 
   const std::string duckdb_path = ResolveDuckdbPath(opts);
   if (duckdb_path.empty()) {
     std::cerr << "Unable to resolve DuckDB path\n";
     return 1;
+  }
+  if (opts.state_only) {
+    if (!std::filesystem::exists(duckdb_path)) {
+      std::cerr << "DuckDB file not found: " << duckdb_path << "\n";
+      return 1;
+    }
+    if (!ApplyReplStateOperations(opts, duckdb_path)) return 1;
+    return 0;
   }
   std::filesystem::path duckdb_file(duckdb_path);
   std::error_code ec;
@@ -1422,6 +1629,9 @@ int main(int argc, char **argv) {
   adapter.Shutdown();
   mysql_close(mysql);
   mysql_library_end();
+  if (has_state_ops) {
+    if (!ApplyReplStateOperations(opts, duckdb_path)) return 1;
+  }
   if (opts.validate && !validation_ok) return 2;
   return 0;
 }

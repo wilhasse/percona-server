@@ -33,3 +33,13 @@
 - Clear the GTID stop and resume:
   `SET GLOBAL duckdb_binlog_apply_stop_at_gtid = '';`
   `SET GLOBAL duckdb_binlog_apply_paused = 0;`
+
+## Resync and State Recovery
+- Inspect current replication state:
+  `duckdb_snapshot_loader --state-only --duckdb-path /path/db.duckdb --show-state`
+- Reset applied GTID state (force replay) and drop legacy watermark:
+  `duckdb_snapshot_loader --state-only --duckdb-path /path/db.duckdb --reset-applied-gtid-set --drop-watermark`
+- Force a specific applied GTID set:
+  `duckdb_snapshot_loader --state-only --duckdb-path /path/db.duckdb --set-applied-gtid-set 'uuid:1-123'`
+- Reload a single table during recovery:
+  `duckdb_snapshot_loader --schema db --table tbl --overwrite --duckdb-dir /var/lib/mysql/duckdb`
