@@ -755,6 +755,9 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
   stream_opts.start_file = start_file;
   stream_opts.start_position = start_pos;
   stream_opts.non_blocking = false;
+  if (!use_gtid) {
+    stream_opts.heartbeat_period_s = 1.0;
+  }
 
   if (use_gtid) {
     sql_print_information(

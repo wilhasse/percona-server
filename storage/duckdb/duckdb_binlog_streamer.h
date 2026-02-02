@@ -47,6 +47,7 @@ struct BinlogStreamOptions {
   uint32_t port{3306};
   uint32_t server_id{24844};
   bool non_blocking{false};
+  double heartbeat_period_s{0.0};
   std::string gtid_set;
   std::string start_file;
   uint64_t start_position{0};

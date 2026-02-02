@@ -154,6 +154,21 @@ bool ConfigureBinlogChecksum(MYSQL *mysql, std::string *error_out) {
   return true;
 }
 
+bool ConfigureBinlogHeartbeat(MYSQL *mysql, double period_s,
+                              std::string *error_out) {
+  if (!mysql || period_s <= 0.0) return true;
+  const unsigned long long nanos =
+      static_cast<unsigned long long>(period_s * 1000000000ULL);
+  const std::string sql =
+      "SET @master_heartbeat_period = " + std::to_string(nanos) +
+      ", @source_heartbeat_period = " + std::to_string(nanos);
+  if (mysql_real_query(mysql, sql.c_str(), sql.size()) != 0) {
+    if (error_out) *error_out = mysql_error(mysql);
+    return false;
+  }
+  return true;
+}
+
 // Validate required binlog configuration on the source server
 duckdb_se::Status ValidateBinlogConfig(MYSQL *mysql, bool require_gtid) {
   std::string value;
@@ -288,6 +303,16 @@ Status DuckDBBinlogStreamer::Open(const BinlogStreamOptions &options) {
       mysql_ = nullptr;
       return Status::Error(StatusCode::kInvalid,
                            "Failed to set binlog checksum: " + error);
+    }
+  }
+  {
+    std::string error;
+    if (!ConfigureBinlogHeartbeat(mysql_, options_.heartbeat_period_s,
+                                  &error)) {
+      mysql_close(mysql_);
+      mysql_ = nullptr;
+      return Status::Error(StatusCode::kInvalid,
+                           "Failed to set binlog heartbeat: " + error);
     }
   }
 
