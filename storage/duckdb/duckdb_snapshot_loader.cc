@@ -49,6 +49,7 @@
 
 #include "storage/duckdb/duckdb_adapter.h"
 #include "storage/duckdb/duckdb_binlog_applier.h"
+#include "storage/duckdb/duckdb_binlog_ddl.h"
 #include "storage/duckdb/duckdb_binlog_streamer.h"
 #include "storage/duckdb/duckdb_gtid_utils.h"
 #include "storage/duckdb/duckdb_row_decoder.h"
@@ -72,6 +73,7 @@ using duckdb_se::Gtid;
 using duckdb_se::BinlogEvent;
 using duckdb_se::BinlogStreamOptions;
 using duckdb_se::MySQLTableDef;
+using duckdb_se::ParsedDdl;
 using duckdb_se::Row;
 using duckdb_se::RowBatch;
 using duckdb_se::Status;
@@ -1166,6 +1168,7 @@ bool IsBufferableEvent(const BinlogEvent &event) {
     case BinlogEvent::Type::kWriteRows:
     case BinlogEvent::Type::kUpdateRows:
     case BinlogEvent::Type::kDeleteRows:
+    case BinlogEvent::Type::kQuery:
     case BinlogEvent::Type::kXid:
       return true;
     default:
@@ -1214,7 +1217,8 @@ bool ShouldApplyEvent(const BinlogEvent &event, const std::string &schema,
   return true;
 }
 
-Status ApplyBufferedEvents(DuckDBAdapter &adapter, DuckDBBinlogStreamer &streamer,
+Status ApplyBufferedEvents(MYSQL *mysql, DuckDBAdapter &adapter,
+                           DuckDBBinlogStreamer &streamer,
                            const std::vector<BinlogEvent> &events,
                            const std::string &schema_filter,
                            const std::string &table_filter, bool verbose) {
@@ -1314,6 +1318,78 @@ Status ApplyBufferedEvents(DuckDBAdapter &adapter, DuckDBBinlogStreamer &streame
           st = applier.AppendDeleteRows(table_id, std::move(batch));
           if (!st.ok()) return st;
         }
+        break;
+      }
+      case BinlogEvent::Type::kQuery: {
+        if (event.query.empty()) break;
+        ParsedDdl parsed;
+        std::string parse_error;
+        if (!ParseDdlQuery(event.query, event.schema, &parsed, &parse_error)) {
+          if (!parse_error.empty() && verbose) {
+            std::cerr << "DDL parse skipped: " << parse_error << "\n";
+          }
+          break;
+        }
+        if (!ShouldApplySchema(parsed.schema, schema_filter)) {
+          break;
+        }
+        if (!table_filter.empty()) {
+          const std::string &table_name = parsed.change.table.table;
+          const std::string &new_table = parsed.change.new_table.table;
+          if (table_name != table_filter && new_table != table_filter) {
+            break;
+          }
+        }
+        if (!txn_active) {
+          if (event.gtid.empty()) {
+            return Status::Error(duckdb_se::StatusCode::kInvalid,
+                                 "DDL event without active GTID");
+          }
+          Status st = begin_txn(event.gtid);
+          if (!st.ok()) return st;
+        }
+
+        DDLChange change = std::move(parsed.change);
+        if (change.type == DDLChange::Type::kCreate) {
+          if (parsed.if_not_exists) {
+            bool exists = false;
+            if (!DuckdbTableExists(adapter, parsed.schema,
+                                   change.table.table, &exists)) {
+              return Status::Error(duckdb_se::StatusCode::kInvalid,
+                                   "DuckDB table existence check failed");
+            }
+            if (exists) break;
+          }
+          if (!mysql) {
+            return Status::Error(duckdb_se::StatusCode::kInvalid,
+                                 "Missing MySQL handle for DDL");
+          }
+          MySQLTableDef def;
+          std::vector<bool> blob_flags;
+          if (!FetchTableDef(mysql, parsed.schema, change.table.table, &def,
+                             &blob_flags)) {
+            return Status::Error(duckdb_se::StatusCode::kInvalid,
+                                 "Failed to fetch table definition for DDL");
+          }
+          change.new_def = std::move(def);
+        } else if (change.type == DDLChange::Type::kAlter) {
+          if (!mysql) {
+            return Status::Error(duckdb_se::StatusCode::kInvalid,
+                                 "Missing MySQL handle for DDL");
+          }
+          MySQLTableDef def;
+          std::vector<bool> blob_flags;
+          if (!FetchTableDef(mysql, parsed.schema, change.table.table, &def,
+                             &blob_flags)) {
+            return Status::Error(duckdb_se::StatusCode::kInvalid,
+                                 "Failed to fetch table definition for DDL");
+          }
+          change.new_def = std::move(def);
+          change.copy_ddl = true;
+        }
+
+        Status st = applier.ApplyDDL(std::move(change));
+        if (!st.ok()) return st;
         break;
       }
       case BinlogEvent::Type::kXid: {
@@ -1603,8 +1679,9 @@ int main(int argc, char **argv) {
     std::cerr << "Buffered " << buffered_events.size() << " binlog events\n";
   }
   if (!buffered_events.empty()) {
-    Status st = ApplyBufferedEvents(adapter, binlog_streamer, buffered_events,
-                                    opts.schema, opts.table, opts.verbose);
+    Status st =
+        ApplyBufferedEvents(mysql, adapter, binlog_streamer, buffered_events,
+                            opts.schema, opts.table, opts.verbose);
     if (!st.ok()) {
       std::cerr << "Applying buffered binlog events failed: " << st.message
                 << "\n";

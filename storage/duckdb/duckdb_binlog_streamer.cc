@@ -35,6 +35,7 @@
 #include "libbinlogevents/include/control_events.h"
 #include "libbinlogevents/include/gtids/gtidset.h"
 #include "libbinlogevents/include/rows_event.h"
+#include "libbinlogevents/include/statement_events.h"
 #include "my_byteorder.h"
 #include "storage/duckdb/duckdb_gtid_utils.h"
 
@@ -476,6 +477,19 @@ Status DuckDBBinlogStreamer::NextEvent(BinlogEvent *event) {
       case binary_log::QUERY_EVENT: {
         event->type = BinlogEvent::Type::kQuery;
         event->gtid = current_gtid_;
+        event->schema.clear();
+        event->query.clear();
+        binary_log::Query_event qev(buf, fde_.get(), event_type);
+        if (qev.header()->get_is_valid()) {
+          if (qev.db && qev.db_len > 0) {
+            event->schema.assign(qev.db, qev.db_len);
+          }
+          if (qev.query) {
+            const size_t qlen = qev.q_len > 0 ? qev.q_len
+                                              : std::strlen(qev.query);
+            event->query.assign(qev.query, qlen);
+          }
+        }
         return Status::Ok();
       }
       default:

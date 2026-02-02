@@ -79,6 +79,7 @@ struct BinlogEvent {
   std::vector<uint8_t> columns_before;
   std::vector<uint8_t> columns_after;
   std::vector<uint8_t> row_data;
+  std::string query;
 };
 
 class DuckDBBinlogStreamer {

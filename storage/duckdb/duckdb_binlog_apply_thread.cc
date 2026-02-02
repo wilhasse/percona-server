@@ -40,6 +40,7 @@
 #include "sql/mysqld.h"
 #include "storage/duckdb/duckdb_adapter.h"
 #include "storage/duckdb/duckdb_binlog_applier.h"
+#include "storage/duckdb/duckdb_binlog_ddl.h"
 #include "storage/duckdb/duckdb_binlog_streamer.h"
 #include "storage/duckdb/duckdb_gtid_utils.h"
 #include "storage/duckdb/duckdb_repl_state.h"
@@ -266,6 +267,147 @@ bool ShouldApplySchema(const std::string &schema,
   return schema == schema_filter;
 }
 
+std::string QuoteMySQLLiteral(MYSQL *mysql, const std::string &value) {
+  std::string escaped;
+  escaped.resize(value.size() * 2 + 1);
+  const unsigned long len = mysql_real_escape_string(
+      mysql, &escaped[0], value.c_str(), static_cast<unsigned long>(value.size()));
+  escaped.resize(len);
+  return "'" + escaped + "'";
+}
+
+bool FetchTableDef(MYSQL *mysql, const std::string &schema,
+                   const std::string &table, MySQLTableDef *def) {
+  if (!mysql || !def) return false;
+  def->schema = schema;
+  def->name = table;
+  def->columns.clear();
+
+  const std::string sql =
+      "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE "
+      "FROM INFORMATION_SCHEMA.COLUMNS "
+      "WHERE TABLE_SCHEMA = " +
+      QuoteMySQLLiteral(mysql, schema) +
+      " AND TABLE_NAME = " + QuoteMySQLLiteral(mysql, table) +
+      " ORDER BY ORDINAL_POSITION";
+
+  if (mysql_real_query(mysql, sql.c_str(), sql.size()) != 0) {
+    return false;
+  }
+  MYSQL_RES *res = mysql_store_result(mysql);
+  if (!res) return false;
+  MYSQL_ROW row;
+  while ((row = mysql_fetch_row(res))) {
+    if (!row[0] || !row[1] || !row[2]) continue;
+    ColumnDef col;
+    col.name = row[0];
+    col.type = row[1];
+    col.not_null = std::strcmp(row[2], "NO") == 0;
+    def->columns.push_back(col);
+  }
+  mysql_free_result(res);
+  return !def->columns.empty();
+}
+
+Status FetchTableDefFromSource(const BinlogApplyThreadOptions &options,
+                               const std::string &schema,
+                               const std::string &table,
+                               MySQLTableDef *def) {
+  MYSQL *mysql = mysql_init(nullptr);
+  if (!mysql) {
+    return Status::Error(StatusCode::kInvalid, "mysql_init failed");
+  }
+  if (!mysql_real_connect(mysql, options.host.c_str(), options.user.c_str(),
+                          options.password.empty()
+                              ? nullptr
+                              : options.password.c_str(),
+                          nullptr, options.port,
+                          options.socket.empty() ? nullptr
+                                                  : options.socket.c_str(),
+                          0)) {
+    std::string err = mysql_error(mysql);
+    mysql_close(mysql);
+    return Status::Error(StatusCode::kInvalid,
+                         "mysql_real_connect failed: " + err);
+  }
+  bool ok = FetchTableDef(mysql, schema, table, def);
+  std::string err = ok ? "" : mysql_error(mysql);
+  mysql_close(mysql);
+  if (!ok) {
+    return Status::Error(StatusCode::kInvalid,
+                         err.empty() ? "Failed to fetch table definition"
+                                     : err);
+  }
+  return Status::Ok();
+}
+
+bool DuckdbTableExists(DuckDBAdapter &adapter, const std::string &table) {
+  const std::string sql =
+      "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' "
+      "AND table_name = '" + table + "' LIMIT 1";
+  auto result = adapter.ExecuteQuery(sql, {});
+  if (!result.ok) return false;
+  auto chunk = result.result->Fetch();
+  return chunk && chunk->size() > 0;
+}
+
+Status ApplyDdlEvent(const BinlogEvent &event,
+                     const BinlogApplyThreadOptions &options,
+                     std::map<std::string, SchemaApplierState> *schema_states,
+                     const std::string &gtid) {
+  if (!schema_states) {
+    return Status::Error(StatusCode::kInvalid, "Missing schema states");
+  }
+  if (event.query.empty()) return Status::Ok();
+  ParsedDdl parsed;
+  std::string parse_error;
+  if (!ParseDdlQuery(event.query, event.schema, &parsed, &parse_error)) {
+    if (!parse_error.empty()) {
+      sql_print_warning("DuckDB binlog applier: DDL parse skipped: %s",
+                        parse_error.c_str());
+    }
+    return Status::Ok();
+  }
+  if (!ShouldApplySchema(parsed.schema, options.schema_filter)) {
+    return Status::Ok();
+  }
+
+  SchemaApplierState *state = nullptr;
+  Status st = EnsureSchemaApplier(parsed.schema, schema_states, &state);
+  if (!st.ok()) return st;
+  if (!state->applier) {
+    return Status::Error(StatusCode::kInvalid, "Missing applier state");
+  }
+
+  if (!state->txn_active) {
+    st = state->applier->BeginTransaction(Gtid{gtid});
+    if (!st.ok()) return st;
+    state->txn_active = true;
+  }
+
+  DDLChange change = std::move(parsed.change);
+  if (change.type == DDLChange::Type::kCreate) {
+    if (parsed.if_not_exists &&
+        DuckdbTableExists(*state->adapter, change.table.table)) {
+      return Status::Ok();
+    }
+    MySQLTableDef def;
+    st = FetchTableDefFromSource(options, parsed.schema, change.table.table,
+                                 &def);
+    if (!st.ok()) return st;
+    change.new_def = std::move(def);
+  } else if (change.type == DDLChange::Type::kAlter) {
+    MySQLTableDef def;
+    st = FetchTableDefFromSource(options, parsed.schema, change.table.table,
+                                 &def);
+    if (!st.ok()) return st;
+    change.new_def = std::move(def);
+    change.copy_ddl = true;
+  }
+
+  return state->applier->ApplyDDL(std::move(change));
+}
+
 Status EnsureSchemaApplier(const std::string &schema,
                            std::map<std::string, SchemaApplierState> *states,
                            SchemaApplierState **out_state) {
@@ -474,6 +616,14 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
         st = EnsureSchemaApplier(map->schema, &schema_states, &state);
         if (!st.ok()) return st;
         st = ApplyRowEvent(event, *map, *state, current_gtid);
+        if (!st.ok()) return st;
+        break;
+      }
+      case BinlogEvent::Type::kQuery: {
+        if (!seen_gtid || current_gtid.empty()) {
+          break;
+        }
+        st = ApplyDdlEvent(event, options, &schema_states, current_gtid);
         if (!st.ok()) return st;
         break;
       }
