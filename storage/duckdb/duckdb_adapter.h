@@ -24,6 +24,7 @@
 #ifndef PLUGIN_DUCKDB_ADAPTER_H_
 #define PLUGIN_DUCKDB_ADAPTER_H_
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -178,6 +179,7 @@ class DuckDBAdapter {
   Status GetAppliedGtids(std::vector<Gtid> *gtids);
   Status IsGtidApplied(const Gtid &gtid, bool *applied);
   Status GetTableColumns(TableId table, std::vector<std::string> *columns);
+  Status GetSchemaVersion(int64_t *version, bool *found);
 
  private:
   Status EnsureInitialized() const;

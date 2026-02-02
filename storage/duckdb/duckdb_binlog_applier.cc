@@ -134,6 +134,25 @@ Status LoadWatermarkGtidSet(duckdb::Connection &conn, std::string *out_set) {
   return Status::Ok();
 }
 
+Status UpdateSchemaVersion(duckdb::Connection &conn) {
+  std::string error;
+  if (!EnsureReplStateTable(conn, &error)) {
+    return Status::Error(StatusCode::kDuckDBError,
+                         error.empty() ? "Failed to ensure __repl_state"
+                                       : error);
+  }
+  const std::string sql =
+      "INSERT INTO __repl_state (channel, schema_version) VALUES ('" +
+      std::string(kReplChannel) +
+      "', 1) ON CONFLICT(channel) DO UPDATE SET schema_version = "
+      "COALESCE(__repl_state.schema_version, 0) + 1";
+  auto result = conn.Query(sql);
+  if (result->HasError()) {
+    return Status::Error(StatusCode::kDuckDBError, result->GetError());
+  }
+  return Status::Ok();
+}
+
 BinlogApplyState &GetApplyState() {
   static BinlogApplyState state;
   return state;
@@ -1018,7 +1037,9 @@ Status DuckDBBinlogApplier::ApplyDDL(DDLChange change) {
     return st;
   }
 
-  return adapter_->ApplyDDLInTxn(apply_txn_, std::move(change));
+  st = adapter_->ApplyDDLInTxn(apply_txn_, std::move(change));
+  if (!st.ok()) return st;
+  return UpdateSchemaVersion(*apply_txn_.conn);
 }
 
 Status DuckDBBinlogApplier::CommitTransaction() {

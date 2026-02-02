@@ -686,6 +686,55 @@ Status DuckDBAdapter::GetTableColumns(TableId table,
   return Status::Ok();
 }
 
+Status DuckDBAdapter::GetSchemaVersion(int64_t *version, bool *found) {
+  if (!version || !found) {
+    return Status::Error(StatusCode::kInvalid, "Schema version output is null");
+  }
+  *version = 0;
+  *found = false;
+
+  auto st = EnsureInitialized();
+  if (!st.ok()) return st;
+
+  std::string error;
+  if (!EnsureReplStateTable(*conn_, &error)) {
+    return Status::Error(StatusCode::kDuckDBError,
+                         error.empty() ? "Failed to ensure __repl_state"
+                                       : error);
+  }
+
+  try {
+    auto result = conn_->Query(
+        "SELECT schema_version FROM __repl_state WHERE channel = '" +
+        std::string(kReplChannel) + "' LIMIT 1");
+    if (result->HasError()) {
+      return Status::Error(StatusCode::kDuckDBError, result->GetError());
+    }
+    auto chunk = result->Fetch();
+    if (!chunk || chunk->size() == 0) {
+      return Status::Ok();
+    }
+    *found = true;
+    auto val = chunk->GetValue(0, 0);
+    if (val.IsNull()) {
+      return Status::Ok();
+    }
+    const std::string value = val.ToString();
+    if (value.empty()) {
+      return Status::Ok();
+    }
+    try {
+      *version = std::stoll(value);
+    } catch (const std::exception &ex) {
+      return Status::Error(StatusCode::kInvalid, ex.what());
+    }
+  } catch (const std::exception &ex) {
+    return Status::Error(StatusCode::kDuckDBError, ex.what());
+  }
+
+  return Status::Ok();
+}
+
 Status DuckDBAdapter::CopyTable(TableId source,
                                 const MySQLTableDef &target_def) {
   auto st = EnsureInitialized();

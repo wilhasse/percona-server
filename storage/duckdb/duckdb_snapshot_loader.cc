@@ -396,6 +396,7 @@ struct ReplStateRow {
   std::string snapshot_gtid_set;
   std::string applied_gtid_set;
   std::string last_commit_ts;
+  std::string schema_version;
 };
 
 bool HasStateOperations(const Options &opts) {
@@ -427,8 +428,10 @@ bool FetchReplStateRow(duckdb::Connection &conn, ReplStateRow *row,
   row->snapshot_gtid_set.clear();
   row->applied_gtid_set.clear();
   row->last_commit_ts.clear();
+  row->schema_version.clear();
   auto result = conn.Query(
-      "SELECT snapshot_gtid_set, applied_gtid_set, last_commit_ts "
+      "SELECT snapshot_gtid_set, applied_gtid_set, last_commit_ts, "
+      "schema_version "
       "FROM __repl_state WHERE channel = '" +
       std::string(kReplChannel) + "' LIMIT 1");
   if (result->HasError()) {
@@ -444,6 +447,8 @@ bool FetchReplStateRow(duckdb::Connection &conn, ReplStateRow *row,
   if (!applied_val.IsNull()) row->applied_gtid_set = applied_val.ToString();
   auto ts_val = chunk->GetValue(2, 0);
   if (!ts_val.IsNull()) row->last_commit_ts = ts_val.ToString();
+  auto ver_val = chunk->GetValue(3, 0);
+  if (!ver_val.IsNull()) row->schema_version = ver_val.ToString();
   return true;
 }
 
@@ -458,6 +463,7 @@ void PrintReplStateRow(const ReplStateRow &row) {
   std::cout << "snapshot_gtid_set: " << format(row.snapshot_gtid_set) << "\n";
   std::cout << "applied_gtid_set: " << format(row.applied_gtid_set) << "\n";
   std::cout << "last_commit_ts: " << format(row.last_commit_ts) << "\n";
+  std::cout << "schema_version: " << format(row.schema_version) << "\n";
 }
 
 bool ApplyReplStateOperations(const Options &opts,
@@ -810,7 +816,8 @@ bool StoreSnapshotGtid(DuckDBAdapter &adapter, const std::string &gtid) {
       "channel VARCHAR PRIMARY KEY, "
       "snapshot_gtid_set VARCHAR, "
       "applied_gtid_set VARCHAR, "
-      "last_commit_ts TIMESTAMP)",
+      "last_commit_ts TIMESTAMP, "
+      "schema_version BIGINT)",
       {});
   if (!create.ok) {
     std::cerr << "DuckDB __repl_state create failed: " << create.error << "\n";
@@ -850,7 +857,8 @@ bool StoreSnapshotGtid(DuckDBAdapter &adapter, const std::string &gtid) {
         "channel VARCHAR PRIMARY KEY, "
         "snapshot_gtid_set VARCHAR, "
         "applied_gtid_set VARCHAR, "
-        "last_commit_ts TIMESTAMP)",
+        "last_commit_ts TIMESTAMP, "
+        "schema_version BIGINT)",
         {});
     if (!create_new.ok) {
       std::cerr << "DuckDB __repl_state_new create failed: "
@@ -863,8 +871,8 @@ bool StoreSnapshotGtid(DuckDBAdapter &adapter, const std::string &gtid) {
         updated_ts.empty() ? "CURRENT_TIMESTAMP" : QuoteDuckdbLiteral(updated_ts);
     const std::string insert_sql =
         "INSERT INTO __repl_state_new (channel, snapshot_gtid_set, "
-        "applied_gtid_set, last_commit_ts) VALUES ('default', " +
-        snapshot_sql + ", NULL, " + ts_sql + ")";
+        "applied_gtid_set, last_commit_ts, schema_version) VALUES ('default', " +
+        snapshot_sql + ", NULL, " + ts_sql + ", NULL)";
     auto insert = adapter.ExecuteQuery(insert_sql, {});
     if (!insert.ok) {
       std::cerr << "DuckDB __repl_state_new insert failed: " << insert.error

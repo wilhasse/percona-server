@@ -92,7 +92,8 @@ inline bool EnsureReplStateTable(duckdb::Connection &conn,
         "channel VARCHAR PRIMARY KEY, "
         "snapshot_gtid_set VARCHAR, "
         "applied_gtid_set VARCHAR, "
-        "last_commit_ts TIMESTAMP)";
+        "last_commit_ts TIMESTAMP, "
+        "schema_version BIGINT)";
     auto create = conn.Query(create_sql);
     if (create->HasError()) {
       if (error) *error = create->GetError();
@@ -105,6 +106,7 @@ inline bool EnsureReplStateTable(duckdb::Connection &conn,
   bool has_snapshot = false;
   bool has_applied = false;
   bool has_last_commit = false;
+  bool has_schema_version = false;
   bool has_id = false;
   bool has_updated = false;
   for (const auto &col : columns) {
@@ -112,10 +114,19 @@ inline bool EnsureReplStateTable(duckdb::Connection &conn,
     if (col == "snapshot_gtid_set") has_snapshot = true;
     if (col == "applied_gtid_set") has_applied = true;
     if (col == "last_commit_ts") has_last_commit = true;
+    if (col == "schema_version") has_schema_version = true;
     if (col == "id") has_id = true;
     if (col == "updated_ts") has_updated = true;
   }
   if (has_channel && has_snapshot && has_applied && has_last_commit) {
+    if (!has_schema_version) {
+      auto alter =
+          conn.Query("ALTER TABLE __repl_state ADD COLUMN schema_version BIGINT");
+      if (alter->HasError()) {
+        if (error) *error = alter->GetError();
+        return false;
+      }
+    }
     return true;
   }
 
@@ -143,7 +154,8 @@ inline bool EnsureReplStateTable(duckdb::Connection &conn,
         "channel VARCHAR PRIMARY KEY, "
         "snapshot_gtid_set VARCHAR, "
         "applied_gtid_set VARCHAR, "
-        "last_commit_ts TIMESTAMP)");
+        "last_commit_ts TIMESTAMP, "
+        "schema_version BIGINT)");
     if (create->HasError()) {
       if (error) *error = create->GetError();
       return false;
@@ -155,9 +167,9 @@ inline bool EnsureReplStateTable(duckdb::Connection &conn,
                              : "'" + EscapeReplStateLiteral(updated) + "'";
     const std::string insert_sql =
         "INSERT INTO __repl_state_new (channel, snapshot_gtid_set, "
-        "applied_gtid_set, last_commit_ts) "
+        "applied_gtid_set, last_commit_ts, schema_version) "
         "VALUES ('default', " +
-        snapshot_sql + ", NULL, " + ts_sql + ")";
+        snapshot_sql + ", NULL, " + ts_sql + ", NULL)";
     auto insert = conn.Query(insert_sql);
     if (insert->HasError()) {
       if (error) *error = insert->GetError();

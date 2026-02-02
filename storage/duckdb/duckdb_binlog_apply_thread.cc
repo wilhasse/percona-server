@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <map>
@@ -54,6 +55,8 @@ struct SchemaApplierState {
   std::unique_ptr<DuckDBAdapter> adapter;
   std::unique_ptr<DuckDBBinlogApplier> applier;
   bool txn_active{false};
+  int64_t schema_version{0};
+  bool schema_version_loaded{false};
 };
 
 struct ApplyThreadState {
@@ -267,6 +270,48 @@ bool ShouldApplySchema(const std::string &schema,
   return schema == schema_filter;
 }
 
+Status LoadSchemaVersion(SchemaApplierState *state) {
+  if (!state || !state->adapter) {
+    return Status::Error(StatusCode::kInvalid, "Missing schema adapter");
+  }
+  int64_t version = 0;
+  bool found = false;
+  Status st = state->adapter->GetSchemaVersion(&version, &found);
+  if (!st.ok()) return st;
+  if (found) {
+    state->schema_version = version;
+    state->schema_version_loaded = true;
+  } else {
+    state->schema_version = 0;
+    state->schema_version_loaded = false;
+  }
+  return Status::Ok();
+}
+
+Status EnsureSchemaVersionFresh(SchemaApplierState *state) {
+  if (!state || !state->adapter) {
+    return Status::Error(StatusCode::kInvalid, "Missing schema adapter");
+  }
+  int64_t version = 0;
+  bool found = false;
+  Status st = state->adapter->GetSchemaVersion(&version, &found);
+  if (!st.ok()) return st;
+  if (!state->schema_version_loaded) {
+    state->schema_version = found ? version : 0;
+    state->schema_version_loaded = found;
+    return Status::Ok();
+  }
+  if (!found) {
+    return Status::Error(StatusCode::kInvalid,
+                         "DuckDB schema_version missing");
+  }
+  if (version != state->schema_version) {
+    return Status::Error(StatusCode::kInvalid,
+                         "DuckDB schema_version changed; restart apply");
+  }
+  return Status::Ok();
+}
+
 std::string QuoteMySQLLiteral(MYSQL *mysql, const std::string &value) {
   std::string escaped;
   escaped.resize(value.size() * 2 + 1);
@@ -396,7 +441,13 @@ Status ApplyDdlEvent(const BinlogEvent &event,
                                  &def);
     if (!st.ok()) return st;
     change.new_def = std::move(def);
-    return state->applier->ApplyDDL(std::move(change));
+    st = state->applier->ApplyDDL(std::move(change));
+    if (!st.ok()) return st;
+    state->schema_version = state->schema_version_loaded
+                                ? state->schema_version + 1
+                                : 1;
+    state->schema_version_loaded = true;
+    return Status::Ok();
   }
 
   if (change.type == DDLChange::Type::kAlter) {
@@ -414,10 +465,21 @@ Status ApplyDdlEvent(const BinlogEvent &event,
       change.new_def = std::move(def);
       change.copy_ddl = true;
     }
-    return state->applier->ApplyDDL(std::move(change));
+    st = state->applier->ApplyDDL(std::move(change));
+    if (!st.ok()) return st;
+    state->schema_version = state->schema_version_loaded
+                                ? state->schema_version + 1
+                                : 1;
+    state->schema_version_loaded = true;
+    return Status::Ok();
   }
 
-  return state->applier->ApplyDDL(std::move(change));
+  st = state->applier->ApplyDDL(std::move(change));
+  if (!st.ok()) return st;
+  state->schema_version =
+      state->schema_version_loaded ? state->schema_version + 1 : 1;
+  state->schema_version_loaded = true;
+  return Status::Ok();
 }
 
 Status EnsureSchemaApplier(const std::string &schema,
@@ -436,6 +498,8 @@ Status EnsureSchemaApplier(const std::string &schema,
     Status st = entry.adapter->Init(path, cfg);
     if (!st.ok()) return st;
     entry.applier = std::make_unique<DuckDBBinlogApplier>(entry.adapter.get());
+    st = LoadSchemaVersion(&entry);
+    if (!st.ok()) return st;
   }
   *out_state = &entry;
   return Status::Ok();
@@ -463,7 +527,9 @@ Status ApplyRowEvent(const BinlogEvent &event, const BinlogTableMap &map,
     return Status::Error(StatusCode::kInvalid, "Missing applier state");
   }
   if (!state.txn_active) {
-    Status st = state.applier->BeginTransaction(Gtid{gtid});
+    Status st = EnsureSchemaVersionFresh(&state);
+    if (!st.ok()) return st;
+    st = state.applier->BeginTransaction(Gtid{gtid});
     if (!st.ok()) return st;
     state.txn_active = true;
   }
