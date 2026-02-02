@@ -498,7 +498,7 @@ Status DuckDBAdapter::EnsureDeltaTable(duckdb::Connection &conn,
   }
 
   std::vector<ColumnInfo> columns;
-  Status st = GetTableInfo(table, &columns);
+  Status st = GetTableInfoOn(conn, table, &columns);
   if (!st.ok()) return st;
   if (columns.empty()) {
     return Status::Error(StatusCode::kInvalid, "No columns for delta table");
@@ -706,6 +706,13 @@ Status DuckDBAdapter::GetTableColumns(TableId table,
 
 Status DuckDBAdapter::GetTableInfo(TableId table,
                                    std::vector<ColumnInfo> *columns) {
+  auto st = EnsureInitialized();
+  if (!st.ok()) return st;
+  return GetTableInfoOn(*conn_, std::move(table), columns);
+}
+
+Status DuckDBAdapter::GetTableInfoOn(duckdb::Connection &conn, TableId table,
+                                     std::vector<ColumnInfo> *columns) {
   if (!columns) {
     return Status::Error(StatusCode::kInvalid, "Table info output is null");
   }
@@ -721,7 +728,7 @@ Status DuckDBAdapter::GetTableInfo(TableId table,
       "PRAGMA table_info('" + EscapeLiteral(table.table) + "')";
 
   try {
-    auto result = conn_->Query(sql);
+    auto result = conn.Query(sql);
     if (result->HasError()) {
       return Status::Error(StatusCode::kDuckDBError, result->GetError());
     }
@@ -760,6 +767,22 @@ Status DuckDBAdapter::GetTableInfo(TableId table,
   return Status::Ok();
 }
 
+Status DuckDBAdapter::GetTableColumnsOn(duckdb::Connection &conn, TableId table,
+                                        std::vector<std::string> *columns) {
+  if (!columns) {
+    return Status::Error(StatusCode::kInvalid, "Columns output is null");
+  }
+  columns->clear();
+
+  std::vector<ColumnInfo> info;
+  auto st = GetTableInfoOn(conn, std::move(table), &info);
+  if (!st.ok()) return st;
+  for (const auto &col : info) {
+    columns->push_back(col.name);
+  }
+  return Status::Ok();
+}
+
 Status DuckDBAdapter::GetPrimaryKeyColumns(
     TableId table, std::vector<std::string> *columns) {
   if (!columns) {
@@ -768,6 +791,33 @@ Status DuckDBAdapter::GetPrimaryKeyColumns(
   columns->clear();
   std::vector<ColumnInfo> info;
   Status st = GetTableInfo(table, &info);
+  if (!st.ok()) return st;
+
+  std::vector<std::pair<int, std::string>> pk;
+  pk.reserve(info.size());
+  for (const auto &col : info) {
+    if (col.pk > 0) {
+      pk.emplace_back(col.pk, col.name);
+    }
+  }
+  if (pk.empty()) return Status::Ok();
+  std::sort(pk.begin(), pk.end(),
+            [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
+  for (const auto &entry : pk) {
+    columns->push_back(entry.second);
+  }
+  return Status::Ok();
+}
+
+Status DuckDBAdapter::GetPrimaryKeyColumnsOn(
+    duckdb::Connection &conn, TableId table,
+    std::vector<std::string> *columns) {
+  if (!columns) {
+    return Status::Error(StatusCode::kInvalid, "PK output is null");
+  }
+  columns->clear();
+  std::vector<ColumnInfo> info;
+  Status st = GetTableInfoOn(conn, std::move(table), &info);
   if (!st.ok()) return st;
 
   std::vector<std::pair<int, std::string>> pk;
@@ -1174,14 +1224,14 @@ Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
     appender->Close();
 
     std::vector<std::string> columns;
-    st = GetTableColumns(table, &columns);
+    st = GetTableColumnsOn(*txn.conn, table, &columns);
     if (!st.ok()) return st;
     if (columns.empty()) {
       return Status::Error(StatusCode::kInvalid,
                            "No columns available for bulk update");
     }
     std::vector<std::string> pk_columns;
-    st = GetPrimaryKeyColumns(table, &pk_columns);
+    st = GetPrimaryKeyColumnsOn(*txn.conn, table, &pk_columns);
     if (!st.ok()) return st;
 
     for (const auto &row : batch.old_rows) {
@@ -1266,14 +1316,14 @@ Status DuckDBAdapter::ApplyBulkDeletes(ApplyTxn &txn, TableId table,
     appender->Close();
 
     std::vector<std::string> columns;
-    st = GetTableColumns(table, &columns);
+    st = GetTableColumnsOn(*txn.conn, table, &columns);
     if (!st.ok()) return st;
     if (columns.empty()) {
       return Status::Error(StatusCode::kInvalid,
                            "No columns available for bulk delete");
     }
     std::vector<std::string> pk_columns;
-    st = GetPrimaryKeyColumns(table, &pk_columns);
+    st = GetPrimaryKeyColumnsOn(*txn.conn, table, &pk_columns);
     if (!st.ok()) return st;
 
     for (const auto &row : batch.old_rows) {

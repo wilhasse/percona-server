@@ -220,7 +220,13 @@ class DuckDBAdapter {
     int pk{0};
   };
   Status GetTableInfo(TableId table, std::vector<ColumnInfo> *columns);
+  Status GetTableInfoOn(duckdb::Connection &conn, TableId table,
+                        std::vector<ColumnInfo> *columns);
+  Status GetTableColumnsOn(duckdb::Connection &conn, TableId table,
+                           std::vector<std::string> *columns);
   Status GetPrimaryKeyColumns(TableId table, std::vector<std::string> *columns);
+  Status GetPrimaryKeyColumnsOn(duckdb::Connection &conn, TableId table,
+                                std::vector<std::string> *columns);
 
   std::string db_path_;
   DuckDBConfig cfg_{};
