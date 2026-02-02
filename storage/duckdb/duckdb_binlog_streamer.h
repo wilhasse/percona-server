@@ -48,6 +48,8 @@ struct BinlogStreamOptions {
   uint32_t server_id{24844};
   bool non_blocking{true};
   std::string gtid_set;
+  std::string start_file;
+  uint64_t start_position{0};
 };
 
 struct BinlogTableMap {
@@ -76,6 +78,8 @@ struct BinlogEvent {
   uint64_t table_id{0};
   std::string schema;
   std::string table;
+  std::string log_file;
+  uint64_t log_pos{0};
   std::vector<uint8_t> columns_before;
   std::vector<uint8_t> columns_after;
   std::vector<uint8_t> row_data;
@@ -101,6 +105,9 @@ class DuckDBBinlogStreamer {
   MYSQL *mysql_{nullptr};
   bool open_{false};
   std::string current_gtid_;
+  std::string current_binlog_file_;
+  uint64_t current_binlog_pos_{0};
+  bool use_gtid_{true};
   std::vector<uint8_t> raw_buffer_;
   void *gtid_encoded_{nullptr};
   size_t gtid_encoded_size_{0};

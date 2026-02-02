@@ -108,6 +108,9 @@ struct Options {
   bool state_only{false};
   bool show_state{false};
   bool consistent_gtid_snapshot{false};
+  std::string start_file;
+  uint64_t start_pos{0};
+  bool capture_binlog_position{false};
   bool show_help{false};
 };
 
@@ -141,6 +144,10 @@ void PrintUsage(const char *argv0) {
          "  --state-only                  Only update/show replication state\n"
          "  --show-state                  Print current __repl_state values\n"
          "  --consistent-gtid-snapshot    Use FTWRL to tie GTID set to snapshot\n"
+         "  --start-file <file>           Record binlog file in __repl_state\n"
+         "  --start-pos <pos>             Record binlog position in __repl_state\n"
+         "  --capture-binlog-position     Capture binlog file/pos via SHOW MASTER STATUS\n"
+         "                               (ignored if --start-file/--start-pos set)\n"
          "  --verbose                Verbose output\n"
          "  --help                   Show this help\n\n"
          "Supported types (test phase): integer types, float/double, "
@@ -185,6 +192,16 @@ bool ParseUInt(const std::string &value, unsigned int *out) {
   return true;
 }
 
+bool ParseUInt64(const std::string &value, uint64_t *out) {
+  if (!out) return false;
+  errno = 0;
+  char *end = nullptr;
+  unsigned long long parsed = std::strtoull(value.c_str(), &end, 10);
+  if (errno != 0 || end == value.c_str() || *end != '\0') return false;
+  *out = static_cast<uint64_t>(parsed);
+  return true;
+}
+
 bool ParseArgs(int argc, char **argv, Options *opts) {
   if (!opts) return false;
   for (int i = 1; i < argc; ++i) {
@@ -201,6 +218,10 @@ bool ParseArgs(int argc, char **argv, Options *opts) {
     auto consume_uint = [&](unsigned int *out) -> bool {
       if (i + 1 >= argc) return false;
       return ParseUInt(argv[++i], out);
+    };
+    auto consume_uint64 = [&](uint64_t *out) -> bool {
+      if (i + 1 >= argc) return false;
+      return ParseUInt64(argv[++i], out);
     };
     auto consume_size = [&](size_t *out) -> bool {
       if (i + 1 >= argc) return false;
@@ -301,6 +322,18 @@ bool ParseArgs(int argc, char **argv, Options *opts) {
       opts->consistent_gtid_snapshot = true;
       continue;
     }
+    if (arg == "--start-file") {
+      if (!consume_value(&opts->start_file)) return false;
+      continue;
+    }
+    if (arg == "--start-pos") {
+      if (!consume_uint64(&opts->start_pos)) return false;
+      continue;
+    }
+    if (arg == "--capture-binlog-position") {
+      opts->capture_binlog_position = true;
+      continue;
+    }
 
     if (StartsWith(arg, "--host=")) {
       opts->host = arg.substr(7);
@@ -316,6 +349,14 @@ bool ParseArgs(int argc, char **argv, Options *opts) {
     }
     if (StartsWith(arg, "--password=")) {
       opts->password = arg.substr(11);
+      continue;
+    }
+    if (StartsWith(arg, "--start-file=")) {
+      opts->start_file = arg.substr(13);
+      continue;
+    }
+    if (StartsWith(arg, "--start-pos=")) {
+      if (!ParseUInt64(arg.substr(12), &opts->start_pos)) return false;
       continue;
     }
     if (StartsWith(arg, "--socket=")) {
@@ -436,6 +477,8 @@ struct ReplStateRow {
   std::string applied_gtid_set;
   std::string last_commit_ts;
   std::string schema_version;
+  std::string binlog_file;
+  std::string binlog_pos;
 };
 
 struct TablePrep {
@@ -522,9 +565,11 @@ bool FetchReplStateRow(duckdb::Connection &conn, ReplStateRow *row,
   row->applied_gtid_set.clear();
   row->last_commit_ts.clear();
   row->schema_version.clear();
+  row->binlog_file.clear();
+  row->binlog_pos.clear();
   auto result = conn.Query(
       "SELECT snapshot_gtid_set, applied_gtid_set, last_commit_ts, "
-      "schema_version "
+      "schema_version, binlog_file, binlog_pos "
       "FROM __repl_state WHERE channel = '" +
       std::string(kReplChannel) + "' LIMIT 1");
   if (result->HasError()) {
@@ -542,6 +587,10 @@ bool FetchReplStateRow(duckdb::Connection &conn, ReplStateRow *row,
   if (!ts_val.IsNull()) row->last_commit_ts = ts_val.ToString();
   auto ver_val = chunk->GetValue(3, 0);
   if (!ver_val.IsNull()) row->schema_version = ver_val.ToString();
+  auto file_val = chunk->GetValue(4, 0);
+  if (!file_val.IsNull()) row->binlog_file = file_val.ToString();
+  auto pos_val = chunk->GetValue(5, 0);
+  if (!pos_val.IsNull()) row->binlog_pos = pos_val.ToString();
   return true;
 }
 
@@ -557,6 +606,8 @@ void PrintReplStateRow(const ReplStateRow &row) {
   std::cout << "applied_gtid_set: " << format(row.applied_gtid_set) << "\n";
   std::cout << "last_commit_ts: " << format(row.last_commit_ts) << "\n";
   std::cout << "schema_version: " << format(row.schema_version) << "\n";
+  std::cout << "binlog_file: " << format(row.binlog_file) << "\n";
+  std::cout << "binlog_pos: " << format(row.binlog_pos) << "\n";
 }
 
 bool ApplyReplStateOperations(const Options &opts,
@@ -735,6 +786,38 @@ bool QuerySingleValue(MYSQL *mysql, const std::string &sql,
   } else {
     out->clear();
   }
+  mysql_free_result(res);
+  return true;
+}
+
+bool FetchMasterStatus(MYSQL *mysql, std::string *file_out,
+                       uint64_t *pos_out) {
+  if (!mysql || !file_out || !pos_out) return false;
+  const std::string sql = "SHOW MASTER STATUS";
+  if (mysql_real_query(mysql, sql.c_str(), sql.size()) != 0) {
+    std::cerr << "MySQL query failed: " << mysql_error(mysql) << "\n";
+    return false;
+  }
+  MYSQL_RES *res = mysql_store_result(mysql);
+  if (!res) {
+    std::cerr << "MySQL store_result failed: " << mysql_error(mysql) << "\n";
+    return false;
+  }
+  MYSQL_ROW row = mysql_fetch_row(res);
+  if (!row || !row[0] || !row[1]) {
+    std::cerr << "SHOW MASTER STATUS returned no rows\n";
+    mysql_free_result(res);
+    return false;
+  }
+  std::string pos_str = row[1];
+  uint64_t pos = 0;
+  if (!ParseUInt64(pos_str, &pos)) {
+    std::cerr << "Invalid master log position: " << pos_str << "\n";
+    mysql_free_result(res);
+    return false;
+  }
+  *file_out = row[0];
+  *pos_out = pos;
   mysql_free_result(res);
   return true;
 }
@@ -935,12 +1018,15 @@ bool EnsureDuckdbSchema(DuckDBAdapter &adapter, const std::string &schema) {
   return true;
 }
 
-bool StoreSnapshotGtid(DuckDBAdapter &adapter, const std::string &gtid) {
+bool StoreSnapshotGtid(DuckDBAdapter &adapter, const std::string &gtid,
+                       const std::string &binlog_file, uint64_t binlog_pos) {
   auto create = adapter.ExecuteQuery(
       "CREATE TABLE IF NOT EXISTS __repl_state ("
       "channel VARCHAR PRIMARY KEY, "
       "snapshot_gtid_set VARCHAR, "
       "applied_gtid_set VARCHAR, "
+      "binlog_file VARCHAR, "
+      "binlog_pos BIGINT, "
       "last_commit_ts TIMESTAMP, "
       "schema_version BIGINT)",
       {});
@@ -950,15 +1036,22 @@ bool StoreSnapshotGtid(DuckDBAdapter &adapter, const std::string &gtid) {
   }
 
   const std::string gtid_sql = QuoteDuckdbLiteral(gtid);
+  const std::string file_sql =
+      binlog_file.empty() ? "NULL" : QuoteDuckdbLiteral(binlog_file);
+  const std::string pos_sql =
+      binlog_pos == 0 ? "NULL" : std::to_string(binlog_pos);
   const std::string upsert_sql =
       "INSERT INTO __repl_state (channel, snapshot_gtid_set, applied_gtid_set, "
-      "last_commit_ts) "
+      "last_commit_ts, binlog_file, binlog_pos) "
       "VALUES ('default', " +
-      gtid_sql + ", " + gtid_sql + ", CURRENT_TIMESTAMP) "
+      gtid_sql + ", " + gtid_sql + ", CURRENT_TIMESTAMP, " + file_sql + ", " +
+      pos_sql + ") "
       "ON CONFLICT(channel) DO UPDATE SET "
       "snapshot_gtid_set = excluded.snapshot_gtid_set, "
       "applied_gtid_set = excluded.applied_gtid_set, "
-      "last_commit_ts = excluded.last_commit_ts";
+      "last_commit_ts = excluded.last_commit_ts, "
+      "binlog_file = excluded.binlog_file, "
+      "binlog_pos = excluded.binlog_pos";
   auto upsert = adapter.ExecuteQuery(upsert_sql, {});
   if (upsert.ok) return true;
 
@@ -985,6 +1078,8 @@ bool StoreSnapshotGtid(DuckDBAdapter &adapter, const std::string &gtid) {
         "channel VARCHAR PRIMARY KEY, "
         "snapshot_gtid_set VARCHAR, "
         "applied_gtid_set VARCHAR, "
+        "binlog_file VARCHAR, "
+        "binlog_pos BIGINT, "
         "last_commit_ts TIMESTAMP, "
         "schema_version BIGINT)",
         {});
@@ -999,8 +1094,10 @@ bool StoreSnapshotGtid(DuckDBAdapter &adapter, const std::string &gtid) {
         updated_ts.empty() ? "CURRENT_TIMESTAMP" : QuoteDuckdbLiteral(updated_ts);
     const std::string insert_sql =
         "INSERT INTO __repl_state_new (channel, snapshot_gtid_set, "
-        "applied_gtid_set, last_commit_ts, schema_version) VALUES ('default', " +
-        snapshot_sql + ", " + snapshot_sql + ", " + ts_sql + ", NULL)";
+        "applied_gtid_set, last_commit_ts, schema_version, binlog_file, "
+        "binlog_pos) VALUES ('default', " +
+        snapshot_sql + ", " + snapshot_sql + ", " + ts_sql +
+        ", NULL, NULL, NULL)";
     auto insert = adapter.ExecuteQuery(insert_sql, {});
     if (!insert.ok) {
       std::cerr << "DuckDB __repl_state_new insert failed: " << insert.error
@@ -1653,6 +1750,18 @@ int main(int argc, char **argv) {
   }
   if (!ValidateAppliedGtidSet(opts)) return 1;
   const bool has_state_ops = HasStateOperations(opts);
+  if (!opts.start_file.empty() && opts.start_pos == 0) {
+    std::cerr << "--start-file requires --start-pos\n";
+    return 1;
+  }
+  if (opts.start_file.empty() && opts.start_pos != 0) {
+    std::cerr << "--start-pos requires --start-file\n";
+    return 1;
+  }
+  if (!opts.start_file.empty() && opts.capture_binlog_position) {
+    std::cerr << "--capture-binlog-position cannot be used with --start-file\n";
+    return 1;
+  }
   if (opts.state_only && !has_state_ops) {
     std::cerr << "No state operation specified for --state-only\n";
     return 1;
@@ -1711,11 +1820,26 @@ int main(int argc, char **argv) {
   }
 
   std::string snapshot_gtid;
+  std::string snapshot_binlog_file;
+  uint64_t snapshot_binlog_pos = 0;
+  if (!opts.start_file.empty()) {
+    snapshot_binlog_file = opts.start_file;
+    snapshot_binlog_pos = opts.start_pos;
+  }
   if (opts.consistent_gtid_snapshot) {
     if (!LockTablesForSnapshot(mysql)) {
       mysql_close(mysql);
       mysql_library_end();
       return 1;
+    }
+    if (opts.capture_binlog_position) {
+      if (!FetchMasterStatus(mysql, &snapshot_binlog_file,
+                             &snapshot_binlog_pos)) {
+        UnlockTablesForSnapshot(mysql);
+        mysql_close(mysql);
+        mysql_library_end();
+        return 1;
+      }
     }
     if (!QuerySingleValue(mysql, "SELECT @@GLOBAL.GTID_EXECUTED",
                           &snapshot_gtid)) {
@@ -1741,6 +1865,16 @@ int main(int argc, char **argv) {
       mysql_library_end();
       return 1;
     }
+    if (opts.capture_binlog_position) {
+      if (!FetchMasterStatus(mysql, &snapshot_binlog_file,
+                             &snapshot_binlog_pos)) {
+        mysql_close(mysql);
+        mysql_library_end();
+        return 1;
+      }
+      std::cerr << "Captured binlog position without FTWRL; "
+                   "use --consistent-gtid-snapshot for consistency.\n";
+    }
     if (!QuerySingleValue(mysql, "SELECT @@GLOBAL.GTID_EXECUTED",
                           &snapshot_gtid)) {
       mysql_close(mysql);
@@ -1750,6 +1884,10 @@ int main(int argc, char **argv) {
   }
   if (opts.verbose) {
     std::cerr << "Snapshot GTID set: " << snapshot_gtid << "\n";
+    if (!snapshot_binlog_file.empty() && snapshot_binlog_pos > 0) {
+      std::cerr << "Snapshot binlog position: " << snapshot_binlog_file << ":"
+                << snapshot_binlog_pos << "\n";
+    }
   }
 
   DuckDBBinlogStreamer binlog_streamer;
@@ -1821,7 +1959,8 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  if (!StoreSnapshotGtid(adapter, snapshot_gtid)) {
+  if (!StoreSnapshotGtid(adapter, snapshot_gtid, snapshot_binlog_file,
+                         snapshot_binlog_pos)) {
     adapter.Shutdown();
     mysql_close(mysql);
     mysql_library_end();

@@ -654,6 +654,9 @@ Status DuckDBBinlogApplier::BeginTransaction(Gtid gtid) {
   skip_txn_ = false;
   ResetBuffers();
   apply_txn_ = ApplyTxn{};
+  if (!options_.use_gtid) {
+    return Status::Ok();
+  }
   bool already_applied = false;
   Status st = adapter_->IsGtidApplied(current_gtid_, &already_applied);
   if (!st.ok()) {
@@ -664,6 +667,16 @@ Status DuckDBBinlogApplier::BeginTransaction(Gtid gtid) {
     skip_txn_ = true;
   }
   return Status::Ok();
+}
+
+void DuckDBBinlogApplier::SetBinlogPosition(const std::string &file,
+                                            uint64_t pos) {
+  if (file.empty() || pos == 0) {
+    return;
+  }
+  current_binlog_file_ = file;
+  current_binlog_pos_ = pos;
+  has_binlog_pos_ = true;
 }
 
 Status DuckDBBinlogApplier::AppendInsert(TableId table, Row row) {
@@ -1308,40 +1321,84 @@ Status DuckDBBinlogApplier::ApplyWatermark() {
   Status st = ReadReplStateRow(*apply_txn_.conn, &snapshot, &applied_set, &found);
   if (!st.ok()) return st;
 
-  if (applied_set.empty() && !snapshot.empty()) {
-    applied_set = snapshot;
-  }
-  if (applied_set.empty()) {
-    std::string watermark_set;
-    st = LoadWatermarkGtidSet(*apply_txn_.conn, &watermark_set);
-    if (!st.ok()) return st;
-    if (!watermark_set.empty()) {
-      applied_set = std::move(watermark_set);
-    }
-  }
-
-  std::string merged_set;
-  if (!MergeGtidIntoSet(applied_set, current_gtid_.value, &merged_set, &error)) {
-    return Status::Error(StatusCode::kInvalid,
-                         error.empty() ? "Failed to merge GTID" : error);
-  }
-
   const std::string commit_ts = GetCurrentTimestampString();
   std::string sql;
-  if (found) {
-    sql =
-        "UPDATE __repl_state SET applied_gtid_set = '" +
-        EscapeLiteral(merged_set) + "', last_commit_ts = '" +
-        EscapeLiteral(commit_ts) + "' WHERE channel = '" +
-        std::string(kReplChannel) + "'";
+  const bool update_binlog = has_binlog_pos_;
+
+  if (options_.use_gtid) {
+    if (applied_set.empty() && !snapshot.empty()) {
+      applied_set = snapshot;
+    }
+    if (applied_set.empty()) {
+      std::string watermark_set;
+      st = LoadWatermarkGtidSet(*apply_txn_.conn, &watermark_set);
+      if (!st.ok()) return st;
+      if (!watermark_set.empty()) {
+        applied_set = std::move(watermark_set);
+      }
+    }
+
+    std::string merged_set;
+    if (!MergeGtidIntoSet(applied_set, current_gtid_.value, &merged_set,
+                          &error)) {
+      return Status::Error(StatusCode::kInvalid,
+                           error.empty() ? "Failed to merge GTID" : error);
+    }
+
+    if (found) {
+      sql =
+          "UPDATE __repl_state SET applied_gtid_set = '" +
+          EscapeLiteral(merged_set) + "', ";
+      if (update_binlog) {
+        sql += "binlog_file = '" + EscapeLiteral(current_binlog_file_) +
+               "', binlog_pos = " + std::to_string(current_binlog_pos_) + ", ";
+      }
+      sql += "last_commit_ts = '" + EscapeLiteral(commit_ts) +
+             "' WHERE channel = '" + std::string(kReplChannel) + "'";
+    } else {
+      const std::string snapshot_sql =
+          snapshot.empty() ? "NULL" : "'" + EscapeLiteral(snapshot) + "'";
+      std::string insert_cols =
+          "channel, snapshot_gtid_set, applied_gtid_set, last_commit_ts";
+      std::string insert_vals = "'" + std::string(kReplChannel) + "', " +
+                                snapshot_sql + ", '" +
+                                EscapeLiteral(merged_set) + "', '" +
+                                EscapeLiteral(commit_ts) + "'";
+      if (update_binlog) {
+        insert_cols += ", binlog_file, binlog_pos";
+        insert_vals += ", '" + EscapeLiteral(current_binlog_file_) + "', " +
+                       std::to_string(current_binlog_pos_);
+      }
+      sql = "INSERT INTO __repl_state (" + insert_cols + ") VALUES (" +
+            insert_vals + ")";
+    }
   } else {
-    const std::string snapshot_sql =
-        snapshot.empty() ? "NULL" : "'" + EscapeLiteral(snapshot) + "'";
-    sql =
-        "INSERT INTO __repl_state (channel, snapshot_gtid_set, "
-        "applied_gtid_set, last_commit_ts) VALUES ('" +
-        std::string(kReplChannel) + "', " + snapshot_sql + ", '" +
-        EscapeLiteral(merged_set) + "', '" + EscapeLiteral(commit_ts) + "')";
+    if (!update_binlog) {
+      return Status::Error(StatusCode::kInvalid,
+                           "Binlog position not set for watermark");
+    }
+    if (found) {
+      sql = "UPDATE __repl_state SET binlog_file = '" +
+            EscapeLiteral(current_binlog_file_) + "', binlog_pos = " +
+            std::to_string(current_binlog_pos_) + ", last_commit_ts = '" +
+            EscapeLiteral(commit_ts) + "' WHERE channel = '" +
+            std::string(kReplChannel) + "'";
+    } else {
+      std::string snapshot_sql =
+          snapshot.empty() ? "NULL" : "'" + EscapeLiteral(snapshot) + "'";
+      std::string applied_sql =
+          applied_set.empty()
+              ? (snapshot.empty() ? "NULL" : snapshot_sql)
+              : "'" + EscapeLiteral(applied_set) + "'";
+      sql =
+          "INSERT INTO __repl_state (channel, snapshot_gtid_set, "
+          "applied_gtid_set, last_commit_ts, binlog_file, binlog_pos) VALUES "
+          "('" +
+          std::string(kReplChannel) + "', " + snapshot_sql + ", " +
+          applied_sql + ", '" + EscapeLiteral(commit_ts) + "', '" +
+          EscapeLiteral(current_binlog_file_) + "', " +
+          std::to_string(current_binlog_pos_) + ")";
+    }
   }
 
   try {

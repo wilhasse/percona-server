@@ -33,6 +33,7 @@
 
 #include "libbinlogevents/include/binlog_event.h"
 #include "libbinlogevents/include/control_events.h"
+#include "libbinlogevents/include/event_reader.h"
 #include "libbinlogevents/include/gtids/gtidset.h"
 #include "libbinlogevents/include/rows_event.h"
 #include "libbinlogevents/include/statement_events.h"
@@ -44,6 +45,9 @@ namespace {
 using binary_log::Format_description_event;
 using binary_log::Gtid_event;
 using binary_log::Log_event_type;
+using binary_log::Log_event_header;
+using binary_log::Rotate_event;
+using binary_log::Event_reader;
 using binary_log::gtids::Gno_interval;
 using binary_log::gtids::Gtid_set;
 using binary_log::gtids::Uuid;
@@ -133,19 +137,21 @@ bool QuerySingleStringValue(MYSQL *mysql, const char *sql,
 }
 
 // Validate required binlog configuration on the source server
-duckdb_se::Status ValidateBinlogConfig(MYSQL *mysql) {
+duckdb_se::Status ValidateBinlogConfig(MYSQL *mysql, bool require_gtid) {
   std::string value;
 
   // Check GTID mode - must be ON for GTID-based replication
-  if (!QuerySingleStringValue(mysql, "SELECT @@GLOBAL.gtid_mode", &value)) {
-    return duckdb_se::Status::Error(duckdb_se::StatusCode::kInvalid,
-                                    "Failed to query @@GLOBAL.gtid_mode");
-  }
-  if (value != "ON") {
-    return duckdb_se::Status::Error(
-        duckdb_se::StatusCode::kInvalid,
-        "gtid_mode must be ON for DuckDB binlog replication (current: " +
-            value + ")");
+  if (require_gtid) {
+    if (!QuerySingleStringValue(mysql, "SELECT @@GLOBAL.gtid_mode", &value)) {
+      return duckdb_se::Status::Error(duckdb_se::StatusCode::kInvalid,
+                                      "Failed to query @@GLOBAL.gtid_mode");
+    }
+    if (value != "ON") {
+      return duckdb_se::Status::Error(
+          duckdb_se::StatusCode::kInvalid,
+          "gtid_mode must be ON for DuckDB binlog replication (current: " +
+              value + ")");
+    }
   }
 
   // Check binlog_format - must be ROW for row-based replication
@@ -192,6 +198,15 @@ Status DuckDBBinlogStreamer::Open(const BinlogStreamOptions &options) {
                          "Binlog streamer already open");
   }
   options_ = options;
+  use_gtid_ = options_.start_file.empty();
+  if (!options_.start_file.empty() && !options_.gtid_set.empty()) {
+    return Status::Error(StatusCode::kInvalid,
+                         "Cannot use GTID set with start_file/position");
+  }
+  if (!options_.start_file.empty() && options_.start_position == 0) {
+    return Status::Error(StatusCode::kInvalid,
+                         "start_position must be > 0 when start_file is set");
+  }
   mysql_ = mysql_init(nullptr);
   if (!mysql_) {
     return Status::Error(StatusCode::kInvalid, "mysql_init failed");
@@ -213,7 +228,7 @@ Status DuckDBBinlogStreamer::Open(const BinlogStreamOptions &options) {
 
   // Validate required binlog configuration before proceeding
   {
-    Status st = ValidateBinlogConfig(mysql_);
+    Status st = ValidateBinlogConfig(mysql_, use_gtid_);
     if (!st.ok()) {
       mysql_close(mysql_);
       mysql_ = nullptr;
@@ -221,26 +236,31 @@ Status DuckDBBinlogStreamer::Open(const BinlogStreamOptions &options) {
     }
   }
 
-  // Enforce GTID auto-position by ensuring a GTID set is provided.
-  if (options_.gtid_set.empty()) {
-    std::string executed;
-    if (!QuerySingleStringValue(mysql_, "SELECT @@GLOBAL.GTID_EXECUTED",
-                                &executed)) {
-      mysql_close(mysql_);
-      mysql_ = nullptr;
-      return Status::Error(StatusCode::kInvalid,
-                           "Failed to query @@GLOBAL.GTID_EXECUTED for "
-                           "auto-position");
+  if (use_gtid_) {
+    // Enforce GTID auto-position by ensuring a GTID set is provided.
+    if (options_.gtid_set.empty()) {
+      std::string executed;
+      if (!QuerySingleStringValue(mysql_, "SELECT @@GLOBAL.GTID_EXECUTED",
+                                  &executed)) {
+        mysql_close(mysql_);
+        mysql_ = nullptr;
+        return Status::Error(StatusCode::kInvalid,
+                             "Failed to query @@GLOBAL.GTID_EXECUTED for "
+                             "auto-position");
+      }
+      if (executed.empty()) {
+        mysql_close(mysql_);
+        mysql_ = nullptr;
+        return Status::Error(StatusCode::kInvalid,
+                             "GTID_EXECUTED is empty; auto-position requires a "
+                             "GTID set. Run a transaction or set "
+                             "duckdb_binlog_apply_start_gtid.");
+      }
+      options_.gtid_set = std::move(executed);
     }
-    if (executed.empty()) {
-      mysql_close(mysql_);
-      mysql_ = nullptr;
-      return Status::Error(StatusCode::kInvalid,
-                           "GTID_EXECUTED is empty; auto-position requires a "
-                           "GTID set. Run a transaction or set "
-                           "duckdb_binlog_apply_start_gtid.");
-    }
-    options_.gtid_set = std::move(executed);
+  } else {
+    current_binlog_file_ = options_.start_file;
+    current_binlog_pos_ = options_.start_position;
   }
 
   const std::string checksum_sql =
@@ -255,25 +275,36 @@ Status DuckDBBinlogStreamer::Open(const BinlogStreamOptions &options) {
   }
 
   rpl_ = MYSQL_RPL{};
-  rpl_.file_name_length = 0;
-  rpl_.file_name = "";
-  rpl_.start_position = 4;
+  rpl_.file_name_length = options_.start_file.size();
+  rpl_.file_name = options_.start_file.empty()
+                       ? ""
+                       : options_.start_file.c_str();
+  rpl_.start_position = options_.start_position == 0 ? 4
+                                                    : options_.start_position;
   rpl_.server_id = options_.server_id;
-  rpl_.flags = MYSQL_RPL_SKIP_HEARTBEAT | MYSQL_RPL_GTID;
+  rpl_.flags = MYSQL_RPL_SKIP_HEARTBEAT;
+  if (use_gtid_) {
+    rpl_.flags |= MYSQL_RPL_GTID;
+  }
   if (options_.non_blocking) {
     constexpr unsigned int kNonBlockingFlag = 1u << 0;
     rpl_.flags |= kNonBlockingFlag;
   }
 
-  if (!options_.gtid_set.empty()) {
-    Status st = ParseGtidSet(options_.gtid_set);
-    if (!st.ok()) {
-      mysql_close(mysql_);
-      mysql_ = nullptr;
-      return st;
+  if (use_gtid_) {
+    if (!options_.gtid_set.empty()) {
+      Status st = ParseGtidSet(options_.gtid_set);
+      if (!st.ok()) {
+        mysql_close(mysql_);
+        mysql_ = nullptr;
+        return st;
+      }
+      rpl_.gtid_set_arg = gtid_encoded_;
+      rpl_.gtid_set_encoded_size = gtid_encoded_size_;
+    } else {
+      rpl_.gtid_set_arg = nullptr;
+      rpl_.gtid_set_encoded_size = 0;
     }
-    rpl_.gtid_set_arg = gtid_encoded_;
-    rpl_.gtid_set_encoded_size = gtid_encoded_size_;
   } else {
     rpl_.gtid_set_arg = nullptr;
     rpl_.gtid_set_encoded_size = 0;
@@ -363,6 +394,8 @@ Status DuckDBBinlogStreamer::NextEvent(BinlogEvent *event) {
   event->table_id = 0;
   event->schema.clear();
   event->table.clear();
+  event->log_file.clear();
+  event->log_pos = 0;
   event->columns_before.clear();
   event->columns_after.clear();
   event->row_data.clear();
@@ -380,11 +413,29 @@ Status DuckDBBinlogStreamer::NextEvent(BinlogEvent *event) {
     const auto ev_type = static_cast<Log_event_type>(
         raw_buffer_[EVENT_TYPE_OFFSET]);
     const char *buf = reinterpret_cast<const char *>(raw_buffer_.data());
+    uint64_t log_pos = 0;
+    {
+      Event_reader reader(buf, raw_buffer_.size());
+      Log_event_header header(reader);
+      if (header.get_is_valid()) {
+        log_pos = header.log_pos;
+      }
+    }
 
     switch (ev_type) {
       case binary_log::FORMAT_DESCRIPTION_EVENT: {
         auto next_fde = std::make_unique<Format_description_event>(buf, fde_.get());
         fde_ = std::move(next_fde);
+        continue;
+      }
+      case binary_log::ROTATE_EVENT: {
+        Rotate_event rev(buf, fde_.get());
+        if (rev.new_log_ident && rev.ident_len > 0) {
+          current_binlog_file_.assign(rev.new_log_ident, rev.ident_len);
+        }
+        if (rev.pos > 0) {
+          current_binlog_pos_ = rev.pos;
+        }
         continue;
       }
       case binary_log::TABLE_MAP_EVENT: {
@@ -410,6 +461,9 @@ Status DuckDBBinlogStreamer::NextEvent(BinlogEvent *event) {
         event->table_id = map.table_id;
         event->schema = map.schema;
         event->table = map.table;
+        event->log_pos = log_pos;
+        event->log_file = current_binlog_file_;
+        if (log_pos > 0) current_binlog_pos_ = log_pos;
         return Status::Ok();
       }
       case binary_log::GTID_LOG_EVENT: {
@@ -418,6 +472,9 @@ Status DuckDBBinlogStreamer::NextEvent(BinlogEvent *event) {
         current_gtid_ = gtid.to_string();
         event->type = BinlogEvent::Type::kGtid;
         event->gtid = current_gtid_;
+        event->log_pos = log_pos;
+        event->log_file = current_binlog_file_;
+        if (log_pos > 0) current_binlog_pos_ = log_pos;
         return Status::Ok();
       }
       case binary_log::WRITE_ROWS_EVENT:
@@ -434,6 +491,9 @@ Status DuckDBBinlogStreamer::NextEvent(BinlogEvent *event) {
           event->schema = it->second.schema;
           event->table = it->second.table;
         }
+        event->log_pos = log_pos;
+        event->log_file = current_binlog_file_;
+        if (log_pos > 0) current_binlog_pos_ = log_pos;
         return Status::Ok();
       }
       case binary_log::UPDATE_ROWS_EVENT:
@@ -451,6 +511,9 @@ Status DuckDBBinlogStreamer::NextEvent(BinlogEvent *event) {
           event->schema = it->second.schema;
           event->table = it->second.table;
         }
+        event->log_pos = log_pos;
+        event->log_file = current_binlog_file_;
+        if (log_pos > 0) current_binlog_pos_ = log_pos;
         return Status::Ok();
       }
       case binary_log::DELETE_ROWS_EVENT:
@@ -467,11 +530,17 @@ Status DuckDBBinlogStreamer::NextEvent(BinlogEvent *event) {
           event->schema = it->second.schema;
           event->table = it->second.table;
         }
+        event->log_pos = log_pos;
+        event->log_file = current_binlog_file_;
+        if (log_pos > 0) current_binlog_pos_ = log_pos;
         return Status::Ok();
       }
       case binary_log::XID_EVENT: {
         event->type = BinlogEvent::Type::kXid;
         event->gtid = current_gtid_;
+        event->log_pos = log_pos;
+        event->log_file = current_binlog_file_;
+        if (log_pos > 0) current_binlog_pos_ = log_pos;
         return Status::Ok();
       }
       case binary_log::QUERY_EVENT: {
@@ -479,7 +548,7 @@ Status DuckDBBinlogStreamer::NextEvent(BinlogEvent *event) {
         event->gtid = current_gtid_;
         event->schema.clear();
         event->query.clear();
-        binary_log::Query_event qev(buf, fde_.get(), event_type);
+        binary_log::Query_event qev(buf, fde_.get(), ev_type);
         if (qev.header()->get_is_valid()) {
           if (qev.db && qev.db_len > 0) {
             event->schema.assign(qev.db, qev.db_len);
@@ -490,6 +559,9 @@ Status DuckDBBinlogStreamer::NextEvent(BinlogEvent *event) {
             event->query.assign(qev.query, qlen);
           }
         }
+        event->log_pos = log_pos;
+        event->log_file = current_binlog_file_;
+        if (log_pos > 0) current_binlog_pos_ = log_pos;
         return Status::Ok();
       }
       default:

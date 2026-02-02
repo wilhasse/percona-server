@@ -39,6 +39,7 @@ struct BinlogApplierOptions {
   size_t max_rows = 50000;
   size_t max_bytes = 64 * 1024 * 1024;
   std::chrono::milliseconds max_delay = std::chrono::milliseconds(200);
+  bool use_gtid{true};
 };
 
 struct BinlogApplyControls {
@@ -89,6 +90,7 @@ class DuckDBBinlogApplier {
   Status AddUpdateStatement(TableId table, std::string sql);
   Status AddDeleteStatement(TableId table, std::string sql);
   Status ApplyDDL(DDLChange change);
+  void SetBinlogPosition(const std::string &file, uint64_t pos);
   Status CommitTransaction();
   Status RollbackTransaction();
 
@@ -138,6 +140,9 @@ class DuckDBBinlogApplier {
   Gtid current_gtid_{};
   ApplyTxn apply_txn_{};
   std::chrono::steady_clock::time_point first_event_time_{};
+  std::string current_binlog_file_;
+  uint64_t current_binlog_pos_{0};
+  bool has_binlog_pos_{false};
 
   size_t buffered_rows_{0};
   size_t buffered_bytes_{0};

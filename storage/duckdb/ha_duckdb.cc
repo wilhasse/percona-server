@@ -1614,6 +1614,8 @@ static char *duckdb_binlog_apply_user = nullptr;
 static char *duckdb_binlog_apply_password = nullptr;
 static char *duckdb_binlog_apply_socket = nullptr;
 static char *duckdb_binlog_apply_start_gtid = nullptr;
+static char *duckdb_binlog_apply_start_file = nullptr;
+static ulonglong duckdb_binlog_apply_start_pos = 0;
 static char *duckdb_binlog_apply_schema_filter = nullptr;
 static ulonglong duckdb_binlog_apply_server_id = 0;
 static uint duckdb_binlog_apply_port = 3306;
@@ -1636,6 +1638,10 @@ static duckdb_se::BinlogApplyThreadOptions duckdb_make_binlog_apply_options() {
   options.server_id = static_cast<uint32_t>(duckdb_binlog_apply_server_id);
   options.start_gtid_set =
       duckdb_binlog_apply_start_gtid ? duckdb_binlog_apply_start_gtid : "";
+  options.start_file =
+      duckdb_binlog_apply_start_file ? duckdb_binlog_apply_start_file : "";
+  options.start_position =
+      static_cast<uint64_t>(duckdb_binlog_apply_start_pos);
   options.schema_filter = duckdb_binlog_apply_schema_filter
                               ? duckdb_binlog_apply_schema_filter
                               : "";
@@ -1742,6 +1748,17 @@ static MYSQL_SYSVAR_STR(
     nullptr, nullptr, "");
 
 static MYSQL_SYSVAR_STR(
+    binlog_apply_start_file, duckdb_binlog_apply_start_file,
+    PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
+    "Binlog file to start DuckDB binlog apply from (requires start_pos).",
+    nullptr, nullptr, "");
+
+static MYSQL_SYSVAR_ULONGLONG(
+    binlog_apply_start_pos, duckdb_binlog_apply_start_pos, PLUGIN_VAR_RQCMDARG,
+    "Binlog position to start DuckDB binlog apply from when start_file is set.",
+    nullptr, nullptr, 0, 0, ~0ULL, 0);
+
+static MYSQL_SYSVAR_STR(
     binlog_apply_schema_filter, duckdb_binlog_apply_schema_filter,
     PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
     "Optional schema filter for DuckDB binlog apply (empty applies all).",
@@ -1786,6 +1803,8 @@ static SYS_VAR *duckdb_system_variables[] = {
     MYSQL_SYSVAR(binlog_apply_port),
     MYSQL_SYSVAR(binlog_apply_server_id),
     MYSQL_SYSVAR(binlog_apply_start_gtid),
+    MYSQL_SYSVAR(binlog_apply_start_file),
+    MYSQL_SYSVAR(binlog_apply_start_pos),
     MYSQL_SYSVAR(binlog_apply_schema_filter),
     MYSQL_SYSVAR(binlog_apply_paused),
     MYSQL_SYSVAR(binlog_apply_throttle_rows_per_sec),

@@ -85,6 +85,8 @@ struct ReplStateSnapshot {
   std::string applied_gtid_set;
   std::string snapshot_gtid_set;
   std::string last_commit_ts;
+  std::string binlog_file;
+  uint64_t binlog_pos{0};
   std::string source_path;
 };
 
@@ -100,6 +102,8 @@ Status LoadReplStateFromFile(const std::string &path,
   out_state->applied_gtid_set.clear();
   out_state->snapshot_gtid_set.clear();
   out_state->last_commit_ts.clear();
+  out_state->binlog_file.clear();
+  out_state->binlog_pos = 0;
   out_state->source_path.clear();
 
   try {
@@ -107,14 +111,33 @@ Status LoadReplStateFromFile(const std::string &path,
     duckdb::DuckDB db(path, &cfg);
     duckdb::Connection conn(db);
 
-    auto result = conn.Query(
-        "SELECT snapshot_gtid_set, applied_gtid_set, last_commit_ts "
-        "FROM __repl_state WHERE channel = 'default' LIMIT 1");
-    if (result->HasError()) {
-      if (!IsMissingReplTableError(result->GetError(), "__repl_state")) {
+    std::vector<std::string> columns;
+    bool missing = false;
+    std::string column_error;
+    if (!FetchReplTableColumns(conn, "__repl_state", &columns, &missing,
+                               &column_error)) {
+      return Status::Error(
+          StatusCode::kDuckDBError,
+          column_error.empty() ? "Failed to read __repl_state schema"
+                               : column_error);
+    }
+
+    if (!missing) {
+      const bool has_binlog_file =
+          std::find(columns.begin(), columns.end(), "binlog_file") !=
+          columns.end();
+      const bool has_binlog_pos =
+          std::find(columns.begin(), columns.end(), "binlog_pos") !=
+          columns.end();
+      std::string sql =
+          "SELECT snapshot_gtid_set, applied_gtid_set, last_commit_ts";
+      if (has_binlog_file) sql += ", binlog_file";
+      if (has_binlog_pos) sql += ", binlog_pos";
+      sql += " FROM __repl_state WHERE channel = 'default' LIMIT 1";
+      auto result = conn.Query(sql);
+      if (result->HasError()) {
         return Status::Error(StatusCode::kDuckDBError, result->GetError());
       }
-    } else {
       auto chunk = result->Fetch();
       if (chunk && chunk->size() > 0) {
         auto snap_val = chunk->GetValue(0, 0);
@@ -128,6 +151,19 @@ Status LoadReplStateFromFile(const std::string &path,
         auto ts_val = chunk->GetValue(2, 0);
         if (!ts_val.IsNull()) {
           out_state->last_commit_ts = ts_val.ToString();
+        }
+        duckdb::idx_t idx = 3;
+        if (has_binlog_file) {
+          auto file_val = chunk->GetValue(idx++, 0);
+          if (!file_val.IsNull()) {
+            out_state->binlog_file = file_val.ToString();
+          }
+        }
+        if (has_binlog_pos) {
+          auto pos_val = chunk->GetValue(idx, 0);
+          if (!pos_val.IsNull()) {
+            out_state->binlog_pos = pos_val.GetValue<uint64_t>();
+          }
         }
       }
     }
@@ -171,7 +207,8 @@ Status LoadReplStateFromFile(const std::string &path,
   }
 
   if (!out_state->applied_gtid_set.empty() ||
-      !out_state->snapshot_gtid_set.empty()) {
+      !out_state->snapshot_gtid_set.empty() ||
+      !out_state->binlog_file.empty() || out_state->binlog_pos != 0) {
     out_state->source_path = path;
   }
   return Status::Ok();
@@ -185,6 +222,8 @@ Status ResolveReplState(const BinlogApplyThreadOptions &options,
   state->applied_gtid_set.clear();
   state->snapshot_gtid_set.clear();
   state->last_commit_ts.clear();
+  state->binlog_file.clear();
+  state->binlog_pos = 0;
   state->source_path.clear();
 
   if (!options.schema_filter.empty()) {
@@ -207,12 +246,18 @@ Status ResolveReplState(const BinlogApplyThreadOptions &options,
     ReplStateSnapshot candidate;
     Status st = LoadReplStateFromFile(path.string(), &candidate);
     if (!st.ok()) return st;
-    if (candidate.applied_gtid_set.empty() &&
-        candidate.snapshot_gtid_set.empty()) {
+    const bool candidate_has_state =
+        !candidate.applied_gtid_set.empty() ||
+        !candidate.snapshot_gtid_set.empty() ||
+        !candidate.binlog_file.empty() || candidate.binlog_pos != 0;
+    if (!candidate_has_state) {
       continue;
     }
-    if (state->applied_gtid_set.empty() &&
-        state->snapshot_gtid_set.empty()) {
+    const bool state_has_state =
+        !state->applied_gtid_set.empty() ||
+        !state->snapshot_gtid_set.empty() || !state->binlog_file.empty() ||
+        state->binlog_pos != 0;
+    if (!state_has_state) {
       *state = std::move(candidate);
       continue;
     }
@@ -427,6 +472,7 @@ bool DuckdbTableExists(DuckDBAdapter &adapter, const std::string &table) {
 
 Status ApplyDdlEvent(const BinlogEvent &event,
                      const BinlogApplyThreadOptions &options,
+                     const DuckDBBinlogApplier::Options &applier_options,
                      std::map<std::string, SchemaApplierState> *schema_states,
                      const std::string &gtid) {
   if (!schema_states) {
@@ -447,7 +493,9 @@ Status ApplyDdlEvent(const BinlogEvent &event,
   }
 
   SchemaApplierState *state = nullptr;
-  Status st = EnsureSchemaApplier(parsed.schema, schema_states, &state);
+  Status st =
+      EnsureSchemaApplier(parsed.schema, options, applier_options,
+                          schema_states, &state);
   if (!st.ok()) return st;
   if (!state->applier) {
     return Status::Error(StatusCode::kInvalid, "Missing applier state");
@@ -512,6 +560,8 @@ Status ApplyDdlEvent(const BinlogEvent &event,
 }
 
 Status EnsureSchemaApplier(const std::string &schema,
+                           const BinlogApplyThreadOptions &options,
+                           const DuckDBBinlogApplier::Options &applier_options,
                            std::map<std::string, SchemaApplierState> *states,
                            SchemaApplierState **out_state) {
   if (!states || !out_state) {
@@ -526,7 +576,8 @@ Status EnsureSchemaApplier(const std::string &schema,
     const std::string path = DuckdbPathForSchema(options, schema);
     Status st = entry.adapter->Init(path, cfg);
     if (!st.ok()) return st;
-    entry.applier = std::make_unique<DuckDBBinlogApplier>(entry.adapter.get());
+    entry.applier = std::make_unique<DuckDBBinlogApplier>(entry.adapter.get(),
+                                                          applier_options);
     st = LoadSchemaVersion(&entry);
     if (!st.ok()) return st;
   }
@@ -535,11 +586,15 @@ Status EnsureSchemaApplier(const std::string &schema,
 }
 
 Status CommitActiveTransactions(
-    std::map<std::string, SchemaApplierState> *states) {
+    std::map<std::string, SchemaApplierState> *states,
+    const std::string &log_file, uint64_t log_pos) {
   if (!states) return Status::Ok();
   for (auto &entry : *states) {
     auto &state = entry.second;
     if (!state.txn_active || !state.applier) continue;
+    if (!log_file.empty() && log_pos > 0) {
+      state.applier->SetBinlogPosition(log_file, log_pos);
+    }
     Status st = state.applier->CommitTransaction();
     if (!st.ok()) {
       (void)state.applier->RollbackTransaction();
@@ -605,26 +660,40 @@ Status ApplyRowEvent(const BinlogEvent &event, const BinlogTableMap &map,
 
 Status RunApplyLoop(const BinlogApplyThreadOptions &options,
                     std::atomic<bool> *stop_flag) {
-  std::string gtid_set;
-  std::string source_gtid_set;
-  if (!FetchGtidExecuted(options, &source_gtid_set)) {
+  if (!options.start_file.empty() && !options.start_gtid_set.empty()) {
     return Status::Error(StatusCode::kInvalid,
-                         "Failed to fetch @@GLOBAL.GTID_EXECUTED");
+                         "Cannot use start_file with start_gtid_set");
   }
-  if (source_gtid_set.empty()) {
+  if (options.start_file.empty() && options.start_position != 0) {
     return Status::Error(StatusCode::kInvalid,
-                         "Source GTID_EXECUTED is empty; cannot resume");
+                         "start_position requires start_file");
   }
 
-  if (!options.start_gtid_set.empty()) {
-    gtid_set = options.start_gtid_set;
-    sql_print_information(
-        "DuckDB binlog applier: Using configured start GTID set override");
-  } else {
-    ReplStateSnapshot state;
-    Status st = ResolveReplState(options, &state);
-    if (!st.ok()) return st;
-    if (!state.applied_gtid_set.empty()) {
+  const bool use_gtid = options.start_file.empty();
+  std::string gtid_set;
+  std::string source_gtid_set;
+  std::string start_file;
+  uint64_t start_pos = 0;
+
+  ReplStateSnapshot state;
+  Status st = ResolveReplState(options, &state);
+  if (!st.ok()) return st;
+
+  if (use_gtid) {
+    if (!FetchGtidExecuted(options, &source_gtid_set)) {
+      return Status::Error(StatusCode::kInvalid,
+                           "Failed to fetch @@GLOBAL.GTID_EXECUTED");
+    }
+    if (source_gtid_set.empty()) {
+      return Status::Error(StatusCode::kInvalid,
+                           "Source GTID_EXECUTED is empty; cannot resume");
+    }
+
+    if (!options.start_gtid_set.empty()) {
+      gtid_set = options.start_gtid_set;
+      sql_print_information(
+          "DuckDB binlog applier: Using configured start GTID set override");
+    } else if (!state.applied_gtid_set.empty()) {
       bool subset = false;
       std::string error;
       if (!IsGtidSetSubset(state.applied_gtid_set, source_gtid_set, &subset,
@@ -649,6 +718,23 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
     } else {
       gtid_set = source_gtid_set;
     }
+  } else {
+    if (!state.binlog_file.empty() && state.binlog_pos > 0) {
+      start_file = state.binlog_file;
+      start_pos = state.binlog_pos;
+      sql_print_information(
+          "DuckDB binlog applier: Resuming from binlog position %s:%llu",
+          start_file.c_str(),
+          static_cast<unsigned long long>(start_pos));
+    } else {
+      start_file = options.start_file;
+      start_pos = options.start_position;
+    }
+    if (start_file.empty() || start_pos == 0) {
+      return Status::Error(StatusCode::kInvalid,
+                           "start_file and start_position are required for "
+                           "file/position mode");
+    }
   }
 
   BinlogStreamOptions stream_opts;
@@ -659,17 +745,28 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
   stream_opts.port = options.port;
   stream_opts.server_id = ResolveServerId(options.server_id);
   stream_opts.gtid_set = gtid_set;
+  stream_opts.start_file = start_file;
+  stream_opts.start_position = start_pos;
   stream_opts.non_blocking = true;
 
-  sql_print_information(
-      "DuckDB binlog applier: Opening stream to %s:%u as %s, "
-      "server_id=%u, gtid_set='%.200s'",
-      stream_opts.host.c_str(), stream_opts.port, stream_opts.user.c_str(),
-      stream_opts.server_id,
-      stream_opts.gtid_set.empty() ? "(empty)" : stream_opts.gtid_set.c_str());
+  if (use_gtid) {
+    sql_print_information(
+        "DuckDB binlog applier: Opening GTID stream to %s:%u as %s, "
+        "server_id=%u, gtid_set='%.200s'",
+        stream_opts.host.c_str(), stream_opts.port, stream_opts.user.c_str(),
+        stream_opts.server_id,
+        stream_opts.gtid_set.empty() ? "(empty)" : stream_opts.gtid_set.c_str());
+  } else {
+    sql_print_information(
+        "DuckDB binlog applier: Opening file/pos stream to %s:%u as %s, "
+        "server_id=%u, start=%s:%llu",
+        stream_opts.host.c_str(), stream_opts.port, stream_opts.user.c_str(),
+        stream_opts.server_id, start_file.c_str(),
+        static_cast<unsigned long long>(start_pos));
+  }
 
   DuckDBBinlogStreamer streamer;
-  Status st = streamer.Open(stream_opts);
+  st = streamer.Open(stream_opts);
   if (!st.ok()) {
     sql_print_warning("DuckDB binlog applier: Failed to open stream: %s",
                       st.message.c_str());
@@ -677,9 +774,14 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
   }
   sql_print_information("DuckDB binlog applier: Stream opened successfully");
 
+  DuckDBBinlogApplier::Options applier_options;
+  applier_options.use_gtid = use_gtid;
+
   std::map<std::string, SchemaApplierState> schema_states;
   std::string current_gtid;
-  bool seen_gtid = false;
+  bool txn_open = false;
+  std::string current_log_file;
+  uint64_t current_log_pos = 0;
 
   while (!stop_flag->load()) {
     BinlogEvent event;
@@ -694,22 +796,32 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
       return st;
     }
 
+    if (!event.log_file.empty() && event.log_pos > 0) {
+      current_log_file = event.log_file;
+      current_log_pos = event.log_pos;
+    }
+
     switch (event.type) {
       case BinlogEvent::Type::kGtid: {
-        if (seen_gtid) {
-          st = CommitActiveTransactions(&schema_states);
+        if (txn_open) {
+          st = CommitActiveTransactions(&schema_states, current_log_file,
+                                        current_log_pos);
           if (!st.ok()) return st;
         }
         current_gtid = event.gtid;
-        seen_gtid = true;
+        txn_open = true;
         break;
       }
       case BinlogEvent::Type::kWriteRows:
       case BinlogEvent::Type::kUpdateRows:
       case BinlogEvent::Type::kDeleteRows: {
-        if (!seen_gtid || current_gtid.empty()) {
+        if (use_gtid && (current_gtid.empty() || !txn_open)) {
           sql_print_warning("DuckDB binlog applier: row event without GTID");
           break;
+        }
+        if (!txn_open) {
+          txn_open = true;
+          current_gtid.clear();
         }
         const BinlogTableMap *map = streamer.GetTableMap(event.table_id);
         if (!map) {
@@ -720,24 +832,31 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
           break;
         }
         SchemaApplierState *state = nullptr;
-        st = EnsureSchemaApplier(map->schema, &schema_states, &state);
+        st = EnsureSchemaApplier(map->schema, options, applier_options,
+                                 &schema_states, &state);
         if (!st.ok()) return st;
         st = ApplyRowEvent(event, *map, *state, current_gtid);
         if (!st.ok()) return st;
         break;
       }
       case BinlogEvent::Type::kQuery: {
-        if (!seen_gtid || current_gtid.empty()) {
+        if (use_gtid && (current_gtid.empty() || !txn_open)) {
           break;
         }
-        st = ApplyDdlEvent(event, options, &schema_states, current_gtid);
+        if (!txn_open) {
+          txn_open = true;
+          current_gtid.clear();
+        }
+        st = ApplyDdlEvent(event, options, applier_options, &schema_states,
+                           current_gtid);
         if (!st.ok()) return st;
         break;
       }
       case BinlogEvent::Type::kXid: {
-        st = CommitActiveTransactions(&schema_states);
+        st = CommitActiveTransactions(&schema_states, current_log_file,
+                                      current_log_pos);
         if (!st.ok()) return st;
-        seen_gtid = false;
+        txn_open = false;
         current_gtid.clear();
         break;
       }
@@ -746,7 +865,8 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
     }
   }
 
-  (void)CommitActiveTransactions(&schema_states);
+  (void)CommitActiveTransactions(&schema_states, current_log_file,
+                                 current_log_pos);
   streamer.Close();
   return Status::Ok();
 }

@@ -38,6 +38,8 @@ struct BinlogApplyThreadOptions {
   uint32_t port{3306};
   uint32_t server_id{0};
   std::string start_gtid_set;
+  std::string start_file;
+  uint64_t start_position{0};
   std::string schema_filter;
   std::string duckdb_dir;
 };

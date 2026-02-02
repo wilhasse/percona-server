@@ -92,6 +92,8 @@ inline bool EnsureReplStateTable(duckdb::Connection &conn,
         "channel VARCHAR PRIMARY KEY, "
         "snapshot_gtid_set VARCHAR, "
         "applied_gtid_set VARCHAR, "
+        "binlog_file VARCHAR, "
+        "binlog_pos BIGINT, "
         "last_commit_ts TIMESTAMP, "
         "schema_version BIGINT)";
     auto create = conn.Query(create_sql);
@@ -107,12 +109,16 @@ inline bool EnsureReplStateTable(duckdb::Connection &conn,
   bool has_applied = false;
   bool has_last_commit = false;
   bool has_schema_version = false;
+  bool has_binlog_file = false;
+  bool has_binlog_pos = false;
   bool has_id = false;
   bool has_updated = false;
   for (const auto &col : columns) {
     if (col == "channel") has_channel = true;
     if (col == "snapshot_gtid_set") has_snapshot = true;
     if (col == "applied_gtid_set") has_applied = true;
+    if (col == "binlog_file") has_binlog_file = true;
+    if (col == "binlog_pos") has_binlog_pos = true;
     if (col == "last_commit_ts") has_last_commit = true;
     if (col == "schema_version") has_schema_version = true;
     if (col == "id") has_id = true;
@@ -122,6 +128,22 @@ inline bool EnsureReplStateTable(duckdb::Connection &conn,
     if (!has_schema_version) {
       auto alter =
           conn.Query("ALTER TABLE __repl_state ADD COLUMN schema_version BIGINT");
+      if (alter->HasError()) {
+        if (error) *error = alter->GetError();
+        return false;
+      }
+    }
+    if (!has_binlog_file) {
+      auto alter =
+          conn.Query("ALTER TABLE __repl_state ADD COLUMN binlog_file VARCHAR");
+      if (alter->HasError()) {
+        if (error) *error = alter->GetError();
+        return false;
+      }
+    }
+    if (!has_binlog_pos) {
+      auto alter =
+          conn.Query("ALTER TABLE __repl_state ADD COLUMN binlog_pos BIGINT");
       if (alter->HasError()) {
         if (error) *error = alter->GetError();
         return false;
@@ -154,6 +176,8 @@ inline bool EnsureReplStateTable(duckdb::Connection &conn,
         "channel VARCHAR PRIMARY KEY, "
         "snapshot_gtid_set VARCHAR, "
         "applied_gtid_set VARCHAR, "
+        "binlog_file VARCHAR, "
+        "binlog_pos BIGINT, "
         "last_commit_ts TIMESTAMP, "
         "schema_version BIGINT)");
     if (create->HasError()) {
@@ -167,9 +191,11 @@ inline bool EnsureReplStateTable(duckdb::Connection &conn,
                              : "'" + EscapeReplStateLiteral(updated) + "'";
     const std::string insert_sql =
         "INSERT INTO __repl_state_new (channel, snapshot_gtid_set, "
-        "applied_gtid_set, last_commit_ts, schema_version) "
+        "applied_gtid_set, last_commit_ts, schema_version, binlog_file, "
+        "binlog_pos) "
         "VALUES ('default', " +
-        snapshot_sql + ", " + snapshot_sql + ", " + ts_sql + ", NULL)";
+        snapshot_sql + ", " + snapshot_sql + ", " + ts_sql +
+        ", NULL, NULL, NULL)";
     auto insert = conn.Query(insert_sql);
     if (insert->HasError()) {
       if (error) *error = insert->GetError();
