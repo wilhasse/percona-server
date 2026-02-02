@@ -756,9 +756,31 @@ std::vector<duckdb_se::QualifiedTableRef> collect_query_tables(LEX *lex) {
   return tables;
 }
 
+bool collect_visible_fields(const mem_root_deque<Item *> &fields,
+                            std::vector<Item *> *out,
+                            std::string *reason) {
+  if (!out) return false;
+  out->clear();
+  for (Item *item : fields) {
+    if (item == nullptr) {
+      if (reason) *reason = "DuckDB select list contains null item";
+      return false;
+    }
+    if (item->hidden) continue;
+    out->push_back(item);
+  }
+  if (out->empty()) {
+    if (reason) *reason = "DuckDB select list is empty";
+    return false;
+  }
+  return true;
+}
+
 bool uses_supported_select_items(const mem_root_deque<Item *> &fields,
                                  std::string *reason) {
-  for (Item *item : VisibleFields(fields)) {
+  std::vector<Item *> visible;
+  if (!collect_visible_fields(fields, &visible, reason)) return false;
+  for (Item *item : visible) {
     Item *real = item->real_item();
     if (real->result_type() == ROW_RESULT) {
       if (reason) *reason = "Row constructors are not supported";
@@ -910,7 +932,18 @@ static bool DuckdbExecuteQuery(JOIN *join, Query_result *query_result) {
       return true;
     }
 
-    const size_t field_count = CountVisibleFields(*join->fields);
+    std::vector<Item *> visible_items;
+    std::string field_reason;
+    if (!collect_visible_fields(*join->fields, &visible_items, &field_reason)) {
+      const std::string err =
+          field_reason.empty()
+              ? "DuckDB select list could not be enumerated"
+              : field_reason;
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), err.c_str());
+      return true;
+    }
+
+    const size_t field_count = visible_items.size();
     if (result->ColumnCount() != field_count) {
       my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
                "DuckDB result column count mismatch");
@@ -925,7 +958,7 @@ static bool DuckdbExecuteQuery(JOIN *join, Query_result *query_result) {
     out_caches.reserve(field_count);
     cache_storage.reserve(field_count);
 
-    for (Item *item : VisibleFields(*join->fields)) {
+    for (Item *item : visible_items) {
       std::string reason;
       Item_cache *cache = create_duckdb_output_cache(item, &reason);
       if (cache == nullptr) {
