@@ -523,8 +523,45 @@ DuckdbRewriteResult RewriteForDuckdb(const std::string &sql) {
             return result;
           }
 
+          if (upper == "IF") {
+            size_t close_paren = 0;
+            std::vector<std::string> args;
+            std::string reason;
+            if (!ParseArguments(sql, lookahead, &close_paren, &args, &reason)) {
+              result.ok = false;
+              result.reason = reason;
+              return result;
+            }
+            if (args.size() != 3) {
+              result.ok = false;
+              result.reason = "IF() requires exactly 3 arguments";
+              return result;
+            }
+            out.append("CASE WHEN ");
+            out.append(NormalizeBackticks(Trim(args[0])));
+            out.append(" THEN ");
+            out.append(NormalizeBackticks(Trim(args[1])));
+            out.append(" ELSE ");
+            out.append(NormalizeBackticks(Trim(args[2])));
+            out.append(" END");
+            i = close_paren + 1;
+            continue;
+          }
+
           if (upper == "IFNULL") {
             out.append("COALESCE");
+            continue;
+          }
+          if (upper == "LCASE") {
+            out.append("LOWER");
+            continue;
+          }
+          if (upper == "UCASE") {
+            out.append("UPPER");
+            continue;
+          }
+          if (upper == "MID") {
+            out.append("SUBSTR");
             continue;
           }
           if (upper == "DATE_FORMAT") {

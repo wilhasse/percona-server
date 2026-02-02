@@ -9,19 +9,25 @@ runs in the server process (no runtime LLM).
 - `LIMIT offset, count` is rewritten to `LIMIT count OFFSET offset`.
 - Function name mapping is applied where DuckDB has an equivalent.
 
-## Coverage Snapshot (2026-02-01)
-- Rules tracked: 11
-- Supported: 4
+## Coverage Snapshot (2026-02-02)
+- Rules tracked: 15
+- Supported: 8
 - Partial: 5
 - Not supported: 2
-- Rewrite coverage (supported + partial): 9/11 = 82%
+- Rewrite coverage (supported + partial): 13/15 = 87%
 
 ## Function Compatibility Matrix
 Legend: SUPPORTED, PARTIAL (differences), NOT SUPPORTED
 
 ### String Functions
 - SUPPORTED: `IFNULL(a,b)` -> `COALESCE(a,b)`
+- SUPPORTED: `LCASE(str)` -> `LOWER(str)`
+- SUPPORTED: `UCASE(str)` -> `UPPER(str)`
+- SUPPORTED: `MID(str, pos, len)` -> `SUBSTR(str, pos, len)`
 - PARTIAL: `LOCATE(substr,str)` -> `STRPOS(str, substr)` (no start-position arg)
+
+### Conditional
+- SUPPORTED: `IF(expr, a, b)` -> `CASE WHEN expr THEN a ELSE b END`
 
 ### Date/Time Functions
 - PARTIAL: `DATE_FORMAT(dt, fmt)` -> `STRFTIME(dt, fmt)` (format tokens may differ)

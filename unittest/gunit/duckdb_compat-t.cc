@@ -91,3 +91,24 @@ TEST(DuckDBCompatTest, RewriteOnlyMappedTables) {
 
   EXPECT_EQ("SELECT * FROM other.t2 JOIN t1 ON other.t2.id = t1.id", rewritten);
 }
+
+TEST(DuckDBCompatTest, RewriteIfFunction) {
+  const std::string sql = "SELECT IF(`a` > 0, 'y', 'n') FROM `t`";
+
+  auto rewrite = RewriteForDuckdb(sql);
+  ASSERT_TRUE(rewrite.ok);
+
+  EXPECT_EQ("SELECT CASE WHEN \"a\" > 0 THEN 'y' ELSE 'n' END FROM \"t\"",
+            rewrite.sql);
+}
+
+TEST(DuckDBCompatTest, RewriteFunctionAliases) {
+  const std::string sql =
+      "SELECT LCASE(name), UCASE(name), MID(name, 2, 3) FROM t";
+
+  auto rewrite = RewriteForDuckdb(sql);
+  ASSERT_TRUE(rewrite.ok);
+
+  EXPECT_EQ("SELECT LOWER(name), UPPER(name), SUBSTR(name, 2, 3) FROM t",
+            rewrite.sql);
+}
