@@ -1386,9 +1386,13 @@ Status DuckDBAdapter::IsGtidApplied(const Gtid &gtid, bool *applied) {
                                          : error);
     }
     bool found = false;
+    std::string snapshot;
     std::string applied_set;
-    st = ReadReplStateRow(*conn_, nullptr, &applied_set, nullptr, &found);
+    st = ReadReplStateRow(*conn_, &snapshot, &applied_set, nullptr, &found);
     if (!st.ok()) return st;
+    if (applied_set.empty() && !snapshot.empty()) {
+      applied_set = snapshot;
+    }
     if (!found || applied_set.empty()) {
       std::string fallback;
       st = LoadWatermarkGtidSet(*conn_, &fallback);

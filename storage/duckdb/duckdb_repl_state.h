@@ -169,7 +169,7 @@ inline bool EnsureReplStateTable(duckdb::Connection &conn,
         "INSERT INTO __repl_state_new (channel, snapshot_gtid_set, "
         "applied_gtid_set, last_commit_ts, schema_version) "
         "VALUES ('default', " +
-        snapshot_sql + ", NULL, " + ts_sql + ", NULL)";
+        snapshot_sql + ", " + snapshot_sql + ", " + ts_sql + ", NULL)";
     auto insert = conn.Query(insert_sql);
     if (insert->HasError()) {
       if (error) *error = insert->GetError();

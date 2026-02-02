@@ -132,6 +132,10 @@ Status LoadReplStateFromFile(const std::string &path,
       }
     }
 
+    if (out_state->applied_gtid_set.empty() &&
+        !out_state->snapshot_gtid_set.empty()) {
+      out_state->applied_gtid_set = out_state->snapshot_gtid_set;
+    }
     if (out_state->applied_gtid_set.empty()) {
       auto wm = conn.Query(
           "SELECT gtid FROM __repl_watermark ORDER BY commit_ts");

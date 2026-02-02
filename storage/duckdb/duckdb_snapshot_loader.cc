@@ -102,6 +102,7 @@ struct Options {
   bool drop_watermark{false};
   bool state_only{false};
   bool show_state{false};
+  bool consistent_gtid_snapshot{false};
   bool show_help{false};
 };
 
@@ -129,6 +130,7 @@ void PrintUsage(const char *argv0) {
          "  --drop-watermark              Drop legacy __repl_watermark table\n"
          "  --state-only                  Only update/show replication state\n"
          "  --show-state                  Print current __repl_state values\n"
+         "  --consistent-gtid-snapshot    Use FTWRL to tie GTID set to snapshot\n"
          "  --verbose                Verbose output\n"
          "  --help                   Show this help\n";
 }
@@ -268,6 +270,10 @@ bool ParseArgs(int argc, char **argv, Options *opts) {
     }
     if (arg == "--show-state") {
       opts->show_state = true;
+      continue;
+    }
+    if (arg == "--consistent-gtid-snapshot") {
+      opts->consistent_gtid_snapshot = true;
       continue;
     }
 
@@ -572,6 +578,14 @@ bool ExecQuery(MYSQL *mysql, const std::string &sql) {
   return true;
 }
 
+bool LockTablesForSnapshot(MYSQL *mysql) {
+  return ExecQuery(mysql, "FLUSH TABLES WITH READ LOCK");
+}
+
+bool UnlockTablesForSnapshot(MYSQL *mysql) {
+  return ExecQuery(mysql, "UNLOCK TABLES");
+}
+
 bool DuckdbTableExists(DuckDBAdapter &adapter, const std::string &schema,
                        const std::string &table, bool *exists) {
   if (!exists) return false;
@@ -824,12 +838,15 @@ bool StoreSnapshotGtid(DuckDBAdapter &adapter, const std::string &gtid) {
     return false;
   }
 
+  const std::string gtid_sql = QuoteDuckdbLiteral(gtid);
   const std::string upsert_sql =
-      "INSERT INTO __repl_state (channel, snapshot_gtid_set, last_commit_ts) "
+      "INSERT INTO __repl_state (channel, snapshot_gtid_set, applied_gtid_set, "
+      "last_commit_ts) "
       "VALUES ('default', " +
-      QuoteDuckdbLiteral(gtid) + ", CURRENT_TIMESTAMP) "
+      gtid_sql + ", " + gtid_sql + ", CURRENT_TIMESTAMP) "
       "ON CONFLICT(channel) DO UPDATE SET "
       "snapshot_gtid_set = excluded.snapshot_gtid_set, "
+      "applied_gtid_set = excluded.applied_gtid_set, "
       "last_commit_ts = excluded.last_commit_ts";
   auto upsert = adapter.ExecuteQuery(upsert_sql, {});
   if (upsert.ok) return true;
@@ -872,7 +889,7 @@ bool StoreSnapshotGtid(DuckDBAdapter &adapter, const std::string &gtid) {
     const std::string insert_sql =
         "INSERT INTO __repl_state_new (channel, snapshot_gtid_set, "
         "applied_gtid_set, last_commit_ts, schema_version) VALUES ('default', " +
-        snapshot_sql + ", NULL, " + ts_sql + ", NULL)";
+        snapshot_sql + ", " + snapshot_sql + ", " + ts_sql + ", NULL)";
     auto insert = adapter.ExecuteQuery(insert_sql, {});
     if (!insert.ok) {
       std::cerr << "DuckDB __repl_state_new insert failed: " << insert.error
@@ -1496,18 +1513,44 @@ int main(int argc, char **argv) {
     mysql_library_end();
     return 1;
   }
-  if (!ExecQuery(mysql, "START TRANSACTION WITH CONSISTENT SNAPSHOT")) {
-    mysql_close(mysql);
-    mysql_library_end();
-    return 1;
-  }
 
   std::string snapshot_gtid;
-  if (!QuerySingleValue(mysql, "SELECT @@GLOBAL.GTID_EXECUTED",
-                        &snapshot_gtid)) {
-    mysql_close(mysql);
-    mysql_library_end();
-    return 1;
+  if (opts.consistent_gtid_snapshot) {
+    if (!LockTablesForSnapshot(mysql)) {
+      mysql_close(mysql);
+      mysql_library_end();
+      return 1;
+    }
+    if (!QuerySingleValue(mysql, "SELECT @@GLOBAL.GTID_EXECUTED",
+                          &snapshot_gtid)) {
+      UnlockTablesForSnapshot(mysql);
+      mysql_close(mysql);
+      mysql_library_end();
+      return 1;
+    }
+    if (!ExecQuery(mysql, "START TRANSACTION WITH CONSISTENT SNAPSHOT")) {
+      UnlockTablesForSnapshot(mysql);
+      mysql_close(mysql);
+      mysql_library_end();
+      return 1;
+    }
+    if (!UnlockTablesForSnapshot(mysql)) {
+      mysql_close(mysql);
+      mysql_library_end();
+      return 1;
+    }
+  } else {
+    if (!ExecQuery(mysql, "START TRANSACTION WITH CONSISTENT SNAPSHOT")) {
+      mysql_close(mysql);
+      mysql_library_end();
+      return 1;
+    }
+    if (!QuerySingleValue(mysql, "SELECT @@GLOBAL.GTID_EXECUTED",
+                          &snapshot_gtid)) {
+      mysql_close(mysql);
+      mysql_library_end();
+      return 1;
+    }
   }
   if (opts.verbose) {
     std::cerr << "Snapshot GTID set: " << snapshot_gtid << "\n";

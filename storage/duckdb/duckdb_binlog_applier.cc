@@ -1308,7 +1308,10 @@ Status DuckDBBinlogApplier::ApplyWatermark() {
   Status st = ReadReplStateRow(*apply_txn_.conn, &snapshot, &applied_set, &found);
   if (!st.ok()) return st;
 
-  if (!found || applied_set.empty()) {
+  if (applied_set.empty() && !snapshot.empty()) {
+    applied_set = snapshot;
+  }
+  if (applied_set.empty()) {
     std::string watermark_set;
     st = LoadWatermarkGtidSet(*apply_txn_.conn, &watermark_set);
     if (!st.ok()) return st;

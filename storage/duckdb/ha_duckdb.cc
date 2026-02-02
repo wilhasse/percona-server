@@ -581,13 +581,15 @@ bool store_snapshot_gtid(duckdb::Connection &con,
   std::string error;
   if (!duckdb_se::EnsureReplStateTable(con, &error)) return false;
 
+  const std::string gtid_sql = value_to_sql(duckdb::Value(snapshot_gtid));
   const std::string sql =
-      "INSERT INTO __repl_state (channel, snapshot_gtid_set, last_commit_ts) "
+      "INSERT INTO __repl_state (channel, snapshot_gtid_set, applied_gtid_set, "
+      "last_commit_ts) "
       "VALUES ('default', " +
-      value_to_sql(duckdb::Value(snapshot_gtid)) +
-      ", CURRENT_TIMESTAMP) "
+      gtid_sql + ", " + gtid_sql + ", CURRENT_TIMESTAMP) "
       "ON CONFLICT(channel) DO UPDATE SET "
       "snapshot_gtid_set = excluded.snapshot_gtid_set, "
+      "applied_gtid_set = excluded.applied_gtid_set, "
       "last_commit_ts = excluded.last_commit_ts";
   auto upsert_result = con.Query(sql);
   return !upsert_result->HasError();
