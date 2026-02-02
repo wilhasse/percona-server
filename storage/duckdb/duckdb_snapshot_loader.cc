@@ -1373,19 +1373,28 @@ Status ApplyBufferedEvents(MYSQL *mysql, DuckDBAdapter &adapter,
           }
           change.new_def = std::move(def);
         } else if (change.type == DDLChange::Type::kAlter) {
-          if (!mysql) {
-            return Status::Error(duckdb_se::StatusCode::kInvalid,
-                                 "Missing MySQL handle for DDL");
+          std::string reason;
+          const bool copy_ddl = ShouldCopyAlter(change.sql, &reason);
+          if (copy_ddl) {
+            if (verbose && !reason.empty()) {
+              std::cerr << "Using copy-DDL fallback for ALTER (" << reason
+                        << ")\n";
+            }
+            if (!mysql) {
+              return Status::Error(duckdb_se::StatusCode::kInvalid,
+                                   "Missing MySQL handle for DDL");
+            }
+            MySQLTableDef def;
+            std::vector<bool> blob_flags;
+            if (!FetchTableDef(mysql, parsed.schema, change.table.table, &def,
+                               &blob_flags)) {
+              return Status::Error(
+                  duckdb_se::StatusCode::kInvalid,
+                  "Failed to fetch table definition for DDL");
+            }
+            change.new_def = std::move(def);
+            change.copy_ddl = true;
           }
-          MySQLTableDef def;
-          std::vector<bool> blob_flags;
-          if (!FetchTableDef(mysql, parsed.schema, change.table.table, &def,
-                             &blob_flags)) {
-            return Status::Error(duckdb_se::StatusCode::kInvalid,
-                                 "Failed to fetch table definition for DDL");
-          }
-          change.new_def = std::move(def);
-          change.copy_ddl = true;
         }
 
         Status st = applier.ApplyDDL(std::move(change));

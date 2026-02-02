@@ -190,6 +190,69 @@ inline std::string RewriteSql(const std::string &sql,
   return out;
 }
 
+inline bool IsBoundary(char ch) {
+  return !std::isalnum(static_cast<unsigned char>(ch)) && ch != '_';
+}
+
+inline bool ContainsToken(const std::string &upper, const std::string &token) {
+  size_t pos = upper.find(token);
+  while (pos != std::string::npos) {
+    const char before = pos == 0 ? ' ' : upper[pos - 1];
+    const size_t end = pos + token.size();
+    const char after = end >= upper.size() ? ' ' : upper[end];
+    if (IsBoundary(before) && IsBoundary(after)) return true;
+    pos = upper.find(token, pos + 1);
+  }
+  return false;
+}
+
+inline std::string ToUpperAscii(std::string value) {
+  for (char &ch : value) {
+    ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+  }
+  return value;
+}
+
+inline std::string UnsupportedDdlReason(const std::string &sql,
+                                        DDLChange::Type type) {
+  if (sql.empty()) return "";
+  std::string upper = ToUpperAscii(sql);
+
+  if (ContainsToken(upper, "CHARACTER SET") || ContainsToken(upper, "CHARSET") ||
+      ContainsToken(upper, "COLLATE")) {
+    return "character set/collation";
+  }
+  if (ContainsToken(upper, "GENERATED") || ContainsToken(upper, "VIRTUAL") ||
+      ContainsToken(upper, "STORED")) {
+    return "generated columns";
+  }
+  if (ContainsToken(upper, "PARTITION")) {
+    return "partitioning";
+  }
+  if (ContainsToken(upper, "FOREIGN KEY") || ContainsToken(upper, "REFERENCES")) {
+    return "foreign keys";
+  }
+  if (ContainsToken(upper, "FULLTEXT") || ContainsToken(upper, "SPATIAL") ||
+      ContainsToken(upper, "INDEX") || ContainsToken(upper, "UNIQUE") ||
+      (ContainsToken(upper, "KEY") && !ContainsToken(upper, "PRIMARY KEY") &&
+       !ContainsToken(upper, "FOREIGN KEY"))) {
+    return "secondary indexes";
+  }
+  if (type == DDLChange::Type::kAlter) {
+    if (ContainsToken(upper, "FIRST") || ContainsToken(upper, "AFTER")) {
+      return "column reordering";
+    }
+    if (ContainsToken(upper, "MODIFY")) {
+      return "modify column";
+    }
+    if (ContainsToken(upper, "CHANGE")) {
+      return "change column";
+    }
+  }
+
+  return "";
+}
+
 }  // namespace detail
 
 inline bool ParseDdlQuery(const std::string &sql,
@@ -328,6 +391,17 @@ inline bool ParseDdlQuery(const std::string &sql,
     return true;
   }
 
+  return false;
+}
+
+inline bool ShouldCopyAlter(const std::string &sql, std::string *reason) {
+  std::string unsupported =
+      detail::UnsupportedDdlReason(sql, DDLChange::Type::kAlter);
+  if (!unsupported.empty()) {
+    if (reason) *reason = std::move(unsupported);
+    return true;
+  }
+  if (reason) reason->clear();
   return false;
 }
 

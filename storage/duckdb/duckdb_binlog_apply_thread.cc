@@ -396,13 +396,25 @@ Status ApplyDdlEvent(const BinlogEvent &event,
                                  &def);
     if (!st.ok()) return st;
     change.new_def = std::move(def);
-  } else if (change.type == DDLChange::Type::kAlter) {
-    MySQLTableDef def;
-    st = FetchTableDefFromSource(options, parsed.schema, change.table.table,
-                                 &def);
-    if (!st.ok()) return st;
-    change.new_def = std::move(def);
-    change.copy_ddl = true;
+    return state->applier->ApplyDDL(std::move(change));
+  }
+
+  if (change.type == DDLChange::Type::kAlter) {
+    std::string reason;
+    if (ShouldCopyAlter(change.sql, &reason)) {
+      if (!reason.empty()) {
+        sql_print_information(
+            "DuckDB binlog applier: Using copy-DDL fallback for ALTER (%s)",
+            reason.c_str());
+      }
+      MySQLTableDef def;
+      st = FetchTableDefFromSource(options, parsed.schema, change.table.table,
+                                   &def);
+      if (!st.ok()) return st;
+      change.new_def = std::move(def);
+      change.copy_ddl = true;
+    }
+    return state->applier->ApplyDDL(std::move(change));
   }
 
   return state->applier->ApplyDDL(std::move(change));
