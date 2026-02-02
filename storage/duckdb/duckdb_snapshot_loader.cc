@@ -80,6 +80,8 @@ using duckdb_se::Status;
 using duckdb_se::TableId;
 
 constexpr const char *kReplChannel = "default";
+constexpr size_t kDefaultMaxBufferEvents = 200000;
+constexpr size_t kDefaultMaxBufferBytes = 64 * 1024 * 1024;
 
 struct Options {
   std::string host{"127.0.0.1"};
@@ -96,6 +98,8 @@ struct Options {
   bool verbose{false};
   bool validate{false};
   bool validate_sum{false};
+  size_t max_buffer_events{kDefaultMaxBufferEvents};
+  size_t max_buffer_bytes{kDefaultMaxBufferBytes};
   std::string applied_gtid_set;
   bool set_applied_gtid{false};
   bool reset_applied_gtid{false};
@@ -125,6 +129,10 @@ void PrintUsage(const char *argv0) {
          "  --overwrite              Drop table if it exists\n"
          "  --validate               Validate row counts after load\n"
          "  --validate-sum           Validate SUM() for up to 3 numeric columns\n"
+         "  --max-buffer-events <n>  Max buffered events (default "
+      << kDefaultMaxBufferEvents << ")\n"
+         "  --max-buffer-bytes <n>   Max buffered bytes (default "
+      << kDefaultMaxBufferBytes << ")\n"
          "  --set-applied-gtid-set <set>  Force applied_gtid_set value\n"
          "  --reset-applied-gtid-set      Clear applied_gtid_set\n"
          "  --drop-watermark              Drop legacy __repl_watermark table\n"
@@ -251,6 +259,14 @@ bool ParseArgs(int argc, char **argv, Options *opts) {
       opts->validate_sum = true;
       continue;
     }
+    if (arg == "--max-buffer-events") {
+      if (!consume_size(&opts->max_buffer_events)) return false;
+      continue;
+    }
+    if (arg == "--max-buffer-bytes") {
+      if (!consume_size(&opts->max_buffer_bytes)) return false;
+      continue;
+    }
     if (arg == "--set-applied-gtid-set") {
       if (!consume_value(&opts->applied_gtid_set)) return false;
       opts->set_applied_gtid = true;
@@ -315,6 +331,14 @@ bool ParseArgs(int argc, char **argv, Options *opts) {
     }
     if (StartsWith(arg, "--batch=")) {
       if (!ParseSizeT(arg.substr(8), &opts->batch_rows)) return false;
+      continue;
+    }
+    if (StartsWith(arg, "--max-buffer-events=")) {
+      if (!ParseSizeT(arg.substr(20), &opts->max_buffer_events)) return false;
+      continue;
+    }
+    if (StartsWith(arg, "--max-buffer-bytes=")) {
+      if (!ParseSizeT(arg.substr(19), &opts->max_buffer_bytes)) return false;
       continue;
     }
     if (StartsWith(arg, "--set-applied-gtid-set=")) {
@@ -1150,6 +1174,10 @@ bool StreamTable(MYSQL *mysql, DuckDBAdapter &adapter,
 struct BinlogBufferState {
   std::vector<BinlogEvent> events;
   std::mutex mutex;
+  size_t buffered_events{0};
+  size_t buffered_bytes{0};
+  size_t max_events{0};
+  size_t max_bytes{0};
   std::atomic<bool> stop{false};
   std::atomic<bool> failed{false};
   std::string error;
@@ -1201,8 +1229,58 @@ bool IsBufferableEvent(const BinlogEvent &event) {
   }
 }
 
+bool ShouldApplySchema(const std::string &schema,
+                       const std::string &schema_filter) {
+  if (schema_filter.empty()) return true;
+  return schema == schema_filter;
+}
+
+size_t EstimateEventBytes(const BinlogEvent &event) {
+  size_t bytes = sizeof(event);
+  bytes += event.gtid.size();
+  bytes += event.schema.size();
+  bytes += event.table.size();
+  bytes += event.query.size();
+  bytes += event.columns_before.size();
+  bytes += event.columns_after.size();
+  bytes += event.row_data.size();
+  return bytes;
+}
+
+bool ShouldBufferEvent(const BinlogEvent &event,
+                       const std::string &schema_filter,
+                       const std::string &table_filter) {
+  switch (event.type) {
+    case BinlogEvent::Type::kGtid:
+    case BinlogEvent::Type::kXid:
+      return true;
+    case BinlogEvent::Type::kWriteRows:
+    case BinlogEvent::Type::kUpdateRows:
+    case BinlogEvent::Type::kDeleteRows:
+      return ShouldApplyEvent(event, schema_filter, table_filter);
+    case BinlogEvent::Type::kQuery: {
+      if (!ShouldApplySchema(event.schema, schema_filter)) return false;
+      if (table_filter.empty()) return true;
+      if (event.query.empty()) return false;
+      ParsedDdl parsed;
+      std::string parse_error;
+      if (!ParseDdlQuery(event.query, event.schema, &parsed, &parse_error)) {
+        return false;
+      }
+      if (!ShouldApplySchema(parsed.schema, schema_filter)) return false;
+      const std::string &table_name = parsed.change.table.table;
+      const std::string &new_table = parsed.change.new_table.table;
+      return table_name == table_filter || new_table == table_filter;
+    }
+    default:
+      return false;
+  }
+}
+
 void BufferBinlogEvents(DuckDBBinlogStreamer *streamer,
-                        BinlogBufferState *state, bool verbose) {
+                        BinlogBufferState *state,
+                        const std::string &schema_filter,
+                        const std::string &table_filter, bool verbose) {
   if (!streamer || !state) return;
   while (!state->stop.load()) {
     BinlogEvent event;
@@ -1225,13 +1303,41 @@ void BufferBinlogEvents(DuckDBBinlogStreamer *streamer,
     if (!IsBufferableEvent(event)) {
       continue;
     }
+    if (!ShouldBufferEvent(event, schema_filter, table_filter)) {
+      continue;
+    }
 
     if (verbose && event.type == BinlogEvent::Type::kGtid) {
       std::cerr << "Buffered GTID: " << event.gtid << "\n";
     }
 
+    const size_t event_bytes = EstimateEventBytes(event);
     std::lock_guard<std::mutex> guard(state->mutex);
+    const size_t next_events = state->buffered_events + 1;
+    const size_t next_bytes = state->buffered_bytes + event_bytes;
+    if ((state->max_events > 0 && next_events > state->max_events) ||
+        (state->max_bytes > 0 && next_bytes > state->max_bytes)) {
+      std::ostringstream oss;
+      oss << "Binlog buffer limit exceeded (";
+      bool first = true;
+      if (state->max_events > 0 && next_events > state->max_events) {
+        oss << "events=" << next_events << " max=" << state->max_events;
+        first = false;
+      }
+      if (state->max_bytes > 0 && next_bytes > state->max_bytes) {
+        if (!first) oss << ", ";
+        oss << "bytes=" << next_bytes << " max=" << state->max_bytes;
+      }
+      oss << "). Re-run with --max-buffer-events/--max-buffer-bytes or use "
+             "--consistent-gtid-snapshot on a quiet source.";
+      state->error = oss.str();
+      state->failed.store(true);
+      state->stop.store(true);
+      break;
+    }
     state->events.push_back(std::move(event));
+    state->buffered_events = next_events;
+    state->buffered_bytes = next_bytes;
   }
 }
 
@@ -1559,6 +1665,8 @@ int main(int argc, char **argv) {
   DuckDBBinlogStreamer binlog_streamer;
   BinlogBufferState binlog_buffer;
   std::thread binlog_thread;
+  binlog_buffer.max_events = opts.max_buffer_events;
+  binlog_buffer.max_bytes = opts.max_buffer_bytes;
   {
     BinlogStreamOptions stream_opts;
     stream_opts.host = opts.host;
@@ -1577,7 +1685,8 @@ int main(int argc, char **argv) {
     }
   }
   binlog_thread = std::thread(BufferBinlogEvents, &binlog_streamer,
-                              &binlog_buffer, opts.verbose);
+                              &binlog_buffer, opts.schema, opts.table,
+                              opts.verbose);
   BinlogBufferGuard binlog_guard(&binlog_streamer, &binlog_buffer,
                                  &binlog_thread);
 
