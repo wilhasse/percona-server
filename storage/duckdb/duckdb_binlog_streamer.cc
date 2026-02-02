@@ -361,6 +361,10 @@ Status DuckDBBinlogStreamer::Open(const BinlogStreamOptions &options) {
   }
 
   fde_ = std::make_unique<Format_description_event>(BINLOG_VERSION, "8.0.0");
+  // MySQL 8.0 uses CRC32 checksums by default. Set this on the default FDE
+  // so that events processed before the real FDE is received (e.g., ROTATE
+  // events) will have checksum bytes properly excluded.
+  fde_->footer()->checksum_alg = binary_log::BINLOG_CHECKSUM_ALG_CRC32;
   open_ = true;
   return Status::Ok();
 }
@@ -444,6 +448,10 @@ Status DuckDBBinlogStreamer::NextEvent(BinlogEvent *event) {
 
   if (!fde_) {
     fde_ = std::make_unique<Format_description_event>(BINLOG_VERSION, "8.0.0");
+    // MySQL 8.0 uses CRC32 checksums by default. Set this on the default FDE
+    // so that events processed before the real FDE is received (e.g., ROTATE
+    // events) will have checksum bytes properly excluded.
+    fde_->footer()->checksum_alg = binary_log::BINLOG_CHECKSUM_ALG_CRC32;
   }
 
   for (;;) {
@@ -473,7 +481,9 @@ Status DuckDBBinlogStreamer::NextEvent(BinlogEvent *event) {
       case binary_log::ROTATE_EVENT: {
         Rotate_event rev(buf, fde_.get());
         if (rev.new_log_ident && rev.ident_len > 0) {
-          current_binlog_file_.assign(rev.new_log_ident, rev.ident_len);
+          // Use null-terminated string assignment instead of ident_len, as
+          // ident_len may include trailing checksum bytes from the event.
+          current_binlog_file_ = rev.new_log_ident;
         }
         if (rev.pos > 0) {
           current_binlog_pos_ = rev.pos;

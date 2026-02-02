@@ -143,23 +143,174 @@ std::string Latin1ToUtf8(const std::string &value) {
   return out;
 }
 
+// Sanitize invalid UTF-8 sequences by replacing them with U+FFFD (replacement
+// character). This ensures the output is always valid UTF-8.
+std::string SanitizeUtf8(const std::string &value) {
+  std::string out;
+  out.reserve(value.size());
+  const unsigned char *data =
+      reinterpret_cast<const unsigned char *>(value.data());
+  size_t i = 0;
+  const size_t len = value.size();
+  while (i < len) {
+    const unsigned char c = data[i];
+    // Check for valid UTF-8 byte sequences
+    if (c <= 0x7F) {
+      // ASCII character
+      out.push_back(static_cast<char>(c));
+      ++i;
+    } else if (c >= 0xC2 && c <= 0xDF) {
+      // 2-byte sequence
+      if (i + 1 < len && (data[i + 1] & 0xC0) == 0x80) {
+        out.push_back(static_cast<char>(c));
+        out.push_back(static_cast<char>(data[i + 1]));
+        i += 2;
+      } else {
+        // Invalid - replace with U+FFFD
+        out.append("\xEF\xBF\xBD");
+        ++i;
+      }
+    } else if (c == 0xE0) {
+      // 3-byte sequence starting with E0
+      if (i + 2 < len && data[i + 1] >= 0xA0 && data[i + 1] <= 0xBF &&
+          (data[i + 2] & 0xC0) == 0x80) {
+        out.push_back(static_cast<char>(c));
+        out.push_back(static_cast<char>(data[i + 1]));
+        out.push_back(static_cast<char>(data[i + 2]));
+        i += 3;
+      } else {
+        out.append("\xEF\xBF\xBD");
+        ++i;
+      }
+    } else if (c >= 0xE1 && c <= 0xEC) {
+      // 3-byte sequence
+      if (i + 2 < len && (data[i + 1] & 0xC0) == 0x80 &&
+          (data[i + 2] & 0xC0) == 0x80) {
+        out.push_back(static_cast<char>(c));
+        out.push_back(static_cast<char>(data[i + 1]));
+        out.push_back(static_cast<char>(data[i + 2]));
+        i += 3;
+      } else {
+        out.append("\xEF\xBF\xBD");
+        ++i;
+      }
+    } else if (c == 0xED) {
+      // 3-byte sequence starting with ED (avoid surrogates)
+      if (i + 2 < len && data[i + 1] >= 0x80 && data[i + 1] <= 0x9F &&
+          (data[i + 2] & 0xC0) == 0x80) {
+        out.push_back(static_cast<char>(c));
+        out.push_back(static_cast<char>(data[i + 1]));
+        out.push_back(static_cast<char>(data[i + 2]));
+        i += 3;
+      } else {
+        out.append("\xEF\xBF\xBD");
+        ++i;
+      }
+    } else if (c >= 0xEE && c <= 0xEF) {
+      // 3-byte sequence
+      if (i + 2 < len && (data[i + 1] & 0xC0) == 0x80 &&
+          (data[i + 2] & 0xC0) == 0x80) {
+        out.push_back(static_cast<char>(c));
+        out.push_back(static_cast<char>(data[i + 1]));
+        out.push_back(static_cast<char>(data[i + 2]));
+        i += 3;
+      } else {
+        out.append("\xEF\xBF\xBD");
+        ++i;
+      }
+    } else if (c == 0xF0) {
+      // 4-byte sequence starting with F0
+      if (i + 3 < len && data[i + 1] >= 0x90 && data[i + 1] <= 0xBF &&
+          (data[i + 2] & 0xC0) == 0x80 && (data[i + 3] & 0xC0) == 0x80) {
+        out.push_back(static_cast<char>(c));
+        out.push_back(static_cast<char>(data[i + 1]));
+        out.push_back(static_cast<char>(data[i + 2]));
+        out.push_back(static_cast<char>(data[i + 3]));
+        i += 4;
+      } else {
+        out.append("\xEF\xBF\xBD");
+        ++i;
+      }
+    } else if (c >= 0xF1 && c <= 0xF3) {
+      // 4-byte sequence
+      if (i + 3 < len && (data[i + 1] & 0xC0) == 0x80 &&
+          (data[i + 2] & 0xC0) == 0x80 && (data[i + 3] & 0xC0) == 0x80) {
+        out.push_back(static_cast<char>(c));
+        out.push_back(static_cast<char>(data[i + 1]));
+        out.push_back(static_cast<char>(data[i + 2]));
+        out.push_back(static_cast<char>(data[i + 3]));
+        i += 4;
+      } else {
+        out.append("\xEF\xBF\xBD");
+        ++i;
+      }
+    } else if (c == 0xF4) {
+      // 4-byte sequence starting with F4
+      if (i + 3 < len && data[i + 1] >= 0x80 && data[i + 1] <= 0x8F &&
+          (data[i + 2] & 0xC0) == 0x80 && (data[i + 3] & 0xC0) == 0x80) {
+        out.push_back(static_cast<char>(c));
+        out.push_back(static_cast<char>(data[i + 1]));
+        out.push_back(static_cast<char>(data[i + 2]));
+        out.push_back(static_cast<char>(data[i + 3]));
+        i += 4;
+      } else {
+        out.append("\xEF\xBF\xBD");
+        ++i;
+      }
+    } else {
+      // Invalid leading byte - replace with U+FFFD
+      out.append("\xEF\xBF\xBD");
+      ++i;
+    }
+  }
+  return out;
+}
+
 Status AppendCellValue(duckdb::Appender &appender, const Cell &cell) {
   if (cell.is_null) {
     appender.Append(duckdb::Value());
     return Status::Ok();
   }
   if (cell.is_blob) {
-    appender.Append(duckdb::Value::BLOB(cell.value));
+    // For BLOB columns, use Value::BLOB_RAW to pass raw bytes without
+    // interpreting escape sequences. Value::BLOB(string) expects hex-escaped
+    // non-ASCII bytes (e.g. \xAA), but we have raw binary data.
+    try {
+      appender.Append(duckdb::Value::BLOB_RAW(cell.value));
+    } catch (const std::exception &ex) {
+      sql_print_warning("DuckDB AppendCellValue: BLOB_RAW append failed: %s", ex.what());
+      return Status::Error(StatusCode::kDuckDBError,
+                           std::string("BLOB encoding error: ") + ex.what());
+    }
     return Status::Ok();
   }
-  if (IsValidUtf8(cell.value)) {
-    appender.Append(cell.value.c_str(),
-                    static_cast<uint32_t>(cell.value.size()));
-    return Status::Ok();
+  // For non-blob values, ensure the string is valid UTF-8.
+  // If not valid, try Latin1→UTF-8 conversion first.
+  // If DuckDB still rejects it, sanitize by replacing invalid sequences
+  // with U+FFFD (replacement character).
+  const std::string *value_ptr = &cell.value;
+  std::string converted;
+  if (!IsValidUtf8(cell.value)) {
+    converted = Latin1ToUtf8(cell.value);
+    value_ptr = &converted;
   }
-  const std::string converted = Latin1ToUtf8(cell.value);
-  appender.Append(converted.c_str(),
-                  static_cast<uint32_t>(converted.size()));
+  try {
+    appender.Append(value_ptr->c_str(),
+                    static_cast<uint32_t>(value_ptr->size()));
+  } catch (const std::exception &ex) {
+    // DuckDB's internal UTF-8 validation may be stricter than ours.
+    // Try sanitizing the string by replacing invalid sequences.
+    std::string sanitized = SanitizeUtf8(cell.value);
+    try {
+      appender.Append(sanitized.c_str(),
+                      static_cast<uint32_t>(sanitized.size()));
+    } catch (const std::exception &ex2) {
+      // If sanitizing still fails, return an error instead of silently
+      // corrupting data by using BLOB for a VARCHAR column.
+      return Status::Error(StatusCode::kDuckDBError,
+                           std::string("UTF-8 encoding error: ") + ex2.what());
+    }
+  }
   return Status::Ok();
 }
 
@@ -728,11 +879,17 @@ Status DuckDBAdapter::CreateTableOn(duckdb::Connection &conn,
 
   sql_print_warning("DuckDB create table DDL: %s", sql.c_str());
   try {
+    sql_print_warning("DuckDB create table: executing query...");
     auto result = conn.Query(sql);
+    sql_print_warning("DuckDB create table: query returned, checking error...");
     if (result->HasError()) {
+      sql_print_warning("DuckDB create table: query error: %s",
+                        result->GetError().c_str());
       return Status::Error(StatusCode::kDuckDBError, result->GetError());
     }
+    sql_print_warning("DuckDB create table: success");
   } catch (const std::exception &ex) {
+    sql_print_warning("DuckDB create table: exception: %s", ex.what());
     return Status::Error(StatusCode::kDuckDBError, ex.what());
   }
 
@@ -1249,19 +1406,38 @@ Status DuckDBAdapter::AppendRows(ApplyTxn &txn, TableId table, RowBatch batch) {
     if (table.table.empty()) {
       return Status::Error(StatusCode::kInvalid, "Missing table name");
     }
+    sql_print_warning("DuckDB AppendRows: creating appender for %s, rows=%zu",
+                      table.table.c_str(), batch.rows.size());
     std::unique_ptr<duckdb::Appender> appender =
         std::make_unique<duckdb::Appender>(*txn.conn, table.table);
 
+    size_t row_idx = 0;
     for (const auto &row : batch.rows) {
       appender->BeginRow();
+      size_t col_idx = 0;
       for (const auto &cell : row) {
         Status st = AppendCellValue(*appender, cell);
-        if (!st.ok()) return st;
+        if (!st.ok()) {
+          sql_print_warning(
+              "DuckDB AppendRows: AppendCellValue failed row=%zu col=%zu",
+              row_idx, col_idx);
+          return st;
+        }
+        ++col_idx;
       }
       appender->EndRow();
+      ++row_idx;
     }
 
-    appender->Close();
+    sql_print_warning("DuckDB AppendRows: closing appender...");
+    try {
+      appender->Close();
+      sql_print_warning("DuckDB AppendRows: appender closed successfully");
+    } catch (const std::exception &close_ex) {
+      sql_print_warning("DuckDB AppendRows: Close() exception: %s",
+                        close_ex.what());
+      throw;
+    }
   } catch (const std::exception &ex) {
     return Status::Error(StatusCode::kDuckDBError, ex.what());
   }
@@ -1309,17 +1485,38 @@ Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
     // Use main schema only - schema separation is at DuckDB file level
     const std::string delta_name = DeltaTableName(table);
     std::unique_ptr<duckdb::Appender> appender;
+    sql_print_warning("DuckDB ApplyBulkUpdates: creating appender for %s",
+                      delta_name.c_str());
     appender = std::make_unique<duckdb::Appender>(*txn.conn, delta_name);
 
+    sql_print_warning("DuckDB ApplyBulkUpdates: appending %zu old rows",
+                      batch.old_rows.size());
+    size_t row_idx = 0;
     for (const auto &row : batch.old_rows) {
       appender->BeginRow();
+      size_t col_idx = 0;
       for (const auto &cell : row) {
         Status st = AppendCellValue(*appender, cell);
-        if (!st.ok()) return st;
+        if (!st.ok()) {
+          sql_print_warning(
+              "DuckDB ApplyBulkUpdates: AppendCellValue failed row=%zu col=%zu",
+              row_idx, col_idx);
+          return st;
+        }
+        ++col_idx;
       }
       appender->EndRow();
+      ++row_idx;
     }
-    appender->Close();
+    sql_print_warning("DuckDB ApplyBulkUpdates: closing appender...");
+    try {
+      appender->Close();
+      sql_print_warning("DuckDB ApplyBulkUpdates: appender closed successfully");
+    } catch (const std::exception &close_ex) {
+      sql_print_warning("DuckDB ApplyBulkUpdates: Close() exception: %s",
+                        close_ex.what());
+      throw;
+    }
 
     std::vector<std::string> columns;
     st = GetTableColumnsOn(*txn.conn, table, &columns);
