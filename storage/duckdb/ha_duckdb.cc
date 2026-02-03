@@ -992,8 +992,13 @@ static bool OptimizeSecondaryEngine(THD *thd, LEX *lex) {
 }
 
 static const char *DuckdbGetOffloadFailReason(THD *thd) {
+  // Clear stale fail reason only when not in FORCED mode and not using secondary engine.
+  // In FORCED mode, we always want to show the specific error message.
+  // When using_secondary_storage_engine() is false after a FORCED query, it means
+  // offload failed and we need to preserve the error message.
   if (thd != nullptr && thd->lex != nullptr &&
       thd->lex->m_sql_cmd != nullptr &&
+      thd->variables.use_secondary_engine != SECONDARY_ENGINE_FORCED &&
       !thd->lex->m_sql_cmd->using_secondary_storage_engine()) {
     tls_fail_reason.clear();
   }
