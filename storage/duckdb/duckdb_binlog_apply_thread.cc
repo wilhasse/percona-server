@@ -41,7 +41,9 @@
 #include "mysql/components/services/mysql_admin_session.h"
 #include "mysql/service_command.h"
 #include "mysql/service_plugin_registry.h"
+#include "mysql/service_security_context.h"
 #include "mysql/service_srv_session.h"
+#include "mysql/service_srv_session_info.h"
 #include "my_sys.h"
 #include "sql/log.h"
 #include "sql/mysqld.h"
@@ -211,6 +213,10 @@ class MysqlAdminSession {
       return Status::Error(StatusCode::kInvalid,
                            "Failed to open mysql admin session");
     }
+    if (!SwitchToRoot()) {
+      return Status::Error(StatusCode::kInvalid,
+                           "Failed to set admin session user");
+    }
     return Status::Ok();
   }
 
@@ -245,6 +251,21 @@ class MysqlAdminSession {
   ~MysqlAdminSession() { Close(); }
 
  private:
+  bool SwitchToRoot() {
+    MYSQL_SECURITY_CONTEXT sc;
+    if (thd_get_security_context(srv_session_info_get_thd(session_), &sc)) {
+      sql_print_warning(
+          "DuckDB: failed to fetch security context for admin session");
+      return false;
+    }
+    if (security_context_lookup(sc, "root", "localhost", "localhost", "")) {
+      sql_print_warning(
+          "DuckDB: failed to switch admin session user to root@localhost");
+      return false;
+    }
+    return true;
+  }
+
   MYSQL_SESSION session_{nullptr};
 };
 
