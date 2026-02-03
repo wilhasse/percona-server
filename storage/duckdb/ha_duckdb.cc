@@ -759,6 +759,33 @@ std::vector<duckdb_se::QualifiedTableRef> collect_query_tables(LEX *lex) {
   return tables;
 }
 
+std::string build_missing_loaded_tables_reason(THD *thd) {
+  if (thd == nullptr || thd->lex == nullptr || loaded_tables == nullptr) {
+    return "";
+  }
+  const auto tables = collect_query_tables(thd->lex);
+  if (tables.empty()) return "";
+
+  std::vector<std::string> missing;
+  missing.reserve(tables.size());
+  for (const auto &ref : tables) {
+    if (ref.schema.empty() || ref.table.empty()) continue;
+    if (loaded_tables->get(ref.schema, ref.table) == nullptr) {
+      missing.push_back(ref.schema + "." + ref.table);
+    }
+  }
+  if (missing.empty()) return "";
+
+  std::ostringstream oss;
+  oss << "DuckDB secondary tables not loaded: ";
+  for (size_t i = 0; i < missing.size(); ++i) {
+    if (i > 0) oss << ", ";
+    oss << missing[i];
+  }
+  oss << ". Run ALTER TABLE ... SECONDARY_LOAD";
+  return oss.str();
+}
+
 bool collect_visible_fields(const mem_root_deque<Item *> &fields,
                             std::vector<Item *> *out,
                             std::string *reason) {
@@ -907,7 +934,13 @@ bool store_duckdb_result_value(THD *thd, Item *item, Item_cache *cache,
   return true;
 }
 
+// Thread-local storage for fail reason that persists across context changes
+static thread_local std::string tls_fail_reason;
+
 static bool PrepareSecondaryEngine(THD *thd, LEX *lex) {
+  // Clear thread-local fail reason from previous queries
+  tls_fail_reason.clear();
+
   auto *ctx = new (thd->mem_root) Duckdb_execution_context;
   if (ctx == nullptr) return true;
   lex->set_secondary_engine_execution_context(ctx);
@@ -959,6 +992,11 @@ static bool OptimizeSecondaryEngine(THD *thd, LEX *lex) {
 }
 
 static const char *DuckdbGetOffloadFailReason(THD *thd) {
+  // First check thread-local storage (set by ha_duckdb::open)
+  if (!tls_fail_reason.empty()) {
+    return tls_fail_reason.c_str();
+  }
+  // Fall back to context-based reason
   auto *ctx = down_cast<Duckdb_execution_context *>(
       thd->lex->secondary_engine_execution_context());
   if (ctx == nullptr || ctx->fail_reason.empty()) {
@@ -968,7 +1006,12 @@ static const char *DuckdbGetOffloadFailReason(THD *thd) {
 }
 
 static void DuckdbSetOffloadFailReason(THD *thd, const char *reason) {
-  if (thd == nullptr || thd->lex == nullptr) return;
+  // Store in thread-local for retrieval even if context changes
+  tls_fail_reason = reason ? reason : "DuckDB secondary engine failed";
+
+  if (thd == nullptr || thd->lex == nullptr) {
+    return;
+  }
   auto *ctx = down_cast<Duckdb_execution_context *>(
       thd->lex->secondary_engine_execution_context());
   if (ctx == nullptr) {
@@ -976,7 +1019,7 @@ static void DuckdbSetOffloadFailReason(THD *thd, const char *reason) {
     if (ctx == nullptr) return;
     thd->lex->set_secondary_engine_execution_context(ctx);
   }
-  ctx->fail_reason = reason ? reason : "DuckDB secondary engine failed";
+  ctx->fail_reason = tls_fail_reason;
 }
 
 }  // namespace
@@ -1080,7 +1123,12 @@ int ha_duckdb::open(const char *, int, unsigned int, const dd::Table *) {
   DuckdbTableState *share =
       loaded_tables->get(table_share->db.str, table_share->table_name.str);
   if (share == nullptr && table_share->is_secondary_engine()) {
-    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), "Table has not been loaded");
+    std::string reason = build_missing_loaded_tables_reason(current_thd);
+    if (reason.empty()) {
+      reason = "Table has not been loaded";
+    }
+    DuckdbSetOffloadFailReason(current_thd, reason.c_str());
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), reason.c_str());
     return HA_ERR_GENERIC;
   }
   if (share == nullptr) {
