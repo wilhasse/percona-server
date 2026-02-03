@@ -1666,6 +1666,8 @@ static std::string DuckdbStripInitConnectSnippet(const std::string &input) {
   return result;
 }
 
+static bool duckdb_owns_init_connect = false;
+
 static void DuckdbUpdateInitConnect() {
   mysql_rwlock_wrlock(&LOCK_sys_init_connect);
   std::string current;
@@ -1691,11 +1693,12 @@ static void DuckdbUpdateInitConnect() {
                   updated.size() + 1, MYF(MY_WME)));
     if (new_value != nullptr) {
       new_value[updated.size()] = 0;
-      if (opt_init_connect.str != nullptr) {
+      if (duckdb_owns_init_connect && opt_init_connect.str != nullptr) {
         my_free(opt_init_connect.str);
       }
       opt_init_connect.str = new_value;
       opt_init_connect.length = updated.size();
+      duckdb_owns_init_connect = true;
     }
   }
 
