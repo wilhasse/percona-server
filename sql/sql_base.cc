@@ -6106,10 +6106,16 @@ restart:
     }
 
     // Remember if an external table has been opened in this statement.
-    if (tbl != nullptr && tbl->s->has_secondary_engine() &&
-        ha_check_storage_engine_flag(tbl->s->db_type(),
-                                     HTON_SUPPORTS_EXTERNAL_SOURCE)) {
-      thd->lex->set_has_external_tables();
+    if (tbl != nullptr && tbl->s->has_secondary_engine()) {
+      const bool is_external_primary = ha_check_storage_engine_flag(
+          tbl->s->db_type(), HTON_SUPPORTS_EXTERNAL_SOURCE);
+      const bool is_duckdb_secondary =
+          tbl->s->secondary_engine.str != nullptr &&
+          !my_strcasecmp(system_charset_info, tbl->s->secondary_engine.str,
+                         "DUCKDB");
+      if (is_external_primary || is_duckdb_secondary) {
+        thd->lex->set_has_external_tables();
+      }
     }
 
     /*
