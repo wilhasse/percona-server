@@ -912,6 +912,7 @@ Status ApplyDdlEvent(const BinlogEvent &event,
                                  &def);
     if (!st.ok()) return st;
     MySQLTableDef def_for_dd = def;
+    std::string table_name = change.table.table;  // Save before move
     change.new_def = std::move(def);
     st = state->applier->ApplyDDL(std::move(change));
     if (!st.ok()) return st;
@@ -921,13 +922,14 @@ Status ApplyDdlEvent(const BinlogEvent &event,
                                 ? state->schema_version + 1
                                 : 1;
     state->schema_version_loaded = true;
-    CacheTable(*state, change.table.table);
+    CacheTable(*state, table_name);
     return Status::Ok();
   }
 
   if (change.type == DDLChange::Type::kAlter) {
     MySQLTableDef def_for_dd;
     std::string reason;
+    std::string table_name = change.table.table;  // Save before move
     if (ShouldCopyAlter(change.sql, &reason)) {
       if (!reason.empty()) {
         sql_print_information(
@@ -935,14 +937,14 @@ Status ApplyDdlEvent(const BinlogEvent &event,
             reason.c_str());
       }
       MySQLTableDef def;
-      st = FetchTableDefFromSource(options, parsed.schema, change.table.table,
+      st = FetchTableDefFromSource(options, parsed.schema, table_name,
                                    &def);
       if (!st.ok()) return st;
       def_for_dd = def;
       change.new_def = std::move(def);
       change.copy_ddl = true;
     } else {
-      st = FetchTableDefFromSource(options, parsed.schema, change.table.table,
+      st = FetchTableDefFromSource(options, parsed.schema, table_name,
                                    &def_for_dd);
       if (!st.ok()) return st;
     }
@@ -954,32 +956,37 @@ Status ApplyDdlEvent(const BinlogEvent &event,
                                 ? state->schema_version + 1
                                 : 1;
     state->schema_version_loaded = true;
-    CacheTable(*state, change.table.table);
+    CacheTable(*state, table_name);
     return Status::Ok();
   }
 
+  // Save values before move since we need them after ApplyDDL
+  DDLChange::Type change_type = change.type;
+  TableId table_id = change.table;
+  TableId new_table_id = change.new_table;
+
   st = state->applier->ApplyDDL(std::move(change));
   if (!st.ok()) return st;
-  if (change.type == DDLChange::Type::kDrop) {
-    st = DropMySQLTableInDD(change.table.schema, change.table.table);
+  if (change_type == DDLChange::Type::kDrop) {
+    st = DropMySQLTableInDD(table_id.schema, table_id.table);
     if (!st.ok()) return st;
-  } else if (change.type == DDLChange::Type::kRename) {
-    st = RenameMySQLTableInDD(options, change.table, change.new_table);
+  } else if (change_type == DDLChange::Type::kRename) {
+    st = RenameMySQLTableInDD(options, table_id, new_table_id);
     if (!st.ok()) return st;
-  } else if (change.type == DDLChange::Type::kTruncate) {
-    st = TruncateMySQLTableInDD(change.table.schema, change.table.table);
+  } else if (change_type == DDLChange::Type::kTruncate) {
+    st = TruncateMySQLTableInDD(table_id.schema, table_id.table);
     if (!st.ok()) return st;
   }
   state->schema_version =
       state->schema_version_loaded ? state->schema_version + 1 : 1;
   state->schema_version_loaded = true;
-  if (change.type == DDLChange::Type::kDrop) {
-    UncacheTable(*state, change.table.table);
-  } else if (change.type == DDLChange::Type::kRename) {
-    UncacheTable(*state, change.table.table);
-    CacheTable(*state, change.new_table.table);
+  if (change_type == DDLChange::Type::kDrop) {
+    UncacheTable(*state, table_id.table);
+  } else if (change_type == DDLChange::Type::kRename) {
+    UncacheTable(*state, table_id.table);
+    CacheTable(*state, new_table_id.table);
   } else {
-    CacheTable(*state, change.table.table);
+    CacheTable(*state, table_id.table);
   }
   return Status::Ok();
 }
