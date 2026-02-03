@@ -992,6 +992,11 @@ static bool OptimizeSecondaryEngine(THD *thd, LEX *lex) {
 }
 
 static const char *DuckdbGetOffloadFailReason(THD *thd) {
+  if (thd != nullptr && thd->lex != nullptr &&
+      thd->lex->m_sql_cmd != nullptr &&
+      !thd->lex->m_sql_cmd->using_secondary_storage_engine()) {
+    tls_fail_reason.clear();
+  }
   // First check thread-local storage (set by ha_duckdb::open)
   if (!tls_fail_reason.empty()) {
     return tls_fail_reason.c_str();
