@@ -937,6 +937,8 @@ bool store_duckdb_result_value(THD *thd, Item *item, Item_cache *cache,
 // Thread-local storage for fail reason that persists across context changes
 static thread_local std::string tls_fail_reason;
 
+static void DuckdbSetOffloadFailReason(THD *thd, const char *reason);
+
 static bool PrepareSecondaryEngine(THD *thd, LEX *lex) {
   // Clear thread-local fail reason from previous queries
   tls_fail_reason.clear();
@@ -981,6 +983,119 @@ static bool PrepareSecondaryEngine(THD *thd, LEX *lex) {
   return false;
 }
 
+static bool DuckdbExecuteQuery(JOIN *join, Query_result *query_result) {
+  if (join == nullptr || query_result == nullptr) return true;
+  THD *thd = join->thd;
+  if (thd == nullptr || thd->lex == nullptr) return true;
+
+  std::string reason;
+  Table_ref *base_table = nullptr;
+  std::string schema;
+  std::string path;
+  if (!is_simple_select(thd->lex, &base_table, &reason, &schema, &path)) {
+    DuckdbSetOffloadFailReason(thd, reason.c_str());
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), reason.c_str());
+    return true;
+  }
+
+  const std::string missing = build_missing_loaded_tables_reason(thd);
+  if (!missing.empty()) {
+    DuckdbSetOffloadFailReason(thd, missing.c_str());
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), missing.c_str());
+    return true;
+  }
+
+  const LEX_CSTRING query = thd->query();
+  if (query.str == nullptr || query.length == 0) {
+    reason = "DuckDB query text is empty";
+    DuckdbSetOffloadFailReason(thd, reason.c_str());
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), reason.c_str());
+    return true;
+  }
+
+  auto rewrite = duckdb_se::RewriteForDuckdb(
+      std::string(query.str, query.length));
+  if (!rewrite.ok) {
+    reason = rewrite.reason.empty() ? "DuckDB SQL rewrite failed"
+                                    : rewrite.reason;
+    DuckdbSetOffloadFailReason(thd, reason.c_str());
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), reason.c_str());
+    return true;
+  }
+  std::string rewritten = duckdb_se::RewriteQualifiedTables(
+      rewrite.sql, collect_query_tables(thd->lex));
+
+  mem_root_deque<Item *> *fields = join->query_expression()->get_field_list();
+  std::vector<Item *> visible;
+  if (!collect_visible_fields(*fields, &visible, &reason)) {
+    DuckdbSetOffloadFailReason(thd, reason.c_str());
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), reason.c_str());
+    return true;
+  }
+
+  std::vector<Item_cache *> caches;
+  caches.reserve(visible.size());
+  mem_root_deque<Item *> cache_items(thd->mem_root);
+  for (Item *item : visible) {
+    Item_cache *cache = create_duckdb_output_cache(item, &reason);
+    if (cache == nullptr) {
+      if (reason.empty()) reason = "DuckDB output cache setup failed";
+      DuckdbSetOffloadFailReason(thd, reason.c_str());
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), reason.c_str());
+      return true;
+    }
+    cache->store(item);
+    caches.push_back(cache);
+    cache_items.push_back(cache);
+  }
+
+  try {
+    duckdb::DBConfig config(true);
+    duckdb::DuckDB db(path, &config);
+    duckdb::Connection conn(db);
+    auto result = conn.SendQuery(rewritten);
+    if (!result || result->HasError()) {
+      const std::string err = result ? result->GetError()
+                                     : "DuckDB query failed";
+      DuckdbSetOffloadFailReason(thd, err.c_str());
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), err.c_str());
+      return true;
+    }
+
+    join->send_records = 0;
+    while (true) {
+      auto chunk = result->Fetch();
+      if (!chunk || chunk->size() == 0) break;
+      if (chunk->ColumnCount() != caches.size()) {
+        reason = "DuckDB column count mismatch";
+        DuckdbSetOffloadFailReason(thd, reason.c_str());
+        my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), reason.c_str());
+        return true;
+      }
+      for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
+        for (duckdb::idx_t col = 0; col < chunk->ColumnCount(); ++col) {
+          const duckdb::Value value = chunk->GetValue(col, row);
+          if (store_duckdb_result_value(thd, visible[col], caches[col], value,
+                                        &reason)) {
+            if (reason.empty()) reason = "DuckDB value conversion failed";
+            DuckdbSetOffloadFailReason(thd, reason.c_str());
+            my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), reason.c_str());
+            return true;
+          }
+        }
+        if (query_result->send_data(thd, cache_items)) return true;
+        join->send_records++;
+      }
+    }
+  } catch (const std::exception &ex) {
+    DuckdbSetOffloadFailReason(thd, ex.what());
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), ex.what());
+    return true;
+  }
+
+  return false;
+}
+
 static bool OptimizeSecondaryEngine(THD *thd, LEX *lex) {
   auto *ctx = down_cast<Duckdb_execution_context *>(
       lex->secondary_engine_execution_context());
@@ -988,6 +1103,60 @@ static bool OptimizeSecondaryEngine(THD *thd, LEX *lex) {
     thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
     return true;
   }
+
+  std::string reason;
+  Table_ref *base_table = nullptr;
+  std::string schema;
+  std::string path;
+  if (!is_simple_select(lex, &base_table, &reason, &schema, &path)) {
+    DuckdbSetOffloadFailReason(thd, reason.c_str());
+    if (thd->variables.use_secondary_engine == SECONDARY_ENGINE_FORCED) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), reason.c_str());
+      return true;
+    }
+    thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
+    return true;
+  }
+
+  const std::string missing = build_missing_loaded_tables_reason(thd);
+  if (!missing.empty()) {
+    DuckdbSetOffloadFailReason(thd, missing.c_str());
+    if (thd->variables.use_secondary_engine == SECONDARY_ENGINE_FORCED) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), missing.c_str());
+      return true;
+    }
+    thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
+    return true;
+  }
+
+  Query_block *select = lex->unit != nullptr ? lex->unit->first_query_block()
+                                             : nullptr;
+  if (select == nullptr || select->join == nullptr) {
+    reason = "DuckDB query block unavailable";
+    DuckdbSetOffloadFailReason(thd, reason.c_str());
+    if (thd->variables.use_secondary_engine == SECONDARY_ENGINE_FORCED) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), reason.c_str());
+      return true;
+    }
+    thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
+    return true;
+  }
+
+  if (!uses_supported_select_items(*select->join->fields, &reason)) {
+    DuckdbSetOffloadFailReason(thd, reason.c_str());
+    if (thd->variables.use_secondary_engine == SECONDARY_ENGINE_FORCED) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), reason.c_str());
+      return true;
+    }
+    thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
+    return true;
+  }
+
+  ctx->eligible = true;
+  ctx->fail_reason.clear();
+  ctx->db_path = path;
+
+  select->join->override_executor_func = DuckdbExecuteQuery;
   return false;
 }
 
@@ -2124,11 +2293,12 @@ static int duckdb_init_func(void *p) {
       DuckdbGetOffloadFailReason;
   duckdb_hton->set_secondary_engine_offload_fail_reason =
       DuckdbSetOffloadFailReason;
-  // Don't use USE_EXTERNAL_EXECUTOR - it causes TLS crashes.
-  // Instead, let MySQL use the normal iterator path which calls
-  // ha_duckdb::rnd_init/rnd_next. Those methods use connections created
-  // in ha_duckdb::open() which work without TLS issues.
-  duckdb_hton->secondary_engine_flags = MakeSecondaryEngineFlags();
+  // Use the external executor path so join queries can run inside DuckDB.
+  duckdb_hton->secondary_engine_flags = MakeSecondaryEngineFlags(
+      SecondaryEngineFlag::SUPPORTS_HASH_JOIN,
+      SecondaryEngineFlag::SUPPORTS_NESTED_LOOP_JOIN,
+      SecondaryEngineFlag::AGGREGATION_IS_UNORDERED,
+      SecondaryEngineFlag::USE_EXTERNAL_EXECUTOR);
   return 0;
 }
 
