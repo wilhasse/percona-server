@@ -24,10 +24,12 @@
 #include "storage/duckdb/ha_duckdb.h"
 
 #include <cctype>
+#include <cfloat>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <iomanip>
 #include <map>
 #include <mutex>
 #include <sstream>
@@ -49,6 +51,7 @@
 #include "mysql/plugin.h"
 #include "sql/my_decimal.h"
 #include "sql/mysqld.h"
+#include "sql/psi_memory_key.h"
 #include "sql/query_result.h"
 #include "sql/sql_class.h"
 #include "sql/sql_lex.h"
@@ -1614,6 +1617,105 @@ static void duckdb_binlog_apply_stop_at_gtid_update(
   duckdb_se::SetBinlogApplyStopAtGtid(value ? value : "");
 }
 
+static const char *duckdb_offload_mode_names[] = {"OFF", "ON", "FORCED",
+                                                  NullS};
+static TYPELIB duckdb_offload_mode_typelib = {
+    array_elements(duckdb_offload_mode_names) - 1,
+    "duckdb_offload_mode_typelib", duckdb_offload_mode_names, nullptr};
+
+static ulong duckdb_offload_default_mode = 0;
+static double duckdb_offload_cost_threshold = 0.0;
+
+static constexpr const char kDuckdbInitConnectStart[] =
+    "/*duckdb_offload_default_begin*/";
+static constexpr const char kDuckdbInitConnectEnd[] =
+    "/*duckdb_offload_default_end*/";
+
+static const char *DuckdbOffloadModeToString(ulong mode) {
+  switch (mode) {
+    case 1:
+      return "ON";
+    case 2:
+      return "FORCED";
+    default:
+      return "OFF";
+  }
+}
+
+static std::string DuckdbBuildInitConnectSnippet() {
+  if (duckdb_offload_default_mode == 0) return "";
+  std::ostringstream oss;
+  oss << kDuckdbInitConnectStart << " SET SESSION use_secondary_engine="
+      << DuckdbOffloadModeToString(duckdb_offload_default_mode)
+      << "; SET SESSION secondary_engine_cost_threshold="
+      << std::setprecision(6) << std::fixed << duckdb_offload_cost_threshold
+      << "; " << kDuckdbInitConnectEnd;
+  return oss.str();
+}
+
+static std::string DuckdbStripInitConnectSnippet(const std::string &input) {
+  const std::string start{kDuckdbInitConnectStart};
+  const std::string end{kDuckdbInitConnectEnd};
+  const auto start_pos = input.find(start);
+  if (start_pos == std::string::npos) return input;
+  auto end_pos = input.find(end, start_pos);
+  if (end_pos == std::string::npos) return input;
+  end_pos += end.size();
+  std::string result = input;
+  result.erase(start_pos, end_pos - start_pos);
+  return result;
+}
+
+static void DuckdbUpdateInitConnect() {
+  mysql_rwlock_wrlock(&LOCK_sys_init_connect);
+  std::string current;
+  if (opt_init_connect.str && opt_init_connect.length > 0) {
+    current.assign(opt_init_connect.str, opt_init_connect.length);
+  }
+
+  std::string stripped = DuckdbStripInitConnectSnippet(current);
+  std::string snippet = DuckdbBuildInitConnectSnippet();
+  std::string updated = stripped;
+  if (!snippet.empty()) {
+    if (!updated.empty() && updated.back() != ';') {
+      updated.append("; ");
+    } else if (!updated.empty()) {
+      updated.push_back(' ');
+    }
+    updated.append(snippet);
+  }
+
+  if (updated != current) {
+    char *new_value = static_cast<char *>(
+        my_memdup(key_memory_Sys_var_charptr_value, updated.c_str(),
+                  updated.size() + 1, MYF(MY_WME)));
+    if (new_value != nullptr) {
+      new_value[updated.size()] = 0;
+      if (opt_init_connect.str != nullptr) {
+        my_free(opt_init_connect.str);
+      }
+      opt_init_connect.str = new_value;
+      opt_init_connect.length = updated.size();
+    }
+  }
+
+  mysql_rwlock_unlock(&LOCK_sys_init_connect);
+}
+
+static void duckdb_offload_default_mode_update(
+    MYSQL_THD, SYS_VAR *, void *var_ptr, const void *save) {
+  auto value = *static_cast<const ulong *>(save);
+  *static_cast<ulong *>(var_ptr) = value;
+  DuckdbUpdateInitConnect();
+}
+
+static void duckdb_offload_cost_threshold_update(
+    MYSQL_THD, SYS_VAR *, void *var_ptr, const void *save) {
+  auto value = *static_cast<const double *>(save);
+  *static_cast<double *>(var_ptr) = value;
+  DuckdbUpdateInitConnect();
+}
+
 static MYSQL_SYSVAR_BOOL(
     binlog_apply_enabled, duckdb_binlog_apply_enabled, PLUGIN_VAR_RQCMDARG,
     "Enable DuckDB binlog applier thread.",
@@ -1710,8 +1812,22 @@ static MYSQL_SYSVAR_STR(
     "Pause apply after committing this GTID (empty disables).",
     nullptr, duckdb_binlog_apply_stop_at_gtid_update, "");
 
+static MYSQL_SYSVAR_ENUM(
+    offload_default_mode, duckdb_offload_default_mode, PLUGIN_VAR_RQCMDARG,
+    "Default offload mode for new sessions. Updates init_connect to set "
+    "use_secondary_engine (OFF/ON/FORCED).",
+    nullptr, duckdb_offload_default_mode_update, 0,
+    &duckdb_offload_mode_typelib);
+
+static MYSQL_SYSVAR_DOUBLE(
+    offload_cost_threshold, duckdb_offload_cost_threshold, PLUGIN_VAR_RQCMDARG,
+    "Secondary engine cost threshold to apply via init_connect (0 for tests).",
+    nullptr, duckdb_offload_cost_threshold_update, 0.0, 0.0, DBL_MAX, 0);
+
 static SYS_VAR *duckdb_system_variables[] = {
     MYSQL_SYSVAR(db_dir),
+    MYSQL_SYSVAR(offload_default_mode),
+    MYSQL_SYSVAR(offload_cost_threshold),
     MYSQL_SYSVAR(binlog_apply_enabled),
     MYSQL_SYSVAR(binlog_apply_host),
     MYSQL_SYSVAR(binlog_apply_user),
@@ -1932,6 +2048,7 @@ static int duckdb_init_func(void *p) {
       duckdb_binlog_apply_lag_alert_ms);
   duckdb_se::SetBinlogApplyStopAtGtid(
       duckdb_binlog_apply_stop_at_gtid ? duckdb_binlog_apply_stop_at_gtid : "");
+  DuckdbUpdateInitConnect();
   (void)duckdb_validate_read_only_settings();
   duckdb_se::StartBinlogApplyThread(duckdb_make_binlog_apply_options());
 
