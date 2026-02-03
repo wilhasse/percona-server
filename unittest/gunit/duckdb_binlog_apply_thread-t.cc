@@ -30,6 +30,23 @@
 #include "storage/duckdb/duckdb_binlog_apply_thread_test.h"
 #include "storage/duckdb/duckdb_binlog_applier.h"
 
+// Stub for MySQL memory instrumentation symbol used by binlogevents
+#include "mysql/psi/psi_memory.h"
+PSI_memory_key key_memory_log_event = 0;
+
+int log_message(int, ...) { return 0; }
+
+char mysql_real_data_home[1] = "";
+
+namespace duckdb_se {
+
+void RegisterLoadedTable(const std::string &, const std::string &,
+                         const std::string &) {}
+
+void UnregisterLoadedTable(const std::string &, const std::string &) {}
+
+}  // namespace duckdb_se
+
 namespace {
 
 using duckdb_se::ApplyDdlEventForTest;

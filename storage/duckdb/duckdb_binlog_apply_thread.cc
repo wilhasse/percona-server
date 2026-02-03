@@ -1371,6 +1371,7 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
   return Status::Ok();
 }
 
+#ifndef DUCKDB_APPLY_THREAD_TEST
 void ApplyThreadMain(BinlogApplyThreadOptions options) {
   auto &state = GetThreadState();
   uint64_t backoff_ms = 1000;
@@ -1405,6 +1406,7 @@ void ApplyThreadMain(BinlogApplyThreadOptions options) {
   sql_print_information("DuckDB binlog applier thread stopped");
   state.running.store(false);
 }
+#endif  // !DUCKDB_APPLY_THREAD_TEST
 
 }  // namespace
 
@@ -1426,6 +1428,7 @@ Status ApplyDdlEventForTest(
 }
 #endif
 
+#ifndef DUCKDB_APPLY_THREAD_TEST
 bool StartBinlogApplyThread(const BinlogApplyThreadOptions &options) {
   if (!options.enabled) return false;
   auto &state = GetThreadState();
@@ -1451,5 +1454,6 @@ void StopBinlogApplyThread() {
 bool BinlogApplyThreadRunning() {
   return GetThreadState().running.load();
 }
+#endif  // !DUCKDB_APPLY_THREAD_TEST
 
 }  // namespace duckdb_se

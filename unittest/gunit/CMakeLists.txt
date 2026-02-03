@@ -491,8 +491,6 @@ IF(TARGET duckdb_static)
     ../../storage/duckdb/duckdb_adapter.cc
     ../../storage/duckdb/duckdb_binlog_applier.cc
     ../../storage/duckdb/duckdb_binlog_apply_thread.cc
-    ../../storage/duckdb/duckdb_binlog_streamer.cc
-    ../../storage/duckdb/duckdb_row_decoder.cc
     ENABLE_EXPORTS
     ADD_TEST duckdb_binlog_apply_thread
     LINK_LIBRARIES gunit_small duckdb_static dummy_static_extension_loader
