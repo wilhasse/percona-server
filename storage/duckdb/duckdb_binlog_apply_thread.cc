@@ -32,11 +32,16 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <thread>
 #include <unordered_set>
 #include <vector>
 
 #include "mysql.h"
+#include "mysql/components/services/mysql_admin_session.h"
+#include "mysql/service_command.h"
+#include "mysql/service_plugin_registry.h"
+#include "mysql/service_srv_session.h"
 #include "my_sys.h"
 #include "sql/log.h"
 #include "sql/mysqld.h"
@@ -44,6 +49,7 @@
 #include "storage/duckdb/duckdb_binlog_applier.h"
 #include "storage/duckdb/duckdb_binlog_ddl.h"
 #include "storage/duckdb/duckdb_binlog_streamer.h"
+#include "storage/duckdb/duckdb_engine_utils.h"
 #include "storage/duckdb/duckdb_gtid_utils.h"
 #include "storage/duckdb/duckdb_repl_state.h"
 #include "storage/duckdb/duckdb_row_decoder.h"
@@ -71,6 +77,300 @@ struct ApplyThreadState {
 ApplyThreadState &GetThreadState() {
   static ApplyThreadState state;
   return state;
+}
+
+std::string DuckdbPathForSchema(const BinlogApplyThreadOptions &options,
+                                const std::string &schema);
+
+struct SqlExecContext {
+  uint sql_errno{0};
+  std::string err_msg;
+  uint server_status{0};
+  uint warn_count{0};
+  bool ok{false};
+};
+
+int SqlStartResultMetadata(void *, uint, uint, const CHARSET_INFO *) {
+  return 0;
+}
+
+int SqlFieldMetadata(void *, struct st_send_field *, const CHARSET_INFO *) {
+  return 0;
+}
+
+int SqlEndResultMetadata(void *, uint, uint) { return 0; }
+
+int SqlStartRow(void *) { return 0; }
+
+int SqlEndRow(void *) { return 0; }
+
+void SqlAbortRow(void *) {}
+
+ulong SqlGetClientCapabilities(void *) { return 0; }
+
+int SqlGetNull(void *) { return 0; }
+
+int SqlGetInteger(void *, longlong) { return 0; }
+
+int SqlGetLonglong(void *, longlong, uint) { return 0; }
+
+int SqlGetDecimal(void *, const decimal_t *) { return 0; }
+
+int SqlGetDouble(void *, double, uint32) { return 0; }
+
+int SqlGetDate(void *, const MYSQL_TIME *) { return 0; }
+
+int SqlGetTime(void *, const MYSQL_TIME *, uint) { return 0; }
+
+int SqlGetDatetime(void *, const MYSQL_TIME *, uint) { return 0; }
+
+int SqlGetString(void *, const char *, size_t, const CHARSET_INFO *) {
+  return 0;
+}
+
+void SqlHandleOk(void *ctx, uint server_status, uint warn_count,
+                 ulonglong, ulonglong, const char *) {
+  auto *exec_ctx = static_cast<SqlExecContext *>(ctx);
+  exec_ctx->server_status = server_status;
+  exec_ctx->warn_count = warn_count;
+  exec_ctx->ok = true;
+}
+
+void SqlHandleError(void *ctx, uint sql_errno, const char *err_msg,
+                    const char *) {
+  auto *exec_ctx = static_cast<SqlExecContext *>(ctx);
+  exec_ctx->sql_errno = sql_errno;
+  exec_ctx->err_msg = err_msg ? err_msg : "";
+}
+
+void SqlShutdown(void *, int) {}
+
+bool SqlConnectionAlive(void *) { return true; }
+
+const st_command_service_cbs kSqlCallbacks = {
+    &SqlStartResultMetadata,
+    &SqlFieldMetadata,
+    &SqlEndResultMetadata,
+    &SqlStartRow,
+    &SqlEndRow,
+    &SqlAbortRow,
+    &SqlGetClientCapabilities,
+    &SqlGetNull,
+    &SqlGetInteger,
+    &SqlGetLonglong,
+    &SqlGetDecimal,
+    &SqlGetDouble,
+    &SqlGetDate,
+    &SqlGetTime,
+    &SqlGetDatetime,
+    &SqlGetString,
+    &SqlHandleOk,
+    &SqlHandleError,
+    &SqlShutdown,
+    &SqlConnectionAlive,
+};
+
+SERVICE_TYPE_NO_CONST(mysql_admin_session) *GetAdminSessionFactory() {
+  static SERVICE_TYPE_NO_CONST(mysql_admin_session) *factory = nullptr;
+  static std::mutex mutex;
+  std::lock_guard<std::mutex> guard(mutex);
+  if (factory) return factory;
+  SERVICE_TYPE(registry) *registry = mysql_plugin_registry_acquire();
+  if (!registry) {
+    sql_print_warning("DuckDB: failed to acquire plugin registry");
+    return nullptr;
+  }
+  my_h_service hadmin = nullptr;
+  if (registry->acquire("mysql_admin_session", &hadmin)) {
+    mysql_plugin_registry_release(registry);
+    sql_print_warning("DuckDB: failed to acquire mysql_admin_session service");
+    return nullptr;
+  }
+  factory =
+      reinterpret_cast<SERVICE_TYPE_NO_CONST(mysql_admin_session) *>(hadmin);
+  mysql_plugin_registry_release(registry);
+  return factory;
+}
+
+void AdminSessionErrorHandler(void *, unsigned int sql_errno,
+                              const char *err_msg) {
+  sql_print_warning("DuckDB: admin session error %u: %s", sql_errno,
+                    err_msg ? err_msg : "");
+}
+
+class MysqlAdminSession {
+ public:
+  Status Open() {
+    auto *factory = GetAdminSessionFactory();
+    if (!factory) {
+      return Status::Error(StatusCode::kInvalid,
+                           "mysql_admin_session service unavailable");
+    }
+    session_ = factory->open(AdminSessionErrorHandler, nullptr);
+    if (!session_) {
+      return Status::Error(StatusCode::kInvalid,
+                           "Failed to open mysql admin session");
+    }
+    return Status::Ok();
+  }
+
+  Status Execute(const std::string &sql) {
+    if (!session_) {
+      return Status::Error(StatusCode::kInvalid,
+                           "Admin session is not initialized");
+    }
+    COM_DATA cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.com_query.query = sql.c_str();
+    cmd.com_query.length = static_cast<unsigned int>(sql.size());
+    SqlExecContext ctx;
+    int rc = command_service_run_command(
+        session_, COM_QUERY, &cmd, system_charset_info, &kSqlCallbacks,
+        CS_TEXT_REPRESENTATION, &ctx);
+    if (rc != 0 || ctx.sql_errno != 0) {
+      std::string message = ctx.err_msg;
+      if (message.empty()) message = "command_service_run_command failed";
+      return Status::Error(StatusCode::kInvalid, message);
+    }
+    return Status::Ok();
+  }
+
+  void Close() {
+    if (session_) {
+      (void)srv_session_close(session_);
+      session_ = nullptr;
+    }
+  }
+
+  ~MysqlAdminSession() { Close(); }
+
+ private:
+  MYSQL_SESSION session_{nullptr};
+};
+
+std::string QuoteMySQLIdent(const std::string &name) {
+  std::string out;
+  out.reserve(name.size() + 2);
+  out.push_back('`');
+  for (char ch : name) {
+    if (ch == '`') out.push_back('`');
+    out.push_back(ch);
+  }
+  out.push_back('`');
+  return out;
+}
+
+std::string BuildMySQLCreateTable(const MySQLTableDef &def,
+                                  bool if_not_exists) {
+  std::ostringstream ddl;
+  ddl << "CREATE TABLE ";
+  if (if_not_exists) ddl << "IF NOT EXISTS ";
+  ddl << QuoteMySQLIdent(def.schema) << "." << QuoteMySQLIdent(def.name)
+      << " (";
+  for (size_t i = 0; i < def.columns.size(); ++i) {
+    const auto &col = def.columns[i];
+    ddl << QuoteMySQLIdent(col.name) << " " << col.type;
+    if (col.not_null) ddl << " NOT NULL";
+    if (i + 1 < def.columns.size()) ddl << ", ";
+  }
+  if (!def.primary_key.empty()) {
+    ddl << ", PRIMARY KEY (";
+    for (size_t i = 0; i < def.primary_key.size(); ++i) {
+      ddl << QuoteMySQLIdent(def.primary_key[i]);
+      if (i + 1 < def.primary_key.size()) ddl << ", ";
+    }
+    ddl << ")";
+  }
+  ddl << ") ENGINE=InnoDB SECONDARY_ENGINE='DUCKDB'";
+  return ddl.str();
+}
+
+Status EnsureMySQLTableInDD(const BinlogApplyThreadOptions &options,
+                            const MySQLTableDef &def, bool replace) {
+  if (def.schema.empty() || def.name.empty() || def.columns.empty()) {
+    return Status::Error(StatusCode::kInvalid,
+                         "Missing schema, table, or columns for DD sync");
+  }
+  MysqlAdminSession session;
+  Status st = session.Open();
+  if (!st.ok()) return st;
+  Status ignore = session.Execute("SET SESSION sql_log_bin=0");
+  if (!ignore.ok()) {
+    sql_print_warning("DuckDB binlog applier: failed to disable sql_log_bin: %s",
+                      ignore.message.c_str());
+  }
+  st = session.Execute("CREATE DATABASE IF NOT EXISTS " +
+                       QuoteMySQLIdent(def.schema));
+  if (!st.ok()) return st;
+  if (replace) {
+    st = session.Execute("DROP TABLE IF EXISTS " +
+                         QuoteMySQLIdent(def.schema) + "." +
+                         QuoteMySQLIdent(def.name));
+    if (!st.ok()) return st;
+  }
+  st = session.Execute(BuildMySQLCreateTable(def, true));
+  if (!st.ok()) return st;
+  RegisterLoadedTable(def.schema, def.name,
+                      DuckdbPathForSchema(options, def.schema));
+  return Status::Ok();
+}
+
+Status DropMySQLTableInDD(const std::string &schema,
+                          const std::string &table) {
+  if (schema.empty() || table.empty()) {
+    return Status::Error(StatusCode::kInvalid,
+                         "Missing schema or table for DD drop");
+  }
+  MysqlAdminSession session;
+  Status st = session.Open();
+  if (!st.ok()) return st;
+  (void)session.Execute("SET SESSION sql_log_bin=0");
+  st = session.Execute("DROP TABLE IF EXISTS " + QuoteMySQLIdent(schema) + "." +
+                       QuoteMySQLIdent(table));
+  if (!st.ok()) return st;
+  UnregisterLoadedTable(schema, table);
+  return Status::Ok();
+}
+
+Status RenameMySQLTableInDD(const BinlogApplyThreadOptions &options,
+                            const TableId &from, const TableId &to) {
+  if (from.schema.empty() || from.table.empty() || to.schema.empty() ||
+      to.table.empty()) {
+    return Status::Error(StatusCode::kInvalid,
+                         "Missing schema or table for DD rename");
+  }
+  MysqlAdminSession session;
+  Status st = session.Open();
+  if (!st.ok()) return st;
+  (void)session.Execute("SET SESSION sql_log_bin=0");
+  st = session.Execute("CREATE DATABASE IF NOT EXISTS " +
+                       QuoteMySQLIdent(to.schema));
+  if (!st.ok()) return st;
+  st = session.Execute("RENAME TABLE " + QuoteMySQLIdent(from.schema) + "." +
+                       QuoteMySQLIdent(from.table) + " TO " +
+                       QuoteMySQLIdent(to.schema) + "." +
+                       QuoteMySQLIdent(to.table));
+  if (!st.ok()) return st;
+  UnregisterLoadedTable(from.schema, from.table);
+  RegisterLoadedTable(to.schema, to.table,
+                      DuckdbPathForSchema(options, to.schema));
+  return Status::Ok();
+}
+
+Status TruncateMySQLTableInDD(const std::string &schema,
+                              const std::string &table) {
+  if (schema.empty() || table.empty()) {
+    return Status::Error(StatusCode::kInvalid,
+                         "Missing schema or table for DD truncate");
+  }
+  MysqlAdminSession session;
+  Status st = session.Open();
+  if (!st.ok()) return st;
+  (void)session.Execute("SET SESSION sql_log_bin=0");
+  st = session.Execute("TRUNCATE TABLE " + QuoteMySQLIdent(schema) + "." +
+                       QuoteMySQLIdent(table));
+  if (!st.ok()) return st;
+  return Status::Ok();
 }
 
 // Forward declaration for EnsureSchemaApplier used before definition
@@ -501,15 +801,14 @@ Status EnsureRowEventTable(const BinlogApplyThreadOptions &options,
   if (IsTableCached(state, map.table)) return Status::Ok();
 
   bool exists = DuckdbTableExists(*state.adapter, map.table);
+  MySQLTableDef def;
+  Status st = FetchTableDefFromSource(options, map.schema, map.table, &def);
+  if (!st.ok()) return st;
+  MySQLTableDef def_for_dd = def;
   if (!exists) {
     sql_print_warning(
         "DuckDB binlog applier: Table %s.%s missing, creating from source",
         map.schema.c_str(), map.table.c_str());
-    MySQLTableDef def;
-    Status st =
-        FetchTableDefFromSource(options, map.schema, map.table, &def);
-    if (!st.ok()) return st;
-
     DDLChange change;
     change.type = DDLChange::Type::kCreate;
     change.table = TableId{map.schema, map.table};
@@ -521,17 +820,17 @@ Status EnsureRowEventTable(const BinlogApplyThreadOptions &options,
           map.schema.c_str(), map.table.c_str(), st.message.c_str());
       return st;
     }
-
     state.schema_version = state.schema_version_loaded
                                ? state.schema_version + 1
                                : 1;
     state.schema_version_loaded = true;
-
     sql_print_information(
         "DuckDB binlog applier: Created missing table %s.%s from source "
         "definition",
         map.schema.c_str(), map.table.c_str());
   }
+  st = EnsureMySQLTableInDD(options, def_for_dd, false);
+  if (!st.ok()) return st;
 
   CacheTable(state, map.table);
   return Status::Ok();
@@ -578,6 +877,12 @@ Status ApplyDdlEvent(const BinlogEvent &event,
   if (change.type == DDLChange::Type::kCreate) {
     if (parsed.if_not_exists &&
         DuckdbTableExists(*state->adapter, change.table.table)) {
+      MySQLTableDef def;
+      st = FetchTableDefFromSource(options, parsed.schema, change.table.table,
+                                   &def);
+      if (!st.ok()) return st;
+      st = EnsureMySQLTableInDD(options, def, false);
+      if (!st.ok()) return st;
       CacheTable(*state, change.table.table);
       return Status::Ok();
     }
@@ -585,8 +890,11 @@ Status ApplyDdlEvent(const BinlogEvent &event,
     st = FetchTableDefFromSource(options, parsed.schema, change.table.table,
                                  &def);
     if (!st.ok()) return st;
+    MySQLTableDef def_for_dd = def;
     change.new_def = std::move(def);
     st = state->applier->ApplyDDL(std::move(change));
+    if (!st.ok()) return st;
+    st = EnsureMySQLTableInDD(options, def_for_dd, false);
     if (!st.ok()) return st;
     state->schema_version = state->schema_version_loaded
                                 ? state->schema_version + 1
@@ -597,6 +905,7 @@ Status ApplyDdlEvent(const BinlogEvent &event,
   }
 
   if (change.type == DDLChange::Type::kAlter) {
+    MySQLTableDef def_for_dd;
     std::string reason;
     if (ShouldCopyAlter(change.sql, &reason)) {
       if (!reason.empty()) {
@@ -608,10 +917,17 @@ Status ApplyDdlEvent(const BinlogEvent &event,
       st = FetchTableDefFromSource(options, parsed.schema, change.table.table,
                                    &def);
       if (!st.ok()) return st;
+      def_for_dd = def;
       change.new_def = std::move(def);
       change.copy_ddl = true;
+    } else {
+      st = FetchTableDefFromSource(options, parsed.schema, change.table.table,
+                                   &def_for_dd);
+      if (!st.ok()) return st;
     }
     st = state->applier->ApplyDDL(std::move(change));
+    if (!st.ok()) return st;
+    st = EnsureMySQLTableInDD(options, def_for_dd, true);
     if (!st.ok()) return st;
     state->schema_version = state->schema_version_loaded
                                 ? state->schema_version + 1
@@ -623,6 +939,16 @@ Status ApplyDdlEvent(const BinlogEvent &event,
 
   st = state->applier->ApplyDDL(std::move(change));
   if (!st.ok()) return st;
+  if (change.type == DDLChange::Type::kDrop) {
+    st = DropMySQLTableInDD(change.table.schema, change.table.table);
+    if (!st.ok()) return st;
+  } else if (change.type == DDLChange::Type::kRename) {
+    st = RenameMySQLTableInDD(options, change.table, change.new_table);
+    if (!st.ok()) return st;
+  } else if (change.type == DDLChange::Type::kTruncate) {
+    st = TruncateMySQLTableInDD(change.table.schema, change.table.table);
+    if (!st.ok()) return st;
+  }
   state->schema_version =
       state->schema_version_loaded ? state->schema_version + 1 : 1;
   state->schema_version_loaded = true;
@@ -963,8 +1289,15 @@ void ApplyThreadMain(BinlogApplyThreadOptions options) {
   auto &state = GetThreadState();
   uint64_t backoff_ms = 1000;
   const uint64_t max_backoff_ms = 30000;
+  bool session_thread_inited = false;
 
   sql_print_information("DuckDB binlog applier thread started");
+  if (srv_session_init_thread(GetDuckdbPluginPtr()) == 0) {
+    session_thread_inited = true;
+  } else {
+    sql_print_warning(
+        "DuckDB binlog applier: srv_session_init_thread failed");
+  }
 
   while (!state.stop.load()) {
     Status st = RunApplyLoop(options, &state.stop);
@@ -980,6 +1313,9 @@ void ApplyThreadMain(BinlogApplyThreadOptions options) {
     backoff_ms = 1000;
   }
 
+  if (session_thread_inited) {
+    srv_session_deinit_thread();
+  }
   sql_print_information("DuckDB binlog applier thread stopped");
   state.running.store(false);
 }

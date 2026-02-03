@@ -62,6 +62,7 @@
 #include "storage/duckdb/duckdb_binlog_applier.h"
 #include "storage/duckdb/duckdb_binlog_apply_thread.h"
 #include "storage/duckdb/duckdb_compat.h"
+#include "storage/duckdb/duckdb_engine_utils.h"
 #include "storage/duckdb/duckdb_repl_state.h"
 #include "sql/field.h"
 #include "sql/table.h"
@@ -1163,6 +1164,21 @@ static void DuckdbSetOffloadFailReason(THD *thd, const char *reason) {
 
 namespace duckdb_se {
 
+void *duckdb_plugin_ptr = nullptr;
+
+void SetDuckdbPluginPtr(void *ptr) { duckdb_plugin_ptr = ptr; }
+
+void *GetDuckdbPluginPtr() { return duckdb_plugin_ptr; }
+
+void RegisterLoadedTable(const std::string &schema, const std::string &table,
+                         const std::string &path) {
+  if (loaded_tables) loaded_tables->add(schema, table, path);
+}
+
+void UnregisterLoadedTable(const std::string &schema, const std::string &table) {
+  if (loaded_tables) loaded_tables->erase(schema, table);
+}
+
 ha_duckdb::ha_duckdb(handlerton *hton, TABLE_SHARE *table_share_arg)
     : handler(hton, table_share_arg) {}
 
@@ -2090,6 +2106,7 @@ static int duckdb_init_func(void *p) {
   DBUG_TRACE;
 
   loaded_tables = new LoadedTables();
+  duckdb_se::SetDuckdbPluginPtr(p);
   duckdb_se::SetBinlogApplyPaused(duckdb_binlog_apply_paused);
   duckdb_se::SetBinlogApplyThrottleRowsPerSec(
       duckdb_binlog_apply_throttle_rows_per_sec);
@@ -2122,6 +2139,7 @@ static int duckdb_deinit_func(void *) {
   DBUG_TRACE;
 
   duckdb_se::StopBinlogApplyThread();
+  duckdb_se::SetDuckdbPluginPtr(nullptr);
   delete loaded_tables;
   loaded_tables = nullptr;
   return 0;
