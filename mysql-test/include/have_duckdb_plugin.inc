@@ -12,11 +12,4 @@ if (!$DUCKDB_PLUGIN) {
   --skip Could not find library for DuckDB plugin, see the file plugin.defs
 }
 
-#
-# Check if --plugin-dir was setup for DuckDB
-#
-if (`SELECT CONCAT('--plugin-dir=', REPLACE(@@plugin_dir, '\\', '/')) != '$DUCKDB_PLUGIN_OPT/'`) {
-  --skip DuckDB plugin requires that --plugin-dir is set to the plugin dir
-}
-
 enable_query_log;
