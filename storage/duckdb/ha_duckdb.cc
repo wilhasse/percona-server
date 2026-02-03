@@ -904,131 +904,15 @@ bool store_duckdb_result_value(THD *thd, Item *item, Item_cache *cache,
   return true;
 }
 
-static bool DuckdbExecuteQuery(JOIN *join, Query_result *query_result) {
-  if (join == nullptr || query_result == nullptr) return true;
-  THD *thd = join->thd;
-  if (thd == nullptr || thd->lex == nullptr) {
-    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-             "DuckDB thread context missing");
-    return true;
-  }
-  if (join->fields == nullptr) {
-    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-             "DuckDB select list not available");
-    return true;
-  }
-  auto *ctx = down_cast<Duckdb_execution_context *>(
-      thd->lex->secondary_engine_execution_context());
-  if (ctx == nullptr) {
-    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-             "DuckDB execution context missing");
-    return true;
-  }
-
-  try {
-    duckdb::DBConfig config(true);
-    duckdb::DuckDB db(ctx->db_path, &config);
-    duckdb::Connection conn(db);
-    auto result = conn.SendQuery(ctx->sql);
-    if (!result || result->HasError()) {
-      const std::string err =
-          result ? result->GetError() : "DuckDB query failed";
-      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), err.c_str());
-      return true;
-    }
-
-    size_t field_count = 0;
-
-    std::vector<Item *> out_items;
-    std::vector<Item_cache *> out_caches;
-    std::vector<std::unique_ptr<Item_cache>> cache_storage;
-    mem_root_deque<Item *> cache_items(thd->mem_root);
-
-    for (Item *item : *join->fields) {
-      if (item == nullptr) {
-        my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-                 "DuckDB select list contains null item");
-        return true;
-      }
-      if (item->hidden) continue;
-      std::string reason;
-      Item_cache *cache = create_duckdb_output_cache(item, &reason);
-      if (cache == nullptr) {
-        const std::string err = reason.empty()
-                                    ? "DuckDB output cache creation failed"
-                                    : reason;
-        my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), err.c_str());
-        return true;
-      }
-      if (cache->setup(item)) {
-        my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-                 "DuckDB output cache setup failed");
-        return true;
-      }
-      cache_storage.emplace_back(cache);
-      cache_items.push_back(cache);
-      out_items.push_back(item);
-      out_caches.push_back(cache);
-      ++field_count;
-    }
-
-    if (field_count == 0) {
-      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-               "DuckDB select list is empty");
-      return true;
-    }
-    if (out_items.size() != out_caches.size()) {
-      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-               "DuckDB output cache mismatch");
-      return true;
-    }
-    if (result->ColumnCount() != field_count) {
-      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-               "DuckDB result column count mismatch");
-      return true;
-    }
-
-    ha_rows sent = 0;
-    while (true) {
-      auto chunk = result->Fetch();
-      if (!chunk || chunk->size() == 0) break;
-      if (chunk->ColumnCount() != field_count) {
-        my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-                 "DuckDB chunk column count mismatch");
-        return true;
-      }
-
-      for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
-        for (duckdb::idx_t col = 0; col < chunk->ColumnCount(); ++col) {
-          const duckdb::Value value = chunk->GetValue(col, row);
-          std::string reason;
-          if (store_duckdb_result_value(thd, out_items[col], out_caches[col],
-                                        value, &reason)) {
-            const std::string err = reason.empty()
-                                        ? "DuckDB result conversion failed"
-                                        : reason;
-            my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), err.c_str());
-            return true;
-          }
-        }
-
-        if (query_result->send_data(thd, cache_items)) return true;
-        ++sent;
-      }
-    }
-    join->send_records = sent;
-  } catch (const std::exception &ex) {
-    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), ex.what());
-    return true;
-  }
-
-  return false;
-}
-
 static bool PrepareSecondaryEngine(THD *thd, LEX *lex) {
+  sql_print_warning("DuckDB PrepareSecondaryEngine: called");
   auto *ctx = new (thd->mem_root) Duckdb_execution_context;
-  if (ctx == nullptr) return true;
+  if (ctx == nullptr) {
+    sql_print_warning("DuckDB PrepareSecondaryEngine: ctx allocation failed");
+    return true;
+  }
   lex->set_secondary_engine_execution_context(ctx);
+  sql_print_warning("DuckDB PrepareSecondaryEngine: ctx set");
 
   Table_ref *base_table = nullptr;
   std::string query_schema;
@@ -1074,22 +958,33 @@ static bool PrepareSecondaryEngine(THD *thd, LEX *lex) {
 }
 
 static bool OptimizeSecondaryEngine(THD *thd, LEX *lex) {
+  sql_print_warning("DuckDB OptimizeSecondaryEngine: called");
   auto *ctx = down_cast<Duckdb_execution_context *>(
       lex->secondary_engine_execution_context());
-  if (ctx == nullptr) return false;
+  if (ctx == nullptr) {
+    // No execution context - must fall back to primary engine.
+    // Returning false here would cause a crash because USE_EXTERNAL_EXECUTOR
+    // prevents iterator creation, but override_executor_func wouldn't be set.
+    sql_print_warning("DuckDB OptimizeSecondaryEngine: ctx is null, returning true");
+    thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
+    return true;
+  }
 
   Query_block *qb = lex->unit->first_query_block();
   if (qb == nullptr || qb->join == nullptr || qb->join->fields == nullptr) {
+    sql_print_warning("DuckDB OptimizeSecondaryEngine: qb/join/fields null");
     ctx->fail_reason = "DuckDB offload requires a simple SELECT plan";
     thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
     return true;
   }
 
   if (!ctx->eligible) {
+    sql_print_warning("DuckDB OptimizeSecondaryEngine: ctx not eligible");
     thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
     return true;
   }
   if (ctx->base_table == nullptr) {
+    sql_print_warning("DuckDB OptimizeSecondaryEngine: base_table is null");
     ctx->fail_reason = "DuckDB offload base table missing";
     thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
     return true;
@@ -1113,35 +1008,13 @@ static bool OptimizeSecondaryEngine(THD *thd, LEX *lex) {
   const auto tables = collect_query_tables(lex);
   ctx->sql = duckdb_se::RewriteQualifiedTables(std::move(rewrite.sql), tables);
 
-  try {
-    duckdb::DBConfig config(true);
-    duckdb::DuckDB db(ctx->db_path, &config);
-    duckdb::Connection conn(db);
-    auto prepared = conn.Prepare(ctx->sql);
-    if (prepared->HasError()) {
-      ctx->fail_reason = prepared->GetError();
-      thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
-      return true;
-    }
-    const size_t field_count = CountVisibleFields(*qb->join->fields);
-    if (prepared->ColumnCount() != field_count) {
-      ctx->fail_reason = "DuckDB result column count mismatch";
-      thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
-      return true;
-    }
-  } catch (const std::exception &ex) {
-    ctx->fail_reason = ex.what();
-    thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
-    return true;
-  }
+  // Don't create connections here or set override_executor_func.
+  // Without USE_EXTERNAL_EXECUTOR, MySQL will use the normal iterator path
+  // which calls ha_duckdb::rnd_init/rnd_next. Those methods use the handler's
+  // m_conn which is created in ha_duckdb::open() and works without TLS issues.
+  sql_print_warning("DuckDB OptimizeSecondaryEngine: eligible for DuckDB, sql=%s", ctx->sql.c_str());
 
-  for (Query_block *block = lex->unit->first_query_block(); block != nullptr;
-       block = block->next_query_block()) {
-    if (block->join != nullptr) {
-      block->join->override_executor_func = DuckdbExecuteQuery;
-    }
-  }
-
+  sql_print_warning("DuckDB OptimizeSecondaryEngine: returning false (success)");
   return false;
 }
 
@@ -2136,8 +2009,11 @@ static int duckdb_init_func(void *p) {
       DuckdbGetOffloadFailReason;
   duckdb_hton->set_secondary_engine_offload_fail_reason =
       DuckdbSetOffloadFailReason;
-  duckdb_hton->secondary_engine_flags = MakeSecondaryEngineFlags(
-      SecondaryEngineFlag::USE_EXTERNAL_EXECUTOR);
+  // Don't use USE_EXTERNAL_EXECUTOR - it causes TLS crashes.
+  // Instead, let MySQL use the normal iterator path which calls
+  // ha_duckdb::rnd_init/rnd_next. Those methods use connections created
+  // in ha_duckdb::open() which work without TLS issues.
+  duckdb_hton->secondary_engine_flags = MakeSecondaryEngineFlags();
   return 0;
 }
 
