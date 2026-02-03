@@ -1308,7 +1308,15 @@ int ha_duckdb::open(const char *, int, unsigned int, const dd::Table *) {
   if (share == nullptr && table_share->is_secondary_engine()) {
     std::string reason = build_missing_loaded_tables_reason(current_thd);
     if (reason.empty()) {
-      reason = "Table has not been loaded";
+      // Include specific table name in error message
+      std::ostringstream oss;
+      oss << "DuckDB secondary table not loaded: ";
+      if (table_share->db.str != nullptr && table_share->db.length > 0) {
+        oss << table_share->db.str << ".";
+      }
+      oss << table_share->table_name.str;
+      oss << ". Run ALTER TABLE ... SECONDARY_LOAD";
+      reason = oss.str();
     }
     DuckdbSetOffloadFailReason(current_thd, reason.c_str());
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), reason.c_str());
