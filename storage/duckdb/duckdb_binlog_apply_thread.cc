@@ -947,6 +947,8 @@ Status ApplyDdlEvent(const BinlogEvent &event,
   }
 
   if (!state->txn_active) {
+    st = EnsureSchemaVersionFresh(state);
+    if (!st.ok()) return st;
     st = state->applier->BeginTransaction(Gtid{gtid});
     if (!st.ok()) return st;
     state->txn_active = true;
@@ -1105,9 +1107,7 @@ Status ApplyRowEvent(const BinlogEvent &event, const BinlogTableMap &map,
     return Status::Error(StatusCode::kInvalid, "Missing applier state");
   }
   if (!state.txn_active) {
-    Status st = EnsureSchemaVersionFresh(&state);
-    if (!st.ok()) return st;
-    st = state.applier->BeginTransaction(Gtid{gtid});
+    Status st = state.applier->BeginTransaction(Gtid{gtid});
     if (!st.ok()) return st;
     state.txn_active = true;
   }
