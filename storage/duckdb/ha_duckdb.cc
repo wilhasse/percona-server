@@ -950,10 +950,7 @@ static bool DuckdbExecuteQuery(JOIN *join, Query_result *query_result) {
                  "DuckDB select list contains null item");
         return true;
       }
-      if (item->hidden) {
-        cache_items.push_back(item);
-        continue;
-      }
+      if (item->hidden) continue;
       std::string reason;
       Item_cache *cache = create_duckdb_output_cache(item, &reason);
       if (cache == nullptr) {
@@ -980,6 +977,11 @@ static bool DuckdbExecuteQuery(JOIN *join, Query_result *query_result) {
                "DuckDB select list is empty");
       return true;
     }
+    if (out_items.size() != out_caches.size()) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               "DuckDB output cache mismatch");
+      return true;
+    }
     if (result->ColumnCount() != field_count) {
       my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
                "DuckDB result column count mismatch");
@@ -990,6 +992,11 @@ static bool DuckdbExecuteQuery(JOIN *join, Query_result *query_result) {
     while (true) {
       auto chunk = result->Fetch();
       if (!chunk || chunk->size() == 0) break;
+      if (chunk->ColumnCount() != field_count) {
+        my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+                 "DuckDB chunk column count mismatch");
+        return true;
+      }
 
       for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
         for (duckdb::idx_t col = 0; col < chunk->ColumnCount(); ++col) {
