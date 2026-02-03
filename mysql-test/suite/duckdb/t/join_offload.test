@@ -1,0 +1,69 @@
+--source include/have_duckdb_plugin.inc
+--source include/have_perfschema.inc
+
+--let $duckdb_installed=0
+--let $duckdb_plugin_present=`SELECT COUNT(*) FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_NAME='DUCKDB'`
+--if ($duckdb_plugin_present == 0) {
+  --eval INSTALL PLUGIN duckdb SONAME '$DUCKDB_PLUGIN';
+  --let $duckdb_installed=1
+}
+
+SET @save_use_secondary_engine = @@session.use_secondary_engine;
+SET @save_threshold = @@session.secondary_engine_cost_threshold;
+SET @@session.use_secondary_engine = ON;
+SET @@session.secondary_engine_cost_threshold = 0;
+
+CREATE DATABASE duckdb_join;
+USE duckdb_join;
+
+CREATE TABLE dim (
+  id INT PRIMARY KEY,
+  name VARCHAR(20)
+) ENGINE=InnoDB SECONDARY_ENGINE=DUCKDB;
+
+CREATE TABLE fact (
+  id INT PRIMARY KEY,
+  dim_id INT NOT NULL,
+  amount INT NOT NULL
+) ENGINE=InnoDB SECONDARY_ENGINE=DUCKDB;
+
+CREATE TABLE dim_unloaded (
+  id INT PRIMARY KEY,
+  label VARCHAR(20)
+) ENGINE=InnoDB SECONDARY_ENGINE=DUCKDB;
+
+INSERT INTO dim VALUES (1,'Alpha'),(2,'Beta'),(3,'Gamma');
+INSERT INTO dim_unloaded VALUES (1,'A'),(2,'B'),(3,'C');
+INSERT INTO fact VALUES (1,1,10),(2,1,20),(3,2,5),(4,3,7),(5,3,9);
+
+ALTER TABLE dim SECONDARY_LOAD;
+ALTER TABLE fact SECONDARY_LOAD;
+
+--let $se_before=`SELECT VARIABLE_VALUE FROM performance_schema.session_status WHERE VARIABLE_NAME='Secondary_engine_execution_count'`
+SELECT d.name, COUNT(*) AS c, SUM(f.amount) AS total
+  FROM fact f JOIN dim d ON f.dim_id = d.id
+  GROUP BY d.name
+  ORDER BY d.name;
+--let $se_after=`SELECT VARIABLE_VALUE FROM performance_schema.session_status WHERE VARIABLE_NAME='Secondary_engine_execution_count'`
+--let $se_delta= $se_after - $se_before
+--eval SELECT $se_delta AS se_delta;
+
+--let $se_before=`SELECT VARIABLE_VALUE FROM performance_schema.session_status WHERE VARIABLE_NAME='Secondary_engine_execution_count'`
+SELECT d.label, COUNT(*) AS c
+  FROM fact f JOIN dim_unloaded d ON f.dim_id = d.id
+  GROUP BY d.label
+  ORDER BY d.label;
+--let $se_after=`SELECT VARIABLE_VALUE FROM performance_schema.session_status WHERE VARIABLE_NAME='Secondary_engine_execution_count'`
+--let $se_delta= $se_after - $se_before
+--eval SELECT $se_delta AS se_delta;
+
+ALTER TABLE fact SECONDARY_UNLOAD;
+ALTER TABLE dim SECONDARY_UNLOAD;
+DROP DATABASE duckdb_join;
+
+SET @@session.use_secondary_engine = @save_use_secondary_engine;
+SET @@session.secondary_engine_cost_threshold = @save_threshold;
+
+--if ($duckdb_installed == 1) {
+  UNINSTALL PLUGIN duckdb;
+}
