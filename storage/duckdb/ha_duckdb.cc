@@ -734,20 +734,19 @@ std::vector<duckdb_se::QualifiedTableRef> collect_query_tables(LEX *lex) {
     if (tl->table == nullptr || tl->table->s == nullptr) continue;
 
     std::string schema;
-    if (tl->db != nullptr && tl->db_length > 0) {
-      schema.assign(tl->db, tl->db_length);
-    } else if (tl->table->s->db.str != nullptr &&
-               tl->table->s->db.length > 0) {
+    if (tl->table->s->db.str != nullptr && tl->table->s->db.length > 0) {
       schema.assign(tl->table->s->db.str, tl->table->s->db.length);
+    } else if (tl->db != nullptr && tl->db_length > 0) {
+      schema.assign(tl->db, tl->db_length);
     }
 
     std::string table_name;
-    if (tl->table_name != nullptr && tl->table_name_length > 0) {
-      table_name.assign(tl->table_name, tl->table_name_length);
-    } else if (tl->table->s->table_name.str != nullptr &&
-               tl->table->s->table_name.length > 0) {
+    if (tl->table->s->table_name.str != nullptr &&
+        tl->table->s->table_name.length > 0) {
       table_name.assign(tl->table->s->table_name.str,
                         tl->table->s->table_name.length);
+    } else if (tl->table_name != nullptr && tl->table_name_length > 0) {
+      table_name.assign(tl->table_name, tl->table_name_length);
     }
 
     if (!schema.empty() && !table_name.empty()) {

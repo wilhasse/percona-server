@@ -354,6 +354,7 @@ std::string RewriteQualifiedTables(
   struct Pattern {
     std::string db;
     std::string table;
+    std::string quoted_schema;
     std::string quoted_table;
     std::string quoted_pattern;
   };
@@ -365,9 +366,10 @@ std::string RewriteQualifiedTables(
     Pattern pattern;
     pattern.db = entry.schema;
     pattern.table = entry.table;
+    pattern.quoted_schema = QuoteIdent(entry.schema);
     pattern.quoted_table = QuoteIdent(entry.table);
     pattern.quoted_pattern =
-        QuoteIdent(entry.schema) + "." + pattern.quoted_table;
+        pattern.quoted_schema + "." + pattern.quoted_table;
     patterns.emplace_back(std::move(pattern));
   }
   if (patterns.empty()) return sql;
@@ -375,23 +377,26 @@ std::string RewriteQualifiedTables(
   std::string out;
   out.reserve(sql.size());
   const size_t len = sql.size();
+  enum class State { kNormal, kSingle, kDouble, kBacktick };
+  State state = State::kNormal;
   for (size_t i = 0; i < len;) {
     const char ch = sql[i];
-    if (ch == '\'') {
+    if (state != State::kNormal) {
       out.push_back(ch);
       ++i;
-      while (i < len) {
-        out.push_back(sql[i]);
-        if (sql[i] == '\'') {
-          ++i;
+      if (state == State::kSingle) {
+        if (ch == '\'') {
           if (i < len && sql[i] == '\'') {
             out.push_back(sql[i]);
             ++i;
-            continue;
+          } else {
+            state = State::kNormal;
           }
-          break;
         }
-        ++i;
+      } else if (state == State::kDouble) {
+        if (ch == '"') state = State::kNormal;
+      } else if (state == State::kBacktick) {
+        if (ch == '`') state = State::kNormal;
       }
       continue;
     }
@@ -404,24 +409,95 @@ std::string RewriteQualifiedTables(
         matched = true;
         break;
       }
-      if (MatchCI(sql, i, pattern.db)) {
-        const size_t db_end = i + pattern.db.size();
-        if (db_end < len && sql[db_end] == '.' &&
-            MatchCI(sql, db_end + 1, pattern.table)) {
-          const size_t table_end = db_end + 1 + pattern.table.size();
-          const bool left_ok = (i == 0) || !IsIdentChar(sql[i - 1]);
-          const bool right_ok =
-              (table_end >= len) || !IsIdentChar(sql[table_end]);
-          if (left_ok && right_ok) {
-            out.append(pattern.table);
+
+      if (MatchCI(sql, i, pattern.quoted_schema)) {
+        const size_t db_end = i + pattern.quoted_schema.size();
+        if (db_end < len && sql[db_end] == '.') {
+          const size_t table_start = db_end + 1;
+          if (MatchCI(sql, table_start, pattern.quoted_table)) {
+            const size_t table_end =
+                table_start + pattern.quoted_table.size();
+            out.append(pattern.quoted_table);
+            i = table_end;
+            matched = true;
+            break;
+          }
+          if (MatchCI(sql, table_start, pattern.table)) {
+            const size_t table_end = table_start + pattern.table.size();
+            out.append(pattern.quoted_table);
             i = table_end;
             matched = true;
             break;
           }
         }
       }
+
+      if (MatchCI(sql, i, pattern.db)) {
+        const size_t db_end = i + pattern.db.size();
+        if (db_end < len && sql[db_end] == '.') {
+          const size_t table_start = db_end + 1;
+          if (MatchCI(sql, table_start, pattern.quoted_table)) {
+            const size_t table_end =
+                table_start + pattern.quoted_table.size();
+            const bool left_ok = (i == 0) || !IsIdentChar(sql[i - 1]);
+            const bool right_ok =
+                (table_end >= len) || !IsIdentChar(sql[table_end]);
+            if (left_ok && right_ok) {
+              out.append(pattern.quoted_table);
+              i = table_end;
+              matched = true;
+              break;
+            }
+          }
+          if (MatchCI(sql, table_start, pattern.table)) {
+            const size_t table_end = table_start + pattern.table.size();
+            const bool left_ok = (i == 0) || !IsIdentChar(sql[i - 1]);
+            const bool right_ok =
+                (table_end >= len) || !IsIdentChar(sql[table_end]);
+            if (left_ok && right_ok) {
+              out.append(pattern.quoted_table);
+              i = table_end;
+              matched = true;
+              break;
+            }
+          }
+        }
+      }
+
+      if (MatchCI(sql, i, pattern.table)) {
+        const size_t table_end = i + pattern.table.size();
+        const bool left_ok = (i == 0) || !IsIdentChar(sql[i - 1]);
+        const bool right_ok =
+            (table_end >= len) || !IsIdentChar(sql[table_end]);
+        const bool not_qualified = (i == 0) || sql[i - 1] != '.';
+        if (left_ok && right_ok && not_qualified) {
+          out.append(pattern.quoted_table);
+          i = table_end;
+          matched = true;
+          break;
+        }
+      }
     }
     if (matched) continue;
+
+    if (ch == '\'') {
+      state = State::kSingle;
+      out.push_back(ch);
+      ++i;
+      continue;
+    }
+    if (ch == '"') {
+      state = State::kDouble;
+      out.push_back(ch);
+      ++i;
+      continue;
+    }
+    if (ch == '`') {
+      state = State::kBacktick;
+      out.push_back(ch);
+      ++i;
+      continue;
+    }
 
     out.push_back(ch);
     ++i;
