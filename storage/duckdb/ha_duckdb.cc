@@ -23,6 +23,7 @@
 
 #include "storage/duckdb/ha_duckdb.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cfloat>
 #include <chrono>
@@ -775,6 +776,9 @@ std::string build_missing_loaded_tables_reason(THD *thd) {
     }
   }
   if (missing.empty()) return "";
+
+  std::sort(missing.begin(), missing.end());
+  missing.erase(std::unique(missing.begin(), missing.end()), missing.end());
 
   std::ostringstream oss;
   oss << "DuckDB secondary tables not loaded: ";
