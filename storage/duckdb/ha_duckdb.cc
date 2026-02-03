@@ -905,52 +905,40 @@ bool store_duckdb_result_value(THD *thd, Item *item, Item_cache *cache,
 }
 
 static bool PrepareSecondaryEngine(THD *thd, LEX *lex) {
-  sql_print_warning("DuckDB PrepareSecondaryEngine: called");
   auto *ctx = new (thd->mem_root) Duckdb_execution_context;
-  if (ctx == nullptr) {
-    sql_print_warning("DuckDB PrepareSecondaryEngine: ctx allocation failed");
-    return true;
-  }
+  if (ctx == nullptr) return true;
   lex->set_secondary_engine_execution_context(ctx);
-  sql_print_warning("DuckDB PrepareSecondaryEngine: ctx set");
 
-  Table_ref *base_table = nullptr;
-  std::string query_schema;
-  std::string duckdb_path;
-  std::string reason;
-  if (!is_simple_select(lex, &base_table, &reason, &query_schema,
-                        &duckdb_path)) {
-    ctx->eligible = false;
-    ctx->fail_reason = reason.empty() ? "Query not eligible for DuckDB" : reason;
-    return false;
-  }
-
-  if (base_table == nullptr || base_table->table == nullptr ||
-      base_table->table->s == nullptr) {
-    ctx->eligible = false;
-    ctx->fail_reason = "Base table not available for DuckDB offload";
-    return false;
-  }
-
-  if (!query_schema.empty()) {
-    ctx->db = query_schema;
-  } else if (base_table->db != nullptr && base_table->db_length > 0) {
-    ctx->db.assign(base_table->db, base_table->db_length);
-  } else if (base_table->table->s->db.str != nullptr &&
-             base_table->table->s->db.length > 0) {
-    ctx->db.assign(base_table->table->s->db.str, base_table->table->s->db.length);
-  } else {
-    ctx->db.clear();
-  }
-  if (base_table->table_name != nullptr && base_table->table_name_length > 0) {
-    ctx->table.assign(base_table->table_name, base_table->table_name_length);
-  } else {
-    ctx->table.clear();
-  }
-  ctx->db_path =
-      !duckdb_path.empty() ? duckdb_path : resolve_duckdb_path(base_table->table->s);
-  ctx->base_table = base_table->table;
   ctx->eligible = true;
+  Table_ref *base_table = nullptr;
+  for (Table_ref *tl = lex->query_tables; tl != nullptr; tl = tl->next_global) {
+    if (tl->is_placeholder()) continue;
+    if (tl->is_view_or_derived()) continue;
+    if (tl->schema_table != nullptr) continue;
+    base_table = tl;
+    break;
+  }
+  if (base_table != nullptr && base_table->table != nullptr &&
+      base_table->table->s != nullptr) {
+    ctx->base_table = base_table->table;
+    if (base_table->table->s->db.str != nullptr &&
+        base_table->table->s->db.length > 0) {
+      ctx->db.assign(base_table->table->s->db.str,
+                     base_table->table->s->db.length);
+    } else if (base_table->db != nullptr && base_table->db_length > 0) {
+      ctx->db.assign(base_table->db, base_table->db_length);
+    }
+    if (base_table->table->s->table_name.str != nullptr &&
+        base_table->table->s->table_name.length > 0) {
+      ctx->table.assign(base_table->table->s->table_name.str,
+                        base_table->table->s->table_name.length);
+    } else if (base_table->table_name != nullptr &&
+               base_table->table_name_length > 0) {
+      ctx->table.assign(base_table->table_name,
+                        base_table->table_name_length);
+    }
+    ctx->db_path = resolve_duckdb_path(base_table->table->s);
+  }
 
   lex->add_statement_options(OPTION_NO_CONST_TABLES |
                              OPTION_NO_SUBQUERY_DURING_OPTIMIZATION);
@@ -958,63 +946,12 @@ static bool PrepareSecondaryEngine(THD *thd, LEX *lex) {
 }
 
 static bool OptimizeSecondaryEngine(THD *thd, LEX *lex) {
-  sql_print_warning("DuckDB OptimizeSecondaryEngine: called");
   auto *ctx = down_cast<Duckdb_execution_context *>(
       lex->secondary_engine_execution_context());
   if (ctx == nullptr) {
-    // No execution context - must fall back to primary engine.
-    // Returning false here would cause a crash because USE_EXTERNAL_EXECUTOR
-    // prevents iterator creation, but override_executor_func wouldn't be set.
-    sql_print_warning("DuckDB OptimizeSecondaryEngine: ctx is null, returning true");
     thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
     return true;
   }
-
-  Query_block *qb = lex->unit->first_query_block();
-  if (qb == nullptr || qb->join == nullptr || qb->join->fields == nullptr) {
-    sql_print_warning("DuckDB OptimizeSecondaryEngine: qb/join/fields null");
-    ctx->fail_reason = "DuckDB offload requires a simple SELECT plan";
-    thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
-    return true;
-  }
-
-  if (!ctx->eligible) {
-    sql_print_warning("DuckDB OptimizeSecondaryEngine: ctx not eligible");
-    thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
-    return true;
-  }
-  if (ctx->base_table == nullptr) {
-    sql_print_warning("DuckDB OptimizeSecondaryEngine: base_table is null");
-    ctx->fail_reason = "DuckDB offload base table missing";
-    thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
-    return true;
-  }
-
-  if (!uses_supported_select_items(*qb->join->fields, &ctx->fail_reason)) {
-    thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
-    return true;
-  }
-
-  const LEX_CSTRING &query = thd->query();
-  duckdb_se::DuckdbRewriteResult rewrite =
-      duckdb_se::RewriteForDuckdb(std::string(query.str, query.length));
-  if (!rewrite.ok) {
-    ctx->fail_reason = rewrite.reason.empty()
-                           ? "DuckDB compatibility rewrite failed"
-                           : rewrite.reason;
-    thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
-    return true;
-  }
-  const auto tables = collect_query_tables(lex);
-  ctx->sql = duckdb_se::RewriteQualifiedTables(std::move(rewrite.sql), tables);
-
-  // Don't create connections here or set override_executor_func.
-  // Without USE_EXTERNAL_EXECUTOR, MySQL will use the normal iterator path
-  // which calls ha_duckdb::rnd_init/rnd_next. Those methods use the handler's
-  // m_conn which is created in ha_duckdb::open() and works without TLS issues.
-  sql_print_warning("DuckDB OptimizeSecondaryEngine: eligible for DuckDB, sql=%s", ctx->sql.c_str());
-
-  sql_print_warning("DuckDB OptimizeSecondaryEngine: returning false (success)");
   return false;
 }
 
