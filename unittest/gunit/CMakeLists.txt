@@ -486,6 +486,25 @@ IF(TARGET duckdb_static)
     ${CMAKE_SOURCE_DIR}/extra/duckdb/src/include
   )
 
+  MYSQL_ADD_EXECUTABLE(duckdb_binlog_apply_thread-t
+    duckdb_binlog_apply_thread-t.cc
+    ../../storage/duckdb/duckdb_adapter.cc
+    ../../storage/duckdb/duckdb_binlog_applier.cc
+    ../../storage/duckdb/duckdb_binlog_apply_thread.cc
+    ../../storage/duckdb/duckdb_binlog_streamer.cc
+    ../../storage/duckdb/duckdb_row_decoder.cc
+    ENABLE_EXPORTS
+    ADD_TEST duckdb_binlog_apply_thread
+    LINK_LIBRARIES gunit_small duckdb_static dummy_static_extension_loader
+                  binlogevents_static mysys extra::rapidjson
+  )
+  TARGET_COMPILE_DEFINITIONS(duckdb_binlog_apply_thread-t PRIVATE
+    DUCKDB_APPLY_THREAD_TEST
+  )
+  TARGET_INCLUDE_DIRECTORIES(duckdb_binlog_apply_thread-t PRIVATE
+    ${CMAKE_SOURCE_DIR}/extra/duckdb/src/include
+  )
+
   MYSQL_ADD_EXECUTABLE(duckdb_adapter_ddl-t
     duckdb_adapter_ddl-t.cc
     ../../storage/duckdb/duckdb_adapter.cc

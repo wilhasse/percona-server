@@ -38,12 +38,14 @@
 #include <vector>
 
 #include "mysql.h"
+#ifndef DUCKDB_APPLY_THREAD_TEST
 #include "mysql/components/services/mysql_admin_session.h"
 #include "mysql/service_command.h"
 #include "mysql/service_plugin_registry.h"
 #include "mysql/service_security_context.h"
 #include "mysql/service_srv_session.h"
 #include "mysql/service_srv_session_info.h"
+#endif
 #include "my_sys.h"
 #include "sql/log.h"
 #include "sql/mysqld.h"
@@ -51,6 +53,9 @@
 #include "storage/duckdb/duckdb_binlog_applier.h"
 #include "storage/duckdb/duckdb_binlog_ddl.h"
 #include "storage/duckdb/duckdb_binlog_streamer.h"
+#ifdef DUCKDB_APPLY_THREAD_TEST
+#include "storage/duckdb/duckdb_binlog_apply_thread_test.h"
+#endif
 #include "storage/duckdb/duckdb_engine_utils.h"
 #include "storage/duckdb/duckdb_gtid_utils.h"
 #include "storage/duckdb/duckdb_repl_state.h"
@@ -83,6 +88,10 @@ ApplyThreadState &GetThreadState() {
 
 std::string DuckdbPathForSchema(const BinlogApplyThreadOptions &options,
                                 const std::string &schema);
+
+#ifdef DUCKDB_APPLY_THREAD_TEST
+DuckdbApplyThreadTestHooks g_test_hooks;
+#endif
 
 struct SqlExecContext {
   uint sql_errno{0};
@@ -149,6 +158,7 @@ void SqlShutdown(void *, int) {}
 
 bool SqlConnectionAlive(void *) { return true; }
 
+#ifndef DUCKDB_APPLY_THREAD_TEST
 const st_command_service_cbs kSqlCallbacks = {
     &SqlStartResultMetadata,
     &SqlFieldMetadata,
@@ -268,6 +278,13 @@ class MysqlAdminSession {
 
   MYSQL_SESSION session_{nullptr};
 };
+#else
+class MysqlAdminSession {
+ public:
+  Status Open() { return Status::Ok(); }
+  Status Execute(const std::string &) { return Status::Ok(); }
+};
+#endif
 
 std::string QuoteMySQLIdent(const std::string &name) {
   std::string out;
@@ -308,6 +325,11 @@ std::string BuildMySQLCreateTable(const MySQLTableDef &def,
 
 Status EnsureMySQLTableInDD(const BinlogApplyThreadOptions &options,
                             const MySQLTableDef &def, bool replace) {
+#ifdef DUCKDB_APPLY_THREAD_TEST
+  if (g_test_hooks.ensure_mysql_table_in_dd) {
+    return g_test_hooks.ensure_mysql_table_in_dd(options, def, replace);
+  }
+#endif
   if (def.schema.empty() || def.name.empty() || def.columns.empty()) {
     return Status::Error(StatusCode::kInvalid,
                          "Missing schema, table, or columns for DD sync");
@@ -338,6 +360,11 @@ Status EnsureMySQLTableInDD(const BinlogApplyThreadOptions &options,
 
 Status DropMySQLTableInDD(const std::string &schema,
                           const std::string &table) {
+#ifdef DUCKDB_APPLY_THREAD_TEST
+  if (g_test_hooks.drop_mysql_table_in_dd) {
+    return g_test_hooks.drop_mysql_table_in_dd(schema, table);
+  }
+#endif
   if (schema.empty() || table.empty()) {
     return Status::Error(StatusCode::kInvalid,
                          "Missing schema or table for DD drop");
@@ -355,6 +382,11 @@ Status DropMySQLTableInDD(const std::string &schema,
 
 Status RenameMySQLTableInDD(const BinlogApplyThreadOptions &options,
                             const TableId &from, const TableId &to) {
+#ifdef DUCKDB_APPLY_THREAD_TEST
+  if (g_test_hooks.rename_mysql_table_in_dd) {
+    return g_test_hooks.rename_mysql_table_in_dd(options, from, to);
+  }
+#endif
   if (from.schema.empty() || from.table.empty() || to.schema.empty() ||
       to.table.empty()) {
     return Status::Error(StatusCode::kInvalid,
@@ -380,6 +412,11 @@ Status RenameMySQLTableInDD(const BinlogApplyThreadOptions &options,
 
 Status TruncateMySQLTableInDD(const std::string &schema,
                               const std::string &table) {
+#ifdef DUCKDB_APPLY_THREAD_TEST
+  if (g_test_hooks.truncate_mysql_table_in_dd) {
+    return g_test_hooks.truncate_mysql_table_in_dd(schema, table);
+  }
+#endif
   if (schema.empty() || table.empty()) {
     return Status::Error(StatusCode::kInvalid,
                          "Missing schema or table for DD truncate");
@@ -610,6 +647,7 @@ uint32_t ResolveServerId(uint32_t configured) {
   return 24844;
 }
 
+#ifndef DUCKDB_APPLY_THREAD_TEST
 bool FetchGtidExecuted(const BinlogApplyThreadOptions &options,
                        std::string *gtid_set) {
   if (!gtid_set) return false;
@@ -647,6 +685,13 @@ bool FetchGtidExecuted(const BinlogApplyThreadOptions &options,
   mysql_close(mysql);
   return !gtid_set->empty();
 }
+#else
+bool FetchGtidExecuted(const BinlogApplyThreadOptions &,
+                       std::string *gtid_set) {
+  if (gtid_set) gtid_set->clear();
+  return false;
+}
+#endif
 
 bool ShouldApplySchema(const std::string &schema,
                        const std::string &schema_filter) {
@@ -696,6 +741,7 @@ Status EnsureSchemaVersionFresh(SchemaApplierState *state) {
   return Status::Ok();
 }
 
+#ifndef DUCKDB_APPLY_THREAD_TEST
 std::string QuoteMySQLLiteral(MYSQL *mysql, const std::string &value) {
   std::string escaped;
   escaped.resize(value.size() * 2 + 1);
@@ -789,6 +835,18 @@ Status FetchTableDefFromSource(const BinlogApplyThreadOptions &options,
   }
   return Status::Ok();
 }
+#else
+Status FetchTableDefFromSource(const BinlogApplyThreadOptions &options,
+                               const std::string &schema,
+                               const std::string &table,
+                               MySQLTableDef *def) {
+  if (g_test_hooks.fetch_table_def_from_source) {
+    return g_test_hooks.fetch_table_def_from_source(options, schema, table, def);
+  }
+  return Status::Error(StatusCode::kInvalid,
+                       "FetchTableDefFromSource disabled in tests");
+}
+#endif
 
 bool DuckdbTableExists(DuckDBAdapter &adapter, const std::string &table) {
   const std::string sql =
@@ -1349,6 +1407,24 @@ void ApplyThreadMain(BinlogApplyThreadOptions options) {
 }
 
 }  // namespace
+
+#ifdef DUCKDB_APPLY_THREAD_TEST
+void SetDuckdbApplyThreadTestHooks(const DuckdbApplyThreadTestHooks &hooks) {
+  g_test_hooks = hooks;
+}
+
+void ResetDuckdbApplyThreadTestHooks() {
+  g_test_hooks = DuckdbApplyThreadTestHooks{};
+}
+
+Status ApplyDdlEventForTest(
+    const BinlogEvent &event, const BinlogApplyThreadOptions &options,
+    const DuckDBBinlogApplier::Options &applier_options,
+    const std::string &gtid) {
+  std::map<std::string, SchemaApplierState> schema_states;
+  return ApplyDdlEvent(event, options, applier_options, &schema_states, gtid);
+}
+#endif
 
 bool StartBinlogApplyThread(const BinlogApplyThreadOptions &options) {
   if (!options.enabled) return false;
