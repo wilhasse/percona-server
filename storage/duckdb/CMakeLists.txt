@@ -50,6 +50,13 @@ if(NOT WITHOUT_DUCKDB_SE_STORAGE_ENGINE)
     # Force C++17 to override DuckDB's default of C++11
     set(CMAKE_CXX_STANDARD 17 CACHE STRING "" FORCE)
     set(CMAKE_CXX_STANDARD_REQUIRED ON CACHE BOOL "" FORCE)
+    # Avoid static TLS allocation failures when the plugin is loaded via dlopen.
+    # Using global-dynamic TLS removes the need for LD_PRELOAD on glibc systems.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      set(DUCKDB_TLS_MODEL_FLAG "-ftls-model=global-dynamic")
+      set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${DUCKDB_TLS_MODEL_FLAG}")
+      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${DUCKDB_TLS_MODEL_FLAG}")
+    endif()
     add_subdirectory(${DUCKDB_SOURCE_DIR} ${CMAKE_BINARY_DIR}/duckdb EXCLUDE_FROM_ALL)
   else()
     message(FATAL_ERROR "DuckDB submodule not found at ${DUCKDB_SOURCE_DIR}")
