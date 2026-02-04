@@ -1370,6 +1370,11 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
 
   DuckDBBinlogApplier::Options applier_options;
   applier_options.use_gtid = use_gtid;
+  applier_options.batch_max_gtids = options.batch_max_gtids;
+  applier_options.batch_max_rows = options.batch_max_rows;
+  applier_options.batch_max_bytes = options.batch_max_bytes;
+  applier_options.batch_max_delay =
+      std::chrono::milliseconds(options.batch_max_delay_ms);
 
   std::map<std::string, SchemaApplierState> schema_states;
   std::string current_gtid;

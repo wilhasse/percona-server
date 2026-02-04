@@ -42,6 +42,10 @@ struct BinlogApplyThreadOptions {
   uint64_t start_position{0};
   std::string schema_filter;
   std::string duckdb_dir;
+  size_t batch_max_gtids{1};
+  size_t batch_max_rows{0};
+  size_t batch_max_bytes{0};
+  uint64_t batch_max_delay_ms{0};
 };
 
 bool StartBinlogApplyThread(const BinlogApplyThreadOptions &options);

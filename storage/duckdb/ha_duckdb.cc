@@ -1820,6 +1820,10 @@ static ulonglong duckdb_binlog_apply_throttle_bytes_per_sec = 0;
 static ulonglong duckdb_binlog_apply_lag_alert_ms = 0;
 static char *duckdb_binlog_apply_stop_at_gtid = nullptr;
 static bool duckdb_binlog_apply_verbose = false;
+static ulonglong duckdb_binlog_apply_batch_gtids = 100;
+static ulonglong duckdb_binlog_apply_batch_rows = 0;
+static ulonglong duckdb_binlog_apply_batch_bytes = 0;
+static ulonglong duckdb_binlog_apply_batch_delay_ms = 200;
 
 static duckdb_se::BinlogApplyThreadOptions duckdb_make_binlog_apply_options() {
   duckdb_se::BinlogApplyThreadOptions options;
@@ -1842,6 +1846,13 @@ static duckdb_se::BinlogApplyThreadOptions duckdb_make_binlog_apply_options() {
                               ? duckdb_binlog_apply_schema_filter
                               : "";
   options.duckdb_dir = duckdb_db_dir ? duckdb_db_dir : "";
+  options.batch_max_gtids =
+      static_cast<size_t>(duckdb_binlog_apply_batch_gtids);
+  options.batch_max_rows = static_cast<size_t>(duckdb_binlog_apply_batch_rows);
+  options.batch_max_bytes =
+      static_cast<size_t>(duckdb_binlog_apply_batch_bytes);
+  options.batch_max_delay_ms =
+      static_cast<uint64_t>(duckdb_binlog_apply_batch_delay_ms);
   return options;
 }
 
@@ -2103,6 +2114,30 @@ static MYSQL_SYSVAR_BOOL(
     "Enable verbose DuckDB binlog apply logging (debug).",
     nullptr, duckdb_binlog_apply_verbose_update, false);
 
+static MYSQL_SYSVAR_ULONGLONG(
+    binlog_apply_batch_gtids, duckdb_binlog_apply_batch_gtids,
+    PLUGIN_VAR_RQCMDARG,
+    "Max GTIDs per DuckDB apply commit (1 disables batching).",
+    nullptr, nullptr, 100, 1, ~0ULL, 0);
+
+static MYSQL_SYSVAR_ULONGLONG(
+    binlog_apply_batch_rows, duckdb_binlog_apply_batch_rows,
+    PLUGIN_VAR_RQCMDARG,
+    "Max rows per DuckDB apply commit (0 disables).",
+    nullptr, nullptr, 0, 0, ~0ULL, 0);
+
+static MYSQL_SYSVAR_ULONGLONG(
+    binlog_apply_batch_bytes, duckdb_binlog_apply_batch_bytes,
+    PLUGIN_VAR_RQCMDARG,
+    "Max bytes per DuckDB apply commit (0 disables).",
+    nullptr, nullptr, 0, 0, ~0ULL, 0);
+
+static MYSQL_SYSVAR_ULONGLONG(
+    binlog_apply_batch_delay_ms, duckdb_binlog_apply_batch_delay_ms,
+    PLUGIN_VAR_RQCMDARG,
+    "Max delay in ms before forcing a DuckDB apply commit (0 disables).",
+    nullptr, nullptr, 200, 0, ~0ULL, 0);
+
 static MYSQL_SYSVAR_ENUM(
     offload_default_mode, duckdb_offload_default_mode, PLUGIN_VAR_RQCMDARG,
     "Default offload mode for new sessions. Updates init_connect to set "
@@ -2136,6 +2171,10 @@ static SYS_VAR *duckdb_system_variables[] = {
     MYSQL_SYSVAR(binlog_apply_lag_alert_ms),
     MYSQL_SYSVAR(binlog_apply_stop_at_gtid),
     MYSQL_SYSVAR(binlog_apply_verbose),
+    MYSQL_SYSVAR(binlog_apply_batch_gtids),
+    MYSQL_SYSVAR(binlog_apply_batch_rows),
+    MYSQL_SYSVAR(binlog_apply_batch_bytes),
+    MYSQL_SYSVAR(binlog_apply_batch_delay_ms),
     nullptr};
 
 static int show_duckdb_binlog_apply_paused(MYSQL_THD, SHOW_VAR *var, char *) {
