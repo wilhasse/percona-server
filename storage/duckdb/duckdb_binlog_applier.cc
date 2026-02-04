@@ -1472,6 +1472,13 @@ Status DuckDBBinlogApplier::ApplyWatermark() {
         applied_set = std::move(watermark_set);
       }
     }
+    // Seed with configured start GTID set if still empty
+    if (applied_set.empty() && !options_.seed_gtid_set.empty()) {
+      DUCKDB_APPLY_VERBOSE(
+          "DuckDB ApplyWatermark: seeding applied_set from seed_gtid_set='%s'",
+          options_.seed_gtid_set.c_str());
+      applied_set = options_.seed_gtid_set;
+    }
     if (!applied_set.empty() && repl_applied_set_.empty()) {
       repl_applied_set_ = applied_set;
     }

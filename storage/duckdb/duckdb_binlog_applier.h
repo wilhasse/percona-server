@@ -44,6 +44,7 @@ struct BinlogApplierOptions {
   size_t batch_max_rows{0};
   size_t batch_max_bytes{0};
   std::chrono::milliseconds batch_max_delay = std::chrono::milliseconds(200);
+  std::string seed_gtid_set;  // Initial GTID set to seed watermark on first apply
 };
 
 struct BinlogApplyControls {

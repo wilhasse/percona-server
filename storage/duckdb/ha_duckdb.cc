@@ -1244,6 +1244,9 @@ bool DuckdbBinlogApplyVerbose() {
   return duckdb_binlog_apply_verbose_flag.load();
 }
 
+// Forward declaration for sysvar defined later
+static char *duckdb_binlog_apply_start_gtid;
+
 std::string GetDuckdbBinlogApplyStartGtid() {
   return duckdb_binlog_apply_start_gtid ? duckdb_binlog_apply_start_gtid : "";
 }
