@@ -127,4 +127,14 @@ if(NOT WITHOUT_DUCKDB_SE_STORAGE_ENGINE)
       target_compile_options(duckdb_snapshot_loader PRIVATE ${DUCKDB_TLS_MODEL_FLAG})
     endif()
   endif()
+
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # Ensure MySQL client/static deps that are linked into the plugin also use
+    # global-dynamic TLS, so we don't inherit static TLS from initial-exec builds.
+    foreach(duckdb_tls_target mysys_objlib mytime_objlib strings_objlib vio_objlib clientlib_objlib perconaserverclient)
+      if(TARGET ${duckdb_tls_target})
+        target_compile_options(${duckdb_tls_target} PRIVATE ${DUCKDB_TLS_MODEL_FLAG})
+      endif()
+    endforeach()
+  endif()
 endif()
