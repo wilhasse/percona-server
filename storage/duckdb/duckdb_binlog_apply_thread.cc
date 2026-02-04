@@ -1465,6 +1465,14 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
         const BinlogTableMap *map = streamer.GetTableMap(queued.event.table_id);
         if (map) {
           queued.table_map = *map;
+          if (queued.table_map.schema.empty() &&
+              !queued.event.schema.empty()) {
+            queued.table_map.schema = queued.event.schema;
+          }
+          if (queued.table_map.table.empty() &&
+              !queued.event.table.empty()) {
+            queued.table_map.table = queued.event.table;
+          }
           queued.has_table_map = true;
         }
       }
@@ -1582,8 +1590,10 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
           txn_open = true;
           current_gtid.clear();
         }
-        if (!queued.has_table_map) {
-          sql_print_warning("DuckDB binlog applier: missing table map");
+        if (!queued.has_table_map || queued.table_map.table.empty()) {
+          loop_status = Status::Error(StatusCode::kInvalid,
+                                      "Missing table map for row event");
+          had_error = true;
           break;
         }
         const BinlogTableMap *map = &queued.table_map;
