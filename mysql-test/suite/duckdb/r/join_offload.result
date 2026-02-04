@@ -1,12 +1,22 @@
+SELECT d.name, COUNT(*) AS c, SUM(f.amount) AS total
+FROM fact f JOIN dim d ON f.dim_id = d.id
+GROUP BY d.name
+ORDER BY d.name;
 name	c	total
 Alpha	2	30
 Beta	1	5
 Gamma	2	16
+SELECT 1 - 0 AS se_delta;;
 se_delta
 1
+SELECT d.label, COUNT(*) AS c
+FROM fact f JOIN dim_unloaded d ON f.dim_id = d.id
+GROUP BY d.label
+ORDER BY d.label;
 label	c
 A	2
 B	1
 C	2
+SELECT 1 - 1 AS se_delta;;
 se_delta
 0

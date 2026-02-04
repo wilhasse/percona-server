@@ -67,14 +67,14 @@ if(NOT WITHOUT_DUCKDB_SE_STORAGE_ENGINE)
       STORAGE_ENGINE
       DEFAULT
       MODULE_OUTPUT_NAME ha_duckdb
-      LINK_LIBRARIES duckdb_static dummy_static_extension_loader extra::rapidjson binlogevents_static perconaserverclient
+      LINK_LIBRARIES duckdb_static duckdb_generated_extension_loader core_functions_extension extra::rapidjson binlogevents_static perconaserverclient
       )
   else()
     MYSQL_ADD_PLUGIN(duckdb_se ha_duckdb.cc duckdb_adapter.cc duckdb_binlog_applier.cc duckdb_binlog_apply_thread.cc duckdb_binlog_streamer.cc duckdb_row_decoder.cc duckdb_compat.cc
       STORAGE_ENGINE
       MODULE_ONLY
       MODULE_OUTPUT_NAME ha_duckdb
-      LINK_LIBRARIES duckdb_static dummy_static_extension_loader extra::rapidjson binlogevents_static perconaserverclient
+      LINK_LIBRARIES duckdb_static duckdb_generated_extension_loader core_functions_extension extra::rapidjson binlogevents_static perconaserverclient
       )
   endif()
 
