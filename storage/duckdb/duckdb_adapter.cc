@@ -43,6 +43,16 @@
 namespace duckdb_se {
 namespace {
 
+duckdb::Appender *GetOrCreateAppender(ApplyTxn &txn,
+                                      const std::string &table_name) {
+  if (!txn.conn) return nullptr;
+  auto &slot = txn.appenders[table_name];
+  if (!slot) {
+    slot = std::make_unique<duckdb::Appender>(*txn.conn, table_name);
+  }
+  return slot.get();
+}
+
 // Generate a DuckDB-compatible timestamp literal for the current time.
 // Uses C++ chrono to avoid reliance on DuckDB's now()/CURRENT_TIMESTAMP
 // functions which may require core_functions extension.
@@ -1415,10 +1425,12 @@ Status DuckDBAdapter::AppendRows(ApplyTxn &txn, TableId table, RowBatch batch) {
       return Status::Error(StatusCode::kInvalid, "Missing table name");
     }
     DUCKDB_ADAPTER_VERBOSE(
-        "DuckDB AppendRows: creating appender for %s, rows=%zu",
+        "DuckDB AppendRows: using appender for %s, rows=%zu",
         table.table.c_str(), batch.rows.size());
-    std::unique_ptr<duckdb::Appender> appender =
-        std::make_unique<duckdb::Appender>(*txn.conn, table.table);
+    duckdb::Appender *appender = GetOrCreateAppender(txn, table.table);
+    if (!appender) {
+      return Status::Error(StatusCode::kInvalid, "Appender init failed");
+    }
 
     size_t row_idx = 0;
     for (const auto &row : batch.rows) {
@@ -1436,17 +1448,6 @@ Status DuckDBAdapter::AppendRows(ApplyTxn &txn, TableId table, RowBatch batch) {
       }
       appender->EndRow();
       ++row_idx;
-    }
-
-    DUCKDB_ADAPTER_VERBOSE("DuckDB AppendRows: closing appender...");
-    try {
-      appender->Close();
-      DUCKDB_ADAPTER_VERBOSE(
-          "DuckDB AppendRows: appender closed successfully");
-    } catch (const std::exception &close_ex) {
-      sql_print_warning("DuckDB AppendRows: Close() exception: %s",
-                        close_ex.what());
-      throw;
     }
   } catch (const std::exception &ex) {
     return Status::Error(StatusCode::kDuckDBError, ex.what());
@@ -1494,21 +1495,23 @@ Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
   try {
     // Use main schema only - schema separation is at DuckDB file level
     const std::string delta_name = DeltaTableName(table);
-    std::unique_ptr<duckdb::Appender> appender;
     DUCKDB_ADAPTER_VERBOSE(
-        "DuckDB ApplyBulkUpdates: creating appender for %s",
+        "DuckDB ApplyBulkUpdates: using appender for %s",
         delta_name.c_str());
-    appender = std::make_unique<duckdb::Appender>(*txn.conn, delta_name);
+    duckdb::Appender *delta_appender = GetOrCreateAppender(txn, delta_name);
+    if (!delta_appender) {
+      return Status::Error(StatusCode::kInvalid, "Appender init failed");
+    }
 
     DUCKDB_ADAPTER_VERBOSE(
         "DuckDB ApplyBulkUpdates: appending %zu old rows",
         batch.old_rows.size());
     size_t row_idx = 0;
     for (const auto &row : batch.old_rows) {
-      appender->BeginRow();
+      delta_appender->BeginRow();
       size_t col_idx = 0;
       for (const auto &cell : row) {
-        Status st = AppendCellValue(*appender, cell);
+        Status st = AppendCellValue(*delta_appender, cell);
         if (!st.ok()) {
           sql_print_warning(
               "DuckDB ApplyBulkUpdates: AppendCellValue failed row=%zu col=%zu",
@@ -1517,18 +1520,8 @@ Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
         }
         ++col_idx;
       }
-      appender->EndRow();
+      delta_appender->EndRow();
       ++row_idx;
-    }
-    DUCKDB_ADAPTER_VERBOSE("DuckDB ApplyBulkUpdates: closing appender...");
-    try {
-      appender->Close();
-      DUCKDB_ADAPTER_VERBOSE(
-          "DuckDB ApplyBulkUpdates: appender closed successfully");
-    } catch (const std::exception &close_ex) {
-      sql_print_warning("DuckDB ApplyBulkUpdates: Close() exception: %s",
-                        close_ex.what());
-      throw;
     }
 
     std::vector<std::string> columns;
@@ -1604,18 +1597,19 @@ Status DuckDBAdapter::ApplyBulkDeletes(ApplyTxn &txn, TableId table,
   try {
     // Use main schema only - schema separation is at DuckDB file level
     const std::string delta_name = DeltaTableName(table);
-    std::unique_ptr<duckdb::Appender> appender;
-    appender = std::make_unique<duckdb::Appender>(*txn.conn, delta_name);
+    duckdb::Appender *delta_appender = GetOrCreateAppender(txn, delta_name);
+    if (!delta_appender) {
+      return Status::Error(StatusCode::kInvalid, "Appender init failed");
+    }
 
     for (const auto &row : batch.old_rows) {
-      appender->BeginRow();
+      delta_appender->BeginRow();
       for (const auto &cell : row) {
-        Status st = AppendCellValue(*appender, cell);
+        Status st = AppendCellValue(*delta_appender, cell);
         if (!st.ok()) return st;
       }
-      appender->EndRow();
+      delta_appender->EndRow();
     }
-    appender->Close();
 
     std::vector<std::string> columns;
     st = GetTableColumnsOn(*txn.conn, table, &columns);
@@ -1683,12 +1677,31 @@ Status DuckDBAdapter::ApplyDeletes(ApplyTxn &txn, TableId,
   return Status::Ok();
 }
 
+Status DuckDBAdapter::CloseAppenders(ApplyTxn &txn) {
+  if (txn.appenders.empty()) {
+    return Status::Ok();
+  }
+  try {
+    for (auto &entry : txn.appenders) {
+      if (entry.second) {
+        entry.second->Close();
+      }
+    }
+    txn.appenders.clear();
+  } catch (const std::exception &ex) {
+    return Status::Error(StatusCode::kDuckDBError, ex.what());
+  }
+  return Status::Ok();
+}
+
 Status DuckDBAdapter::CommitApplyTxn(ApplyTxn &txn) {
   if (!txn.active || !txn.conn) {
     return Status::Error(StatusCode::kInvalid, "Apply transaction not active");
   }
 
   try {
+    Status st = CloseAppenders(txn);
+    if (!st.ok()) return st;
     auto result = txn.conn->Query("COMMIT");
     if (result->HasError()) {
       return Status::Error(StatusCode::kDuckDBError, result->GetError());
@@ -1709,6 +1722,8 @@ Status DuckDBAdapter::RollbackApplyTxn(ApplyTxn &txn) {
   }
 
   try {
+    Status st = CloseAppenders(txn);
+    if (!st.ok()) return st;
     auto result = txn.conn->Query("ROLLBACK");
     if (result->HasError()) {
       return Status::Error(StatusCode::kDuckDBError, result->GetError());

@@ -25,6 +25,7 @@
 #define PLUGIN_DUCKDB_ADAPTER_H_
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -152,6 +153,7 @@ struct ApplyTxn {
   Status status;
   std::unique_ptr<duckdb::DuckDB> db;
   std::unique_ptr<duckdb::Connection> conn;
+  std::map<std::string, std::unique_ptr<duckdb::Appender>> appenders;
 };
 
 struct SessionCtx {
@@ -181,6 +183,7 @@ class DuckDBAdapter {
   Status ApplyDeletes(ApplyTxn &txn, TableId table, DeleteBatch batch);
   Status ApplyBulkUpdates(ApplyTxn &txn, TableId table, BulkUpdateBatch batch);
   Status ApplyBulkDeletes(ApplyTxn &txn, TableId table, BulkDeleteBatch batch);
+  Status CloseAppenders(ApplyTxn &txn);
   Status CommitApplyTxn(ApplyTxn &txn);
   Status RollbackApplyTxn(ApplyTxn &txn);
 
