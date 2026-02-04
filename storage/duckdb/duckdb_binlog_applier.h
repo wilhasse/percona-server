@@ -102,6 +102,7 @@ class DuckDBBinlogApplier {
   void SetBinlogPosition(const std::string &file, uint64_t pos);
   Status CommitTransaction();
   Status RollbackTransaction();
+  bool ApplyTxnActive() const;
 
  private:
   struct TableKey {
@@ -142,7 +143,6 @@ class DuckDBBinlogApplier {
   bool BatchingEnabled() const;
   bool ShouldCommitBatch(bool force_commit) const;
   void ResetBatchState();
-  bool ApplyTxnActive() const;
   std::string EscapeLiteral(const std::string &value) const;
 
   DuckDBAdapter *adapter_{nullptr};
