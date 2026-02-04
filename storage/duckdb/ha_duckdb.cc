@@ -1244,6 +1244,10 @@ bool DuckdbBinlogApplyVerbose() {
   return duckdb_binlog_apply_verbose_flag.load();
 }
 
+std::string GetDuckdbBinlogApplyStartGtid() {
+  return duckdb_binlog_apply_start_gtid ? duckdb_binlog_apply_start_gtid : "";
+}
+
 ha_duckdb::ha_duckdb(handlerton *hton, TABLE_SHARE *table_share_arg)
     : handler(hton, table_share_arg) {}
 

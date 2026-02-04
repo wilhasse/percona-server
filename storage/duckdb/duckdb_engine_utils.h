@@ -37,6 +37,7 @@ void UnregisterLoadedTable(const std::string &schema,
                            const std::string &table);
 void SetDuckdbBinlogApplyVerbose(bool enabled);
 bool DuckdbBinlogApplyVerbose();
+std::string GetDuckdbBinlogApplyStartGtid();
 
 }  // namespace duckdb_se
 

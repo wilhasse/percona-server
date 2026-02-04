@@ -1527,6 +1527,7 @@ void ApplyThreadMain(BinlogApplyThreadOptions options) {
   }
 
   while (!state.stop.load()) {
+    options.start_gtid_set = GetDuckdbBinlogApplyStartGtid();
     Status st = RunApplyLoop(options, &state.stop);
     if (state.stop.load()) break;
     if (!st.ok()) {

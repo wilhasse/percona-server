@@ -1472,6 +1472,9 @@ Status DuckDBBinlogApplier::ApplyWatermark() {
         applied_set = std::move(watermark_set);
       }
     }
+    if (!applied_set.empty() && repl_applied_set_.empty()) {
+      repl_applied_set_ = applied_set;
+    }
 
     std::string merged_set = applied_set;
     const bool use_batch = !batch_gtids_.empty();
