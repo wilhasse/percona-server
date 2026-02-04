@@ -98,7 +98,8 @@ std::string CurrentTimestampLiteral() {
 }
 
 struct DuckdbTableState {
-  explicit DuckdbTableState(std::string path_in) : path(std::move(path_in)) {
+  DuckdbTableState(std::string path_in, bool replicated_in)
+      : path(std::move(path_in)), replicated(replicated_in) {
     thr_lock_init(&lock);
   }
 
@@ -109,6 +110,7 @@ struct DuckdbTableState {
 
   THR_LOCK lock;
   std::string path;
+  bool replicated{false};
 };
 
 class LoadedTables {
@@ -119,15 +121,23 @@ class LoadedTables {
 
  public:
   void add(const std::string &db, const std::string &table,
-           const std::string &path) {
+           const std::string &path, bool replicated = false) {
     std::lock_guard<std::mutex> guard(m_mutex);
-    m_tables[{db, table}] = std::make_unique<DuckdbTableState>(path);
+    m_tables[{db, table}] =
+        std::make_unique<DuckdbTableState>(path, replicated);
   }
 
   DuckdbTableState *get(const std::string &db, const std::string &table) {
     std::lock_guard<std::mutex> guard(m_mutex);
     auto it = m_tables.find(std::make_pair(db, table));
     return it == m_tables.end() ? nullptr : it->second.get();
+  }
+
+  bool is_replicated(const std::string &db, const std::string &table) {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    auto it = m_tables.find(std::make_pair(db, table));
+    if (it == m_tables.end()) return false;
+    return it->second->replicated;
   }
 
   void erase(const std::string &db, const std::string &table) {
@@ -1216,8 +1226,8 @@ void SetDuckdbPluginPtr(void *ptr) { duckdb_plugin_ptr = ptr; }
 void *GetDuckdbPluginPtr() { return duckdb_plugin_ptr; }
 
 void RegisterLoadedTable(const std::string &schema, const std::string &table,
-                         const std::string &path) {
-  if (loaded_tables) loaded_tables->add(schema, table, path);
+                         const std::string &path, bool replicated) {
+  if (loaded_tables) loaded_tables->add(schema, table, path, replicated);
 }
 
 void UnregisterLoadedTable(const std::string &schema, const std::string &table) {
@@ -1624,6 +1634,22 @@ THR_LOCK_DATA **ha_duckdb::store_lock(THD *, THR_LOCK_DATA **to,
 }
 
 int ha_duckdb::load_table(const TABLE &table) {
+  const std::string db_name =
+      (table.s->db.str != nullptr && table.s->db.length > 0)
+          ? std::string(table.s->db.str, table.s->db.length)
+          : std::string();
+  if (loaded_tables != nullptr &&
+      loaded_tables->is_replicated(db_name, table.s->table_name.str)) {
+    std::ostringstream oss;
+    oss << "SECONDARY_LOAD is not supported for binlog-replicated table ";
+    if (table.s->db.str != nullptr && table.s->db.length > 0) {
+      oss << table.s->db.str << ".";
+    }
+    oss << table.s->table_name.str
+        << "; data is already applied from binlog";
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), oss.str().c_str());
+    return HA_ERR_GENERIC;
+  }
   const std::string path = resolve_duckdb_path(table.s);
   if (!ensure_duckdb_file(path)) {
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),

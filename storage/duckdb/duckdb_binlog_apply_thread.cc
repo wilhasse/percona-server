@@ -354,7 +354,8 @@ Status EnsureMySQLTableInDD(const BinlogApplyThreadOptions &options,
   st = session.Execute(BuildMySQLCreateTable(def, true));
   if (!st.ok()) return st;
   RegisterLoadedTable(def.schema, def.name,
-                      DuckdbPathForSchema(options, def.schema));
+                      DuckdbPathForSchema(options, def.schema),
+                      /*replicated=*/true);
   return Status::Ok();
 }
 
@@ -406,7 +407,8 @@ Status RenameMySQLTableInDD(const BinlogApplyThreadOptions &options,
   if (!st.ok()) return st;
   UnregisterLoadedTable(from.schema, from.table);
   RegisterLoadedTable(to.schema, to.table,
-                      DuckdbPathForSchema(options, to.schema));
+                      DuckdbPathForSchema(options, to.schema),
+                      /*replicated=*/true);
   return Status::Ok();
 }
 

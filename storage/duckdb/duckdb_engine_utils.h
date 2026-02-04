@@ -32,7 +32,7 @@ void SetDuckdbPluginPtr(void *ptr);
 void *GetDuckdbPluginPtr();
 
 void RegisterLoadedTable(const std::string &schema, const std::string &table,
-                         const std::string &path);
+                         const std::string &path, bool replicated = false);
 void UnregisterLoadedTable(const std::string &schema,
                            const std::string &table);
 
