@@ -9,6 +9,29 @@
 - Stop at a GTID for point-in-time recovery:
   `SET GLOBAL duckdb_binlog_apply_stop_at_gtid = 'uuid:123';`
 
+## Batch Apply Settings (GTID Mode)
+Batching commits multiple GTIDs in a single DuckDB transaction to improve
+throughput. These values are read when the apply thread starts, so restart the
+thread (or mysqld) after changing them.
+
+- Max GTIDs per commit (default 100):
+  `SET GLOBAL duckdb_binlog_apply_batch_gtids = 200;`
+- Max delay before forcing a commit (default 200 ms):
+  `SET GLOBAL duckdb_binlog_apply_batch_delay_ms = 500;`
+- Optional row/byte caps (0 disables):
+  `SET GLOBAL duckdb_binlog_apply_batch_rows = 50000;`
+  `SET GLOBAL duckdb_binlog_apply_batch_bytes = 67108864;`
+
+To apply new batch settings without restart:
+```
+SET GLOBAL duckdb_binlog_apply_enabled = OFF;
+SET GLOBAL duckdb_binlog_apply_enabled = ON;
+```
+
+## Debug Logging
+- Enable verbose apply logging (default OFF):
+  `SET GLOBAL duckdb_binlog_apply_verbose = ON;`
+
 ## Monitoring and Lag
 - Inspect metrics: `SHOW STATUS LIKE 'duckdb_binlog_%';`
 - Key fields:
