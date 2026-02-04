@@ -27,9 +27,11 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "libbinlogevents/include/gtids/gtid.h"
@@ -270,6 +272,95 @@ inline bool IsGtidSetSubset(const std::string &candidate_set,
       if (!covered) {
         *is_subset = false;
         return true;
+      }
+    }
+  }
+  return true;
+}
+
+inline bool CountGtidSetTransactions(const std::string &gtid_set,
+                                     uint64_t *count_out,
+                                     std::string *error) {
+  if (!count_out) return false;
+  *count_out = 0;
+  if (gtid_set.empty()) return true;
+  binary_log::gtids::Gtid_set parsed;
+  if (!ParseGtidSetString(gtid_set, &parsed, error)) return false;
+  const auto &contents = parsed.get_gtid_set();
+  for (const auto &entry : contents) {
+    const auto &intervals = entry.second;
+    for (const auto &interval : intervals) {
+      const auto start = static_cast<uint64_t>(interval.get_start());
+      const auto end = static_cast<uint64_t>(interval.get_end());
+      if (end >= start) {
+        *count_out += (end - start + 1);
+      }
+    }
+  }
+  return true;
+}
+
+inline bool ComputeGtidSetLag(const std::string &source_set,
+                              const std::string &applied_set,
+                              uint64_t *lag_out,
+                              std::string *error) {
+  if (!lag_out) return false;
+  *lag_out = 0;
+  if (source_set.empty()) return true;
+
+  binary_log::gtids::Gtid_set source;
+  if (!ParseGtidSetString(source_set, &source, error)) return false;
+  binary_log::gtids::Gtid_set applied;
+  if (!applied_set.empty()) {
+    if (!ParseGtidSetString(applied_set, &applied, error)) return false;
+  }
+
+  const auto &source_map = source.get_gtid_set();
+  const auto &applied_map = applied.get_gtid_set();
+
+  for (const auto &entry : source_map) {
+    std::vector<std::pair<uint64_t, uint64_t>> source_intervals;
+    std::vector<std::pair<uint64_t, uint64_t>> applied_intervals;
+    for (const auto &interval : entry.second) {
+      source_intervals.emplace_back(
+          static_cast<uint64_t>(interval.get_start()),
+          static_cast<uint64_t>(interval.get_end()));
+    }
+    auto applied_it = applied_map.find(entry.first);
+    if (applied_it != applied_map.end()) {
+      for (const auto &interval : applied_it->second) {
+        applied_intervals.emplace_back(
+            static_cast<uint64_t>(interval.get_start()),
+            static_cast<uint64_t>(interval.get_end()));
+      }
+    }
+    std::sort(source_intervals.begin(), source_intervals.end());
+    std::sort(applied_intervals.begin(), applied_intervals.end());
+
+    size_t applied_idx = 0;
+    for (const auto &src : source_intervals) {
+      uint64_t cur = src.first;
+      const uint64_t end = src.second;
+      while (applied_idx < applied_intervals.size() &&
+             applied_intervals[applied_idx].second < cur) {
+        ++applied_idx;
+      }
+      size_t idx = applied_idx;
+      while (idx < applied_intervals.size() &&
+             applied_intervals[idx].first <= end) {
+        const uint64_t a_start = applied_intervals[idx].first;
+        const uint64_t a_end = applied_intervals[idx].second;
+        if (a_start > cur) {
+          *lag_out += (a_start - cur);
+        }
+        if (a_end + 1 > cur) {
+          cur = a_end + 1;
+        }
+        if (cur > end) break;
+        ++idx;
+      }
+      if (cur <= end) {
+        *lag_out += (end - cur + 1);
       }
     }
   }

@@ -2247,12 +2247,30 @@ static int show_duckdb_binlog_lag_alert(MYSQL_THD, SHOW_VAR *var, char *) {
   return 0;
 }
 
+static int show_duckdb_binlog_gtid_lag(MYSQL_THD, SHOW_VAR *var, char *) {
+  static ulonglong value;
+  value = duckdb_se::GetBinlogApplyMetrics().gtid_lag;
+  var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
 static int show_duckdb_binlog_last_gtid(MYSQL_THD, SHOW_VAR *var, char *buf) {
   var->type = SHOW_CHAR;
   var->value = buf;
   const auto metrics = duckdb_se::GetBinlogApplyMetrics();
   const char *gtid = metrics.last_gtid.empty() ? "" : metrics.last_gtid.c_str();
   std::snprintf(buf, SHOW_VAR_FUNC_BUFF_SIZE, "%s", gtid);
+  return 0;
+}
+
+static int show_duckdb_binlog_source_gtid(MYSQL_THD, SHOW_VAR *var, char *buf) {
+  var->type = SHOW_CHAR;
+  var->value = buf;
+  const auto metrics = duckdb_se::GetBinlogApplyMetrics();
+  const char *gtid_set =
+      metrics.source_gtid_set.empty() ? "" : metrics.source_gtid_set.c_str();
+  std::snprintf(buf, SHOW_VAR_FUNC_BUFF_SIZE, "%s", gtid_set);
   return 0;
 }
 
@@ -2293,8 +2311,12 @@ static SHOW_VAR duckdb_status_variables[] = {
      (char *)show_duckdb_binlog_lag_seconds, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"duckdb_binlog_lag_alert", (char *)show_duckdb_binlog_lag_alert, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
+    {"duckdb_binlog_gtid_lag", (char *)show_duckdb_binlog_gtid_lag, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
     {"duckdb_binlog_last_gtid", (char *)show_duckdb_binlog_last_gtid, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
+    {"duckdb_binlog_source_gtid",
+     (char *)show_duckdb_binlog_source_gtid, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {nullptr, nullptr, SHOW_UNDEF, SHOW_SCOPE_GLOBAL}};
 
 static handler *duckdb_create_handler(handlerton *hton, TABLE_SHARE *table,

@@ -62,8 +62,10 @@ struct BinlogApplyMetrics {
   uint64_t last_commit_epoch_ms{0};
   uint64_t last_commit_ms{0};
   uint64_t lag_ms{0};
+  uint64_t gtid_lag{0};
   bool lag_alert{false};
   std::string last_gtid;
+  std::string source_gtid_set;
 };
 
 BinlogApplyControls GetBinlogApplyControls();
@@ -73,6 +75,7 @@ void SetBinlogApplyThrottleRowsPerSec(uint64_t rows_per_sec);
 void SetBinlogApplyThrottleBytesPerSec(uint64_t bytes_per_sec);
 void SetBinlogApplyLagAlertThresholdMs(uint64_t threshold_ms);
 void SetBinlogApplyStopAtGtid(const std::string &gtid);
+void SetBinlogApplySourceGtid(const std::string &gtid_set, uint64_t lag);
 
 class DuckDBBinlogApplier {
  public:

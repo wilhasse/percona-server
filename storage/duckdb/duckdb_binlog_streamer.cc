@@ -423,6 +423,23 @@ Status DuckDBBinlogStreamer::ParseGtidSet(const std::string &gtid_set) {
   return Status::Ok();
 }
 
+Status DuckDBBinlogStreamer::QuerySourceGtidExecuted(std::string *gtid_set) {
+  if (!gtid_set) {
+    return Status::Error(StatusCode::kInvalid, "GTID set output is null");
+  }
+  gtid_set->clear();
+  if (!mysql_) {
+    return Status::Error(StatusCode::kInvalid,
+                         "Binlog streamer not connected");
+  }
+  if (!QuerySingleStringValue(mysql_, "SELECT @@GLOBAL.GTID_EXECUTED",
+                              gtid_set)) {
+    return Status::Error(StatusCode::kInvalid,
+                         "Failed to query @@GLOBAL.GTID_EXECUTED");
+  }
+  return Status::Ok();
+}
+
 Status DuckDBBinlogStreamer::ReadRawEvent(std::vector<uint8_t> *buffer) {
   if (!buffer) {
     return Status::Error(StatusCode::kInvalid, "Buffer is null");

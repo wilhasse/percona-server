@@ -101,6 +101,25 @@ struct SqlExecContext {
   bool ok{false};
 };
 
+constexpr uint64_t kGtidLagUpdateIntervalMs = 5000;
+
+uint64_t NowEpochMs() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+}
+
+DuckDBAdapter *PickLagAdapter(
+    const std::map<std::string, SchemaApplierState> &schema_states) {
+  for (const auto &entry : schema_states) {
+    if (entry.second.adapter) {
+      return entry.second.adapter.get();
+    }
+  }
+  return nullptr;
+}
+
 int SqlStartResultMetadata(void *, uint, uint, const CHARSET_INFO *) {
   return 0;
 }
@@ -1284,8 +1303,44 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
   bool txn_open = false;
   std::string current_log_file;
   uint64_t current_log_pos = 0;
+  uint64_t last_gtid_lag_update_ms = 0;
 
   while (!stop_flag->load()) {
+    if (use_gtid) {
+      const uint64_t now_ms = NowEpochMs();
+      if (now_ms - last_gtid_lag_update_ms >= kGtidLagUpdateIntervalMs) {
+        std::string source_gtid_set;
+        Status gtid_st = streamer.QuerySourceGtidExecuted(&source_gtid_set);
+        if (!gtid_st.ok()) {
+          sql_print_warning(
+              "DuckDB binlog applier: failed to query source GTID_EXECUTED: %s",
+              gtid_st.message.c_str());
+        } else {
+          std::string applied_set;
+          if (DuckDBAdapter *adapter = PickLagAdapter(schema_states)) {
+            Gtid gtid;
+            Status applied_st = adapter->GetLatestWatermark(&gtid);
+            if (applied_st.ok()) {
+              applied_set = gtid.value;
+            } else {
+              sql_print_warning(
+                  "DuckDB binlog applier: failed to read applied GTID set: %s",
+                  applied_st.message.c_str());
+            }
+          }
+          uint64_t lag = 0;
+          std::string error;
+          if (!ComputeGtidSetLag(source_gtid_set, applied_set, &lag, &error)) {
+            sql_print_warning(
+                "DuckDB binlog applier: failed to compute GTID lag: %s",
+                error.c_str());
+          }
+          SetBinlogApplySourceGtid(source_gtid_set, lag);
+        }
+        last_gtid_lag_update_ms = now_ms;
+      }
+    }
+
     BinlogEvent event;
     st = streamer.NextEvent(&event);
     if (!st.ok()) {

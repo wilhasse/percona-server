@@ -64,11 +64,13 @@ struct BinlogApplyState {
   std::atomic<uint64_t> total_throttle_ms{0};
   std::atomic<uint64_t> last_commit_epoch_ms{0};
   std::atomic<uint64_t> last_commit_ms{0};
+  std::atomic<uint64_t> gtid_lag{0};
   std::mutex pause_mutex;
   std::condition_variable pause_cv;
   std::mutex gtid_mutex;
   std::string last_gtid;
   std::string stop_at_gtid;
+  std::string source_gtid_set;
 };
 
 constexpr const char *kReplChannel = "default";
@@ -634,9 +636,11 @@ BinlogApplyMetrics GetBinlogApplyMetrics() {
             ? now_ms - metrics.last_commit_epoch_ms
             : 0;
   }
+  metrics.gtid_lag = state.gtid_lag.load();
   {
     std::lock_guard<std::mutex> guard(state.gtid_mutex);
     metrics.last_gtid = state.last_gtid;
+    metrics.source_gtid_set = state.source_gtid_set;
   }
   const uint64_t lag_threshold = state.lag_alert_threshold_ms.load();
   metrics.lag_alert =
@@ -671,6 +675,15 @@ void SetBinlogApplyStopAtGtid(const std::string &gtid) {
   auto &state = GetApplyState();
   std::lock_guard<std::mutex> guard(state.gtid_mutex);
   state.stop_at_gtid = gtid;
+}
+
+void SetBinlogApplySourceGtid(const std::string &gtid_set, uint64_t lag) {
+  auto &state = GetApplyState();
+  {
+    std::lock_guard<std::mutex> guard(state.gtid_mutex);
+    state.source_gtid_set = gtid_set;
+  }
+  state.gtid_lag.store(lag);
 }
 
 DuckDBBinlogApplier::DuckDBBinlogApplier(DuckDBAdapter *adapter,

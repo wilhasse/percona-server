@@ -97,6 +97,7 @@ class DuckDBBinlogStreamer {
 
   Status NextEvent(BinlogEvent *event);
   const BinlogTableMap *GetTableMap(uint64_t table_id) const;
+  Status QuerySourceGtidExecuted(std::string *gtid_set);
 
  private:
   Status ReadRawEvent(std::vector<uint8_t> *buffer);
