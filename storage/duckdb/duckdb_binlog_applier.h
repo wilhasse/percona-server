@@ -40,6 +40,10 @@ struct BinlogApplierOptions {
   size_t max_bytes = 64 * 1024 * 1024;
   std::chrono::milliseconds max_delay = std::chrono::milliseconds(200);
   bool use_gtid{true};
+  size_t batch_max_gtids{100};
+  size_t batch_max_rows{0};
+  size_t batch_max_bytes{0};
+  std::chrono::milliseconds batch_max_delay = std::chrono::milliseconds(200);
 };
 
 struct BinlogApplyControls {
@@ -133,6 +137,9 @@ class DuckDBBinlogApplier {
                      std::chrono::milliseconds apply_ms);
   void ResetBuffers();
   Status ApplyWatermark();
+  bool BatchingEnabled() const;
+  bool ShouldCommitBatch(bool force_commit) const;
+  void ResetBatchState();
   std::string EscapeLiteral(const std::string &value) const;
 
   DuckDBAdapter *adapter_{nullptr};
@@ -141,6 +148,12 @@ class DuckDBBinlogApplier {
   bool skip_txn_{false};
   bool have_buffered_{false};
   Gtid current_gtid_{};
+  std::vector<std::string> batch_gtids_;
+  size_t batch_gtid_count_{0};
+  size_t batch_rows_{0};
+  size_t batch_bytes_{0};
+  std::chrono::steady_clock::time_point batch_start_time_{};
+  bool txn_has_ddl_{false};
   ApplyTxn apply_txn_{};
   std::chrono::steady_clock::time_point first_event_time_{};
   std::string current_binlog_file_;

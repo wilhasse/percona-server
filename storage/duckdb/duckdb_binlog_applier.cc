@@ -719,7 +719,7 @@ Status DuckDBBinlogApplier::BeginTransaction(Gtid gtid) {
     return Status::Error(StatusCode::kInvalid,
                          "Binlog transaction already active");
   }
-  if (apply_txn_.active) {
+  if (apply_txn_.active && !BatchingEnabled()) {
     return Status::Error(StatusCode::kInvalid,
                          "Apply transaction still active");
   }
@@ -727,8 +727,10 @@ Status DuckDBBinlogApplier::BeginTransaction(Gtid gtid) {
   current_gtid_ = std::move(gtid);
   in_txn_ = true;
   skip_txn_ = false;
-  ResetBuffers();
-  apply_txn_ = ApplyTxn{};
+  if (!BatchingEnabled() || !apply_txn_.active) {
+    ResetBuffers();
+    apply_txn_ = ApplyTxn{};
+  }
   if (!options_.use_gtid) {
     return Status::Ok();
   }
@@ -1115,6 +1117,7 @@ Status DuckDBBinlogApplier::ApplyDDL(DDLChange change) {
     return Status::Ok();
   }
 
+  txn_has_ddl_ = true;
   Status st = FlushBuffered(true);
   if (!st.ok()) {
     return st;
@@ -1124,6 +1127,9 @@ Status DuckDBBinlogApplier::ApplyDDL(DDLChange change) {
   if (!st.ok()) {
     return st;
   }
+
+  st = adapter_->CloseAppenders(apply_txn_);
+  if (!st.ok()) return st;
 
   st = adapter_->ApplyDDLInTxn(apply_txn_, std::move(change));
   if (!st.ok()) return st;
@@ -1139,8 +1145,8 @@ Status DuckDBBinlogApplier::CommitTransaction() {
   if (skip_txn_) {
     in_txn_ = false;
     skip_txn_ = false;
-    apply_txn_ = ApplyTxn{};
     ResetBuffers();
+    txn_has_ddl_ = false;
     return Status::Ok();
   }
 
@@ -1160,6 +1166,32 @@ Status DuckDBBinlogApplier::CommitTransaction() {
                       st.message.c_str());
     RollbackTransaction();
     return st;
+  }
+
+  bool force_commit = !options_.use_gtid || txn_has_ddl_;
+  bool should_pause = false;
+  auto &state = GetApplyState();
+  {
+    std::lock_guard<std::mutex> guard(state.gtid_mutex);
+    if (!current_gtid_.value.empty()) {
+      batch_gtids_.push_back(current_gtid_.value);
+      ++batch_gtid_count_;
+      if (batch_start_time_ == std::chrono::steady_clock::time_point{}) {
+        batch_start_time_ = std::chrono::steady_clock::now();
+      }
+      if (!state.stop_at_gtid.empty() &&
+          state.stop_at_gtid == current_gtid_.value) {
+        force_commit = true;
+        should_pause = true;
+      }
+    }
+  }
+
+  if (!ShouldCommitBatch(force_commit)) {
+    in_txn_ = false;
+    txn_has_ddl_ = false;
+    ResetBuffers();
+    return Status::Ok();
   }
 
   const auto commit_start = std::chrono::steady_clock::now();
@@ -1182,18 +1214,12 @@ Status DuckDBBinlogApplier::CommitTransaction() {
   const auto commit_ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(commit_end -
                                                             commit_start);
-  auto &state = GetApplyState();
   state.applied_transactions.fetch_add(1);
   state.last_commit_epoch_ms.store(NowEpochMs());
   state.last_commit_ms.store(static_cast<uint64_t>(commit_ms.count()));
-  bool should_pause = false;
   {
     std::lock_guard<std::mutex> guard(state.gtid_mutex);
     state.last_gtid = current_gtid_.value;
-    if (!state.stop_at_gtid.empty() &&
-        state.stop_at_gtid == current_gtid_.value) {
-      should_pause = true;
-    }
   }
   if (should_pause) {
     SetBinlogApplyPaused(true);
@@ -1201,6 +1227,8 @@ Status DuckDBBinlogApplier::CommitTransaction() {
 
   apply_txn_ = ApplyTxn{};
   in_txn_ = false;
+  txn_has_ddl_ = false;
+  ResetBatchState();
   ResetBuffers();
   return Status::Ok();
 }
@@ -1220,6 +1248,8 @@ Status DuckDBBinlogApplier::RollbackTransaction() {
   apply_txn_ = ApplyTxn{};
   in_txn_ = false;
   skip_txn_ = false;
+  txn_has_ddl_ = false;
+  ResetBatchState();
   ResetBuffers();
   return st;
 }
@@ -1342,6 +1372,8 @@ void DuckDBBinlogApplier::UpdateMetrics(size_t rows, size_t bytes,
   state.last_flush_ms.store(static_cast<uint64_t>(apply_ms.count()));
   state.applied_rows.fetch_add(rows);
   state.applied_bytes.fetch_add(bytes);
+  batch_rows_ += rows;
+  batch_bytes_ += bytes;
 }
 
 void DuckDBBinlogApplier::MaybeThrottle(size_t rows, size_t bytes,
@@ -1441,16 +1473,24 @@ Status DuckDBBinlogApplier::ApplyWatermark() {
       }
     }
 
-    DUCKDB_APPLY_VERBOSE(
-        "DuckDB ApplyWatermark: calling MergeGtidIntoSet, applied_set='%s', "
-        "gtid='%s'",
-        applied_set.c_str(), current_gtid_.value.c_str());
-    std::string merged_set;
-    if (!MergeGtidIntoSet(applied_set, current_gtid_.value, &merged_set,
-                          &error)) {
-      sql_print_warning("DuckDB ApplyWatermark: MergeGtidIntoSet failed: %s", error.c_str());
-      return Status::Error(StatusCode::kInvalid,
-                           error.empty() ? "Failed to merge GTID" : error);
+    std::string merged_set = applied_set;
+    const bool use_batch = !batch_gtids_.empty();
+    const auto &gtids = use_batch ? batch_gtids_
+                                  : std::vector<std::string>{current_gtid_.value};
+    for (const auto &gtid : gtids) {
+      if (gtid.empty()) continue;
+      DUCKDB_APPLY_VERBOSE(
+          "DuckDB ApplyWatermark: calling MergeGtidIntoSet, applied_set='%s', "
+          "gtid='%s'",
+          merged_set.c_str(), gtid.c_str());
+      std::string next_set;
+      if (!MergeGtidIntoSet(merged_set, gtid, &next_set, &error)) {
+        sql_print_warning("DuckDB ApplyWatermark: MergeGtidIntoSet failed: %s",
+                          error.c_str());
+        return Status::Error(StatusCode::kInvalid,
+                             error.empty() ? "Failed to merge GTID" : error);
+      }
+      merged_set = std::move(next_set);
     }
     DUCKDB_APPLY_VERBOSE(
         "DuckDB ApplyWatermark: MergeGtidIntoSet succeeded, merged_set='%s'",
@@ -1550,6 +1590,44 @@ std::string DuckDBBinlogApplier::EscapeLiteral(const std::string &value) const {
     out.push_back(ch);
   }
   return out;
+}
+
+bool DuckDBBinlogApplier::BatchingEnabled() const {
+  if (!options_.use_gtid) return false;
+  return options_.batch_max_gtids > 1 || options_.batch_max_rows > 0 ||
+         options_.batch_max_bytes > 0 ||
+         options_.batch_max_delay.count() > 0;
+}
+
+bool DuckDBBinlogApplier::ShouldCommitBatch(bool force_commit) const {
+  if (!BatchingEnabled()) return true;
+  if (force_commit) return true;
+  if (options_.batch_max_gtids > 0 &&
+      batch_gtid_count_ >= options_.batch_max_gtids) {
+    return true;
+  }
+  if (options_.batch_max_rows > 0 && batch_rows_ >= options_.batch_max_rows) {
+    return true;
+  }
+  if (options_.batch_max_bytes > 0 && batch_bytes_ >= options_.batch_max_bytes) {
+    return true;
+  }
+  if (options_.batch_max_delay.count() > 0 &&
+      batch_start_time_ != std::chrono::steady_clock::time_point{}) {
+    auto now = std::chrono::steady_clock::now();
+    if (now - batch_start_time_ >= options_.batch_max_delay) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void DuckDBBinlogApplier::ResetBatchState() {
+  batch_gtids_.clear();
+  batch_gtid_count_ = 0;
+  batch_rows_ = 0;
+  batch_bytes_ = 0;
+  batch_start_time_ = std::chrono::steady_clock::time_point{};
 }
 
 }  // namespace duckdb_se
