@@ -146,6 +146,10 @@ class DuckDBBinlogApplier {
   std::string current_binlog_file_;
   uint64_t current_binlog_pos_{0};
   bool has_binlog_pos_{false};
+  bool repl_state_loaded_{false};
+  bool repl_state_found_{false};
+  std::string repl_snapshot_set_;
+  std::string repl_applied_set_;
 
   size_t buffered_rows_{0};
   size_t buffered_bytes_{0};

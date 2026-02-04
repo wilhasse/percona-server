@@ -35,6 +35,8 @@ void RegisterLoadedTable(const std::string &schema, const std::string &table,
                          const std::string &path, bool replicated = false);
 void UnregisterLoadedTable(const std::string &schema,
                            const std::string &table);
+void SetDuckdbBinlogApplyVerbose(bool enabled);
+bool DuckdbBinlogApplyVerbose();
 
 }  // namespace duckdb_se
 

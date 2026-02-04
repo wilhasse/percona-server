@@ -24,6 +24,7 @@
 #include "storage/duckdb/duckdb_binlog_applier.h"
 
 #include "sql/log.h"
+#include "storage/duckdb/duckdb_engine_utils.h"
 #include "storage/duckdb/duckdb_gtid_utils.h"
 #include "storage/duckdb/duckdb_repl_state.h"
 
@@ -40,6 +41,12 @@
 #include <sstream>
 #include <thread>
 #include <utility>
+
+#define DUCKDB_APPLY_VERBOSE(...)                                           \
+  do {                                                                      \
+    if (duckdb_se::DuckdbBinlogApplyVerbose())                              \
+      sql_print_information(__VA_ARGS__);                                   \
+  } while (0)
 
 namespace duckdb_se {
 namespace {
@@ -77,7 +84,7 @@ constexpr const char *kReplChannel = "default";
 
 Status ReadReplStateRow(duckdb::Connection &conn, std::string *snapshot,
                         std::string *applied, bool *found) {
-  sql_print_warning("DuckDB ReadReplStateRow: starting");
+  DUCKDB_APPLY_VERBOSE("DuckDB ReadReplStateRow: starting");
   if (snapshot) snapshot->clear();
   if (applied) applied->clear();
   if (found) *found = false;
@@ -90,39 +97,48 @@ Status ReadReplStateRow(duckdb::Connection &conn, std::string *snapshot,
                       result->GetError().c_str());
     return Status::Error(StatusCode::kDuckDBError, result->GetError());
   }
-  sql_print_warning("DuckDB ReadReplStateRow: query succeeded, fetching chunk");
+  DUCKDB_APPLY_VERBOSE(
+      "DuckDB ReadReplStateRow: query succeeded, fetching chunk");
   auto chunk = result->Fetch();
   if (!chunk || chunk->size() == 0) {
-    sql_print_warning("DuckDB ReadReplStateRow: no rows found");
+    DUCKDB_APPLY_VERBOSE("DuckDB ReadReplStateRow: no rows found");
     return Status::Ok();
   }
-  sql_print_warning("DuckDB ReadReplStateRow: found %zu rows",
-                    static_cast<size_t>(chunk->size()));
+  DUCKDB_APPLY_VERBOSE("DuckDB ReadReplStateRow: found %zu rows",
+                       static_cast<size_t>(chunk->size()));
   if (found) *found = true;
-  sql_print_warning("DuckDB ReadReplStateRow: getting snapshot_gtid_set (col 0)");
+  DUCKDB_APPLY_VERBOSE(
+      "DuckDB ReadReplStateRow: getting snapshot_gtid_set (col 0)");
   auto snap_val = chunk->GetValue(0, 0);
-  sql_print_warning("DuckDB ReadReplStateRow: snapshot_gtid_set IsNull=%d",
-                    snap_val.IsNull() ? 1 : 0);
+  DUCKDB_APPLY_VERBOSE(
+      "DuckDB ReadReplStateRow: snapshot_gtid_set IsNull=%d",
+      snap_val.IsNull() ? 1 : 0);
   if (snapshot && !snap_val.IsNull()) {
-    sql_print_warning("DuckDB ReadReplStateRow: calling ToString on snapshot");
+    DUCKDB_APPLY_VERBOSE(
+        "DuckDB ReadReplStateRow: calling ToString on snapshot");
     *snapshot = snap_val.ToString();
-    sql_print_warning("DuckDB ReadReplStateRow: snapshot=%s", snapshot->c_str());
+    DUCKDB_APPLY_VERBOSE("DuckDB ReadReplStateRow: snapshot=%s",
+                         snapshot->c_str());
   }
-  sql_print_warning("DuckDB ReadReplStateRow: getting applied_gtid_set (col 1)");
+  DUCKDB_APPLY_VERBOSE(
+      "DuckDB ReadReplStateRow: getting applied_gtid_set (col 1)");
   auto applied_val = chunk->GetValue(1, 0);
-  sql_print_warning("DuckDB ReadReplStateRow: applied_gtid_set IsNull=%d",
-                    applied_val.IsNull() ? 1 : 0);
+  DUCKDB_APPLY_VERBOSE(
+      "DuckDB ReadReplStateRow: applied_gtid_set IsNull=%d",
+      applied_val.IsNull() ? 1 : 0);
   if (applied && !applied_val.IsNull()) {
-    sql_print_warning("DuckDB ReadReplStateRow: calling ToString on applied");
+    DUCKDB_APPLY_VERBOSE(
+        "DuckDB ReadReplStateRow: calling ToString on applied");
     *applied = applied_val.ToString();
-    sql_print_warning("DuckDB ReadReplStateRow: applied=%s", applied->c_str());
+    DUCKDB_APPLY_VERBOSE("DuckDB ReadReplStateRow: applied=%s",
+                         applied->c_str());
   }
-  sql_print_warning("DuckDB ReadReplStateRow: done");
+  DUCKDB_APPLY_VERBOSE("DuckDB ReadReplStateRow: done");
   return Status::Ok();
 }
 
 Status LoadWatermarkGtidSet(duckdb::Connection &conn, std::string *out_set) {
-  sql_print_warning("DuckDB LoadWatermarkGtidSet: starting");
+  DUCKDB_APPLY_VERBOSE("DuckDB LoadWatermarkGtidSet: starting");
   if (!out_set) {
     return Status::Error(StatusCode::kInvalid, "GTID set output is null");
   }
@@ -131,36 +147,39 @@ Status LoadWatermarkGtidSet(duckdb::Connection &conn, std::string *out_set) {
       conn.Query("SELECT gtid FROM __repl_watermark ORDER BY commit_ts");
   if (result->HasError()) {
     if (IsMissingReplTableError(result->GetError(), "__repl_watermark")) {
-      sql_print_warning("DuckDB LoadWatermarkGtidSet: no watermark table");
+      DUCKDB_APPLY_VERBOSE("DuckDB LoadWatermarkGtidSet: no watermark table");
       return Status::Ok();
     }
     sql_print_warning("DuckDB LoadWatermarkGtidSet: query error: %s",
                       result->GetError().c_str());
     return Status::Error(StatusCode::kDuckDBError, result->GetError());
   }
-  sql_print_warning("DuckDB LoadWatermarkGtidSet: query succeeded");
+  DUCKDB_APPLY_VERBOSE("DuckDB LoadWatermarkGtidSet: query succeeded");
   std::vector<std::string> gtids;
   while (true) {
     auto chunk = result->Fetch();
     if (!chunk || chunk->size() == 0) break;
-    sql_print_warning("DuckDB LoadWatermarkGtidSet: processing chunk of %zu rows",
-                      static_cast<size_t>(chunk->size()));
+    DUCKDB_APPLY_VERBOSE(
+        "DuckDB LoadWatermarkGtidSet: processing chunk of %zu rows",
+        static_cast<size_t>(chunk->size()));
     for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
-      sql_print_warning("DuckDB LoadWatermarkGtidSet: getting gtid at row %zu",
-                        static_cast<size_t>(row));
+      DUCKDB_APPLY_VERBOSE(
+          "DuckDB LoadWatermarkGtidSet: getting gtid at row %zu",
+          static_cast<size_t>(row));
       auto gtid_val = chunk->GetValue(0, row);
-      sql_print_warning("DuckDB LoadWatermarkGtidSet: gtid IsNull=%d",
-                        gtid_val.IsNull() ? 1 : 0);
+      DUCKDB_APPLY_VERBOSE(
+          "DuckDB LoadWatermarkGtidSet: gtid IsNull=%d",
+          gtid_val.IsNull() ? 1 : 0);
       if (!gtid_val.IsNull()) {
-        sql_print_warning("DuckDB LoadWatermarkGtidSet: calling ToString");
+        DUCKDB_APPLY_VERBOSE("DuckDB LoadWatermarkGtidSet: calling ToString");
         gtids.push_back(gtid_val.ToString());
-        sql_print_warning("DuckDB LoadWatermarkGtidSet: gtid=%s",
-                          gtids.back().c_str());
+        DUCKDB_APPLY_VERBOSE("DuckDB LoadWatermarkGtidSet: gtid=%s",
+                             gtids.back().c_str());
       }
     }
   }
-  sql_print_warning("DuckDB LoadWatermarkGtidSet: collected %zu gtids",
-                    gtids.size());
+  DUCKDB_APPLY_VERBOSE("DuckDB LoadWatermarkGtidSet: collected %zu gtids",
+                       gtids.size());
   if (gtids.empty()) return Status::Ok();
   std::string error;
   if (!BuildGtidSetFromList(gtids, out_set, &error)) {
@@ -170,7 +189,8 @@ Status LoadWatermarkGtidSet(duckdb::Connection &conn, std::string *out_set) {
                          error.empty() ? "Failed to build GTID set"
                                        : error);
   }
-  sql_print_warning("DuckDB LoadWatermarkGtidSet: done, set=%s", out_set->c_str());
+  DUCKDB_APPLY_VERBOSE("DuckDB LoadWatermarkGtidSet: done, set=%s",
+                       out_set->c_str());
   return Status::Ok();
 }
 
@@ -1111,7 +1131,7 @@ Status DuckDBBinlogApplier::ApplyDDL(DDLChange change) {
 }
 
 Status DuckDBBinlogApplier::CommitTransaction() {
-  sql_print_warning("DuckDB CommitTransaction: starting");
+  DUCKDB_APPLY_VERBOSE("DuckDB CommitTransaction: starting");
   if (!in_txn_) {
     return Status::Error(StatusCode::kInvalid, "No active binlog transaction");
   }
@@ -1124,7 +1144,7 @@ Status DuckDBBinlogApplier::CommitTransaction() {
     return Status::Ok();
   }
 
-  sql_print_warning("DuckDB CommitTransaction: calling FlushBuffered");
+  DUCKDB_APPLY_VERBOSE("DuckDB CommitTransaction: calling FlushBuffered");
   Status st = FlushBuffered(true);
   if (!st.ok()) {
     sql_print_warning("DuckDB CommitTransaction: FlushBuffered failed: %s",
@@ -1133,7 +1153,7 @@ Status DuckDBBinlogApplier::CommitTransaction() {
     return st;
   }
 
-  sql_print_warning("DuckDB CommitTransaction: calling EnsureApplyTxn");
+  DUCKDB_APPLY_VERBOSE("DuckDB CommitTransaction: calling EnsureApplyTxn");
   st = EnsureApplyTxn();
   if (!st.ok()) {
     sql_print_warning("DuckDB CommitTransaction: EnsureApplyTxn failed: %s",
@@ -1143,7 +1163,7 @@ Status DuckDBBinlogApplier::CommitTransaction() {
   }
 
   const auto commit_start = std::chrono::steady_clock::now();
-  sql_print_warning("DuckDB CommitTransaction: calling ApplyWatermark");
+  DUCKDB_APPLY_VERBOSE("DuckDB CommitTransaction: calling ApplyWatermark");
   st = ApplyWatermark();
   if (!st.ok()) {
     sql_print_warning("DuckDB CommitTransaction: ApplyWatermark failed: %s",
@@ -1152,7 +1172,7 @@ Status DuckDBBinlogApplier::CommitTransaction() {
     return st;
   }
 
-  sql_print_warning("DuckDB CommitTransaction: calling CommitApplyTxn");
+  DUCKDB_APPLY_VERBOSE("DuckDB CommitTransaction: calling CommitApplyTxn");
   st = adapter_->CommitApplyTxn(apply_txn_);
   if (!st.ok()) {
     RollbackTransaction();
@@ -1371,13 +1391,13 @@ void DuckDBBinlogApplier::ResetBuffers() {
 }
 
 Status DuckDBBinlogApplier::ApplyWatermark() {
-  sql_print_warning("DuckDB ApplyWatermark: starting, gtid=%s",
-                    current_gtid_.value.c_str());
+  DUCKDB_APPLY_VERBOSE("DuckDB ApplyWatermark: starting, gtid=%s",
+                       current_gtid_.value.c_str());
   if (!apply_txn_.active || !apply_txn_.conn) {
     return Status::Error(StatusCode::kInvalid, "Apply transaction not active");
   }
   std::string error;
-  sql_print_warning("DuckDB ApplyWatermark: ensuring repl state table");
+  DUCKDB_APPLY_VERBOSE("DuckDB ApplyWatermark: ensuring repl state table");
   if (!EnsureReplStateTable(*apply_txn_.conn, &error)) {
     sql_print_warning("DuckDB ApplyWatermark: EnsureReplStateTable failed: %s",
                       error.c_str());
@@ -1385,13 +1405,24 @@ Status DuckDBBinlogApplier::ApplyWatermark() {
                          error.empty() ? "Failed to ensure __repl_state"
                                        : error);
   }
-  sql_print_warning("DuckDB ApplyWatermark: repl state table ensured");
+  DUCKDB_APPLY_VERBOSE("DuckDB ApplyWatermark: repl state table ensured");
 
-  bool found = false;
-  std::string snapshot;
-  std::string applied_set;
-  Status st = ReadReplStateRow(*apply_txn_.conn, &snapshot, &applied_set, &found);
-  if (!st.ok()) return st;
+  if (!repl_state_loaded_) {
+    bool found = false;
+    std::string snapshot;
+    std::string applied_set;
+    Status st =
+        ReadReplStateRow(*apply_txn_.conn, &snapshot, &applied_set, &found);
+    if (!st.ok()) return st;
+    repl_state_loaded_ = true;
+    repl_state_found_ = found;
+    repl_snapshot_set_ = std::move(snapshot);
+    repl_applied_set_ = std::move(applied_set);
+  }
+
+  bool found = repl_state_found_;
+  std::string snapshot = repl_snapshot_set_;
+  std::string applied_set = repl_applied_set_;
 
   const std::string commit_ts = GetCurrentTimestampString();
   std::string sql;
@@ -1403,15 +1434,17 @@ Status DuckDBBinlogApplier::ApplyWatermark() {
     }
     if (applied_set.empty()) {
       std::string watermark_set;
-      st = LoadWatermarkGtidSet(*apply_txn_.conn, &watermark_set);
+      Status st = LoadWatermarkGtidSet(*apply_txn_.conn, &watermark_set);
       if (!st.ok()) return st;
       if (!watermark_set.empty()) {
         applied_set = std::move(watermark_set);
       }
     }
 
-    sql_print_warning("DuckDB ApplyWatermark: calling MergeGtidIntoSet, applied_set='%s', gtid='%s'",
-                      applied_set.c_str(), current_gtid_.value.c_str());
+    DUCKDB_APPLY_VERBOSE(
+        "DuckDB ApplyWatermark: calling MergeGtidIntoSet, applied_set='%s', "
+        "gtid='%s'",
+        applied_set.c_str(), current_gtid_.value.c_str());
     std::string merged_set;
     if (!MergeGtidIntoSet(applied_set, current_gtid_.value, &merged_set,
                           &error)) {
@@ -1419,13 +1452,15 @@ Status DuckDBBinlogApplier::ApplyWatermark() {
       return Status::Error(StatusCode::kInvalid,
                            error.empty() ? "Failed to merge GTID" : error);
     }
-    sql_print_warning("DuckDB ApplyWatermark: MergeGtidIntoSet succeeded, merged_set='%s'",
-                      merged_set.c_str());
+    DUCKDB_APPLY_VERBOSE(
+        "DuckDB ApplyWatermark: MergeGtidIntoSet succeeded, merged_set='%s'",
+        merged_set.c_str());
 
     if (found) {
       // Use DELETE + INSERT instead of UPDATE to work around DuckDB UTF-8
       // validation issue that can occur during UPDATE processing.
-      sql_print_warning("DuckDB ApplyWatermark: building DELETE+INSERT SQL (found=true)");
+      DUCKDB_APPLY_VERBOSE(
+          "DuckDB ApplyWatermark: building DELETE+INSERT SQL (found=true)");
       std::string delete_sql = "DELETE FROM __repl_state WHERE channel = '" +
                                std::string(kReplChannel) + "'";
       auto del_result = apply_txn_.conn->Query(delete_sql);
@@ -1434,21 +1469,14 @@ Status DuckDBBinlogApplier::ApplyWatermark() {
                           del_result->GetError().c_str());
         return Status::Error(StatusCode::kDuckDBError, del_result->GetError());
       }
-      sql_print_warning("DuckDB ApplyWatermark: DELETE succeeded");
+      DUCKDB_APPLY_VERBOSE("DuckDB ApplyWatermark: DELETE succeeded");
       // Fall through to INSERT path below
     }
     // Always INSERT (either fresh row or after DELETE)
     {
-      sql_print_warning("DuckDB ApplyWatermark: building INSERT SQL, binlog_file='%s' len=%zu",
-                        current_binlog_file_.c_str(), current_binlog_file_.size());
-      // Print hex of binlog_file to check for hidden chars
-      std::string hex_file;
-      for (unsigned char c : current_binlog_file_) {
-        char buf[4];
-        snprintf(buf, sizeof(buf), "%02x", c);
-        hex_file += buf;
-      }
-      sql_print_warning("DuckDB ApplyWatermark: binlog_file hex: %s", hex_file.c_str());
+      DUCKDB_APPLY_VERBOSE(
+          "DuckDB ApplyWatermark: building INSERT SQL, binlog_file='%s' len=%zu",
+          current_binlog_file_.c_str(), current_binlog_file_.size());
       const std::string snapshot_sql =
           snapshot.empty() ? "''" : "'" + EscapeLiteral(snapshot) + "'";
       std::string insert_cols =
@@ -1465,6 +1493,7 @@ Status DuckDBBinlogApplier::ApplyWatermark() {
       sql = "INSERT INTO __repl_state (" + insert_cols + ") VALUES (" +
             insert_vals + ")";
     }
+    repl_applied_set_ = merged_set;
   } else {
     if (!update_binlog) {
       return Status::Error(StatusCode::kInvalid,
@@ -1494,37 +1523,22 @@ Status DuckDBBinlogApplier::ApplyWatermark() {
     }
   }
 
-  sql_print_warning("DuckDB ApplyWatermark: executing SQL: %s", sql.c_str());
+  DUCKDB_APPLY_VERBOSE("DuckDB ApplyWatermark: executing SQL: %s", sql.c_str());
   try {
-    // Debug: test SELECT first
-    sql_print_warning("DuckDB ApplyWatermark: testing SELECT...");
-    auto test = apply_txn_.conn->Query("SELECT * FROM __repl_state");
-    if (test->HasError()) {
-      sql_print_warning("DuckDB ApplyWatermark: SELECT failed: %s", test->GetError().c_str());
-    } else {
-      sql_print_warning("DuckDB ApplyWatermark: SELECT succeeded");
-    }
-
-    sql_print_warning("DuckDB ApplyWatermark: calling Query()...");
     auto result = apply_txn_.conn->Query(sql);
-    sql_print_warning("DuckDB ApplyWatermark: Query() returned, result=%p",
-                      static_cast<void*>(result.get()));
-    sql_print_warning("DuckDB ApplyWatermark: calling HasError()...");
     bool has_error = result->HasError();
-    sql_print_warning("DuckDB ApplyWatermark: HasError() returned %d", has_error ? 1 : 0);
     if (has_error) {
-      sql_print_warning("DuckDB ApplyWatermark: calling GetError()...");
       std::string err = result->GetError();
       sql_print_warning("DuckDB ApplyWatermark: Query error: %s", err.c_str());
       return Status::Error(StatusCode::kDuckDBError, err);
     }
-    sql_print_warning("DuckDB ApplyWatermark: Query succeeded");
   } catch (const std::exception &ex) {
     sql_print_warning("DuckDB ApplyWatermark: Query exception: %s", ex.what());
     return Status::Error(StatusCode::kDuckDBError, ex.what());
   }
 
-  sql_print_warning("DuckDB ApplyWatermark: done");
+  repl_state_found_ = true;
+  DUCKDB_APPLY_VERBOSE("DuckDB ApplyWatermark: done");
   return Status::Ok();
 }
 

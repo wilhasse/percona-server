@@ -24,6 +24,7 @@
 #include "storage/duckdb/ha_duckdb.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cfloat>
 #include <chrono>
@@ -1220,6 +1221,7 @@ static void DuckdbSetOffloadFailReason(THD *thd, const char *reason) {
 namespace duckdb_se {
 
 void *duckdb_plugin_ptr = nullptr;
+static std::atomic<bool> duckdb_binlog_apply_verbose_flag{false};
 
 void SetDuckdbPluginPtr(void *ptr) { duckdb_plugin_ptr = ptr; }
 
@@ -1232,6 +1234,14 @@ void RegisterLoadedTable(const std::string &schema, const std::string &table,
 
 void UnregisterLoadedTable(const std::string &schema, const std::string &table) {
   if (loaded_tables) loaded_tables->erase(schema, table);
+}
+
+void SetDuckdbBinlogApplyVerbose(bool enabled) {
+  duckdb_binlog_apply_verbose_flag.store(enabled);
+}
+
+bool DuckdbBinlogApplyVerbose() {
+  return duckdb_binlog_apply_verbose_flag.load();
 }
 
 ha_duckdb::ha_duckdb(handlerton *hton, TABLE_SHARE *table_share_arg)
@@ -1809,6 +1819,7 @@ static ulonglong duckdb_binlog_apply_throttle_rows_per_sec = 0;
 static ulonglong duckdb_binlog_apply_throttle_bytes_per_sec = 0;
 static ulonglong duckdb_binlog_apply_lag_alert_ms = 0;
 static char *duckdb_binlog_apply_stop_at_gtid = nullptr;
+static bool duckdb_binlog_apply_verbose = false;
 
 static duckdb_se::BinlogApplyThreadOptions duckdb_make_binlog_apply_options() {
   duckdb_se::BinlogApplyThreadOptions options;
@@ -1880,6 +1891,13 @@ static void duckdb_binlog_apply_stop_at_gtid_update(
   const char *value =
       *static_cast<const char **>(const_cast<void *>(save));
   duckdb_se::SetBinlogApplyStopAtGtid(value ? value : "");
+}
+
+static void duckdb_binlog_apply_verbose_update(
+    MYSQL_THD, SYS_VAR *, void *var_ptr, const void *save) {
+  auto value = *static_cast<const bool *>(save);
+  *static_cast<bool *>(var_ptr) = value;
+  duckdb_se::SetDuckdbBinlogApplyVerbose(value);
 }
 
 static const char *duckdb_offload_mode_names[] = {"OFF", "ON", "FORCED",
@@ -2080,6 +2098,11 @@ static MYSQL_SYSVAR_STR(
     "Pause apply after committing this GTID (empty disables).",
     nullptr, duckdb_binlog_apply_stop_at_gtid_update, "");
 
+static MYSQL_SYSVAR_BOOL(
+    binlog_apply_verbose, duckdb_binlog_apply_verbose, PLUGIN_VAR_RQCMDARG,
+    "Enable verbose DuckDB binlog apply logging (debug).",
+    nullptr, duckdb_binlog_apply_verbose_update, false);
+
 static MYSQL_SYSVAR_ENUM(
     offload_default_mode, duckdb_offload_default_mode, PLUGIN_VAR_RQCMDARG,
     "Default offload mode for new sessions. Updates init_connect to set "
@@ -2112,6 +2135,7 @@ static SYS_VAR *duckdb_system_variables[] = {
     MYSQL_SYSVAR(binlog_apply_throttle_bytes_per_sec),
     MYSQL_SYSVAR(binlog_apply_lag_alert_ms),
     MYSQL_SYSVAR(binlog_apply_stop_at_gtid),
+    MYSQL_SYSVAR(binlog_apply_verbose),
     nullptr};
 
 static int show_duckdb_binlog_apply_paused(MYSQL_THD, SHOW_VAR *var, char *) {
@@ -2338,6 +2362,7 @@ static int duckdb_init_func(void *p) {
       duckdb_binlog_apply_lag_alert_ms);
   duckdb_se::SetBinlogApplyStopAtGtid(
       duckdb_binlog_apply_stop_at_gtid ? duckdb_binlog_apply_stop_at_gtid : "");
+  duckdb_se::SetDuckdbBinlogApplyVerbose(duckdb_binlog_apply_verbose);
   DuckdbUpdateInitConnect();
   (void)duckdb_validate_read_only_settings();
   duckdb_se::StartBinlogApplyThread(duckdb_make_binlog_apply_options());

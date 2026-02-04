@@ -30,8 +30,15 @@
 #include <unordered_set>
 
 #include "sql/log.h"
+#include "storage/duckdb/duckdb_engine_utils.h"
 #include "storage/duckdb/duckdb_gtid_utils.h"
 #include "storage/duckdb/duckdb_repl_state.h"
+
+#define DUCKDB_ADAPTER_VERBOSE(...)                                          \
+  do {                                                                       \
+    if (duckdb_se::DuckdbBinlogApplyVerbose())                               \
+      sql_print_information(__VA_ARGS__);                                    \
+  } while (0)
 
 namespace duckdb_se {
 namespace {
@@ -877,17 +884,18 @@ Status DuckDBAdapter::CreateTableOn(duckdb::Connection &conn,
     sql = ddl.str();
   }
 
-  sql_print_warning("DuckDB create table DDL: %s", sql.c_str());
+  DUCKDB_ADAPTER_VERBOSE("DuckDB create table DDL: %s", sql.c_str());
   try {
-    sql_print_warning("DuckDB create table: executing query...");
+    DUCKDB_ADAPTER_VERBOSE("DuckDB create table: executing query...");
     auto result = conn.Query(sql);
-    sql_print_warning("DuckDB create table: query returned, checking error...");
+    DUCKDB_ADAPTER_VERBOSE(
+        "DuckDB create table: query returned, checking error...");
     if (result->HasError()) {
       sql_print_warning("DuckDB create table: query error: %s",
                         result->GetError().c_str());
       return Status::Error(StatusCode::kDuckDBError, result->GetError());
     }
-    sql_print_warning("DuckDB create table: success");
+    DUCKDB_ADAPTER_VERBOSE("DuckDB create table: success");
   } catch (const std::exception &ex) {
     sql_print_warning("DuckDB create table: exception: %s", ex.what());
     return Status::Error(StatusCode::kDuckDBError, ex.what());
@@ -1406,8 +1414,9 @@ Status DuckDBAdapter::AppendRows(ApplyTxn &txn, TableId table, RowBatch batch) {
     if (table.table.empty()) {
       return Status::Error(StatusCode::kInvalid, "Missing table name");
     }
-    sql_print_warning("DuckDB AppendRows: creating appender for %s, rows=%zu",
-                      table.table.c_str(), batch.rows.size());
+    DUCKDB_ADAPTER_VERBOSE(
+        "DuckDB AppendRows: creating appender for %s, rows=%zu",
+        table.table.c_str(), batch.rows.size());
     std::unique_ptr<duckdb::Appender> appender =
         std::make_unique<duckdb::Appender>(*txn.conn, table.table);
 
@@ -1429,10 +1438,11 @@ Status DuckDBAdapter::AppendRows(ApplyTxn &txn, TableId table, RowBatch batch) {
       ++row_idx;
     }
 
-    sql_print_warning("DuckDB AppendRows: closing appender...");
+    DUCKDB_ADAPTER_VERBOSE("DuckDB AppendRows: closing appender...");
     try {
       appender->Close();
-      sql_print_warning("DuckDB AppendRows: appender closed successfully");
+      DUCKDB_ADAPTER_VERBOSE(
+          "DuckDB AppendRows: appender closed successfully");
     } catch (const std::exception &close_ex) {
       sql_print_warning("DuckDB AppendRows: Close() exception: %s",
                         close_ex.what());
@@ -1485,12 +1495,14 @@ Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
     // Use main schema only - schema separation is at DuckDB file level
     const std::string delta_name = DeltaTableName(table);
     std::unique_ptr<duckdb::Appender> appender;
-    sql_print_warning("DuckDB ApplyBulkUpdates: creating appender for %s",
-                      delta_name.c_str());
+    DUCKDB_ADAPTER_VERBOSE(
+        "DuckDB ApplyBulkUpdates: creating appender for %s",
+        delta_name.c_str());
     appender = std::make_unique<duckdb::Appender>(*txn.conn, delta_name);
 
-    sql_print_warning("DuckDB ApplyBulkUpdates: appending %zu old rows",
-                      batch.old_rows.size());
+    DUCKDB_ADAPTER_VERBOSE(
+        "DuckDB ApplyBulkUpdates: appending %zu old rows",
+        batch.old_rows.size());
     size_t row_idx = 0;
     for (const auto &row : batch.old_rows) {
       appender->BeginRow();
@@ -1508,10 +1520,11 @@ Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
       appender->EndRow();
       ++row_idx;
     }
-    sql_print_warning("DuckDB ApplyBulkUpdates: closing appender...");
+    DUCKDB_ADAPTER_VERBOSE("DuckDB ApplyBulkUpdates: closing appender...");
     try {
       appender->Close();
-      sql_print_warning("DuckDB ApplyBulkUpdates: appender closed successfully");
+      DUCKDB_ADAPTER_VERBOSE(
+          "DuckDB ApplyBulkUpdates: appender closed successfully");
     } catch (const std::exception &close_ex) {
       sql_print_warning("DuckDB ApplyBulkUpdates: Close() exception: %s",
                         close_ex.what());
