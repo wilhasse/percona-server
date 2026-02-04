@@ -46,6 +46,7 @@ struct BinlogApplyThreadOptions {
   size_t batch_max_rows{0};
   size_t batch_max_bytes{0};
   uint64_t batch_max_delay_ms{0};
+  size_t parallel_workers{1};
 };
 
 bool StartBinlogApplyThread(const BinlogApplyThreadOptions &options);

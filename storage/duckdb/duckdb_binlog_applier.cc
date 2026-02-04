@@ -38,6 +38,7 @@
 #include <ctime>
 #include <iomanip>
 #include <mutex>
+#include <thread>
 #include <sstream>
 #include <thread>
 #include <utility>
@@ -708,7 +709,11 @@ void SetBinlogApplySourceGtid(const std::string &gtid_set, uint64_t lag) {
 
 DuckDBBinlogApplier::DuckDBBinlogApplier(DuckDBAdapter *adapter,
                                          Options options)
-    : adapter_(adapter), options_(options) {}
+    : adapter_(adapter), options_(options) {
+  if (options_.parallel_workers == 0) {
+    options_.parallel_workers = 1;
+  }
+}
 
 Status DuckDBBinlogApplier::BeginTransaction(Gtid gtid) {
   if (!adapter_) {
@@ -1160,13 +1165,16 @@ Status DuckDBBinlogApplier::CommitTransaction() {
     return st;
   }
 
-  DUCKDB_APPLY_VERBOSE("DuckDB CommitTransaction: calling EnsureApplyTxn");
-  st = EnsureApplyTxn();
-  if (!st.ok()) {
-    sql_print_warning("DuckDB CommitTransaction: EnsureApplyTxn failed: %s",
-                      st.message.c_str());
-    RollbackTransaction();
-    return st;
+  const bool use_parallel = options_.parallel_workers > 1 && !txn_has_ddl_;
+  if (!use_parallel) {
+    DUCKDB_APPLY_VERBOSE("DuckDB CommitTransaction: calling EnsureApplyTxn");
+    st = EnsureApplyTxn();
+    if (!st.ok()) {
+      sql_print_warning("DuckDB CommitTransaction: EnsureApplyTxn failed: %s",
+                        st.message.c_str());
+      RollbackTransaction();
+      return st;
+    }
   }
 
   bool force_commit = !options_.use_gtid || txn_has_ddl_;
@@ -1193,6 +1201,17 @@ Status DuckDBBinlogApplier::CommitTransaction() {
     txn_has_ddl_ = false;
     ResetBuffers();
     return Status::Ok();
+  }
+
+  if (use_parallel && !apply_txn_.active) {
+    DUCKDB_APPLY_VERBOSE("DuckDB CommitTransaction: calling EnsureApplyTxn");
+    st = EnsureApplyTxn();
+    if (!st.ok()) {
+      sql_print_warning("DuckDB CommitTransaction: EnsureApplyTxn failed: %s",
+                        st.message.c_str());
+      RollbackTransaction();
+      return st;
+    }
   }
 
   const auto commit_start = std::chrono::steady_clock::now();
@@ -1305,49 +1324,171 @@ Status DuckDBBinlogApplier::FlushBuffered(bool force) {
 
   WaitIfPaused();
   const auto apply_start = std::chrono::steady_clock::now();
-  Status st = EnsureApplyTxn();
-  if (!st.ok()) {
-    return st;
+  const bool use_parallel =
+      options_.parallel_workers > 1 && !txn_has_ddl_;
+  if (!use_parallel) {
+    Status st = EnsureApplyTxn();
+    if (!st.ok()) {
+      return st;
+    }
   }
 
-  for (auto &entry : buffers_) {
-    auto &buffer = entry.second;
-    if (!buffer.inserts.rows.empty()) {
-      RowBatch batch = std::move(buffer.inserts);
-      TableId table = batch.table;  // Copy before move to avoid UB
-      st = adapter_->ApplyInsertDelta(apply_txn_, table, std::move(batch),
-                                      DuckDBAdapter::InsertDeltaMode::kInsert);
-      if (!st.ok()) return st;
+  Status st = Status::Ok();
+  if (!use_parallel) {
+    for (auto &entry : buffers_) {
+      auto &buffer = entry.second;
+      if (!buffer.inserts.rows.empty()) {
+        RowBatch batch = std::move(buffer.inserts);
+        TableId table = batch.table;  // Copy before move to avoid UB
+        st = adapter_->ApplyInsertDelta(apply_txn_, table, std::move(batch),
+                                        DuckDBAdapter::InsertDeltaMode::kInsert);
+        if (!st.ok()) return st;
+      }
+      if (!buffer.bulk_updates.old_rows.empty()) {
+        BulkUpdateBatch batch = std::move(buffer.bulk_updates);
+        TableId table = batch.table;  // Copy before move to avoid UB
+        TableKey key{table.schema, table.table};
+        insert_delta_tables_.insert(key);
+        delta_tables_.insert(key);
+        st = adapter_->ApplyBulkUpdates(apply_txn_, std::move(table),
+                                        std::move(batch));
+        if (!st.ok()) return st;
+      }
+      if (!buffer.updates.statements.empty()) {
+        UpdateBatch batch = std::move(buffer.updates);
+        TableId table = batch.table;  // Copy before move to avoid UB
+        st = adapter_->ApplyUpdates(apply_txn_, std::move(table),
+                                    std::move(batch));
+        if (!st.ok()) return st;
+      }
+      if (!buffer.bulk_deletes.old_rows.empty()) {
+        BulkDeleteBatch batch = std::move(buffer.bulk_deletes);
+        TableId table = batch.table;  // Copy before move to avoid UB
+        delta_tables_.insert(TableKey{table.schema, table.table});
+        st = adapter_->ApplyBulkDeletes(apply_txn_, std::move(table),
+                                        std::move(batch));
+        if (!st.ok()) return st;
+      }
+      if (!buffer.deletes.statements.empty()) {
+        DeleteBatch batch = std::move(buffer.deletes);
+        TableId table = batch.table;  // Copy before move to avoid UB
+        st = adapter_->ApplyDeletes(apply_txn_, std::move(table),
+                                    std::move(batch));
+        if (!st.ok()) return st;
+      }
     }
-    if (!buffer.bulk_updates.old_rows.empty()) {
-      BulkUpdateBatch batch = std::move(buffer.bulk_updates);
-      TableId table = batch.table;  // Copy before move to avoid UB
-      TableKey key{table.schema, table.table};
-      insert_delta_tables_.insert(key);
-      delta_tables_.insert(key);
-      st = adapter_->ApplyBulkUpdates(apply_txn_, std::move(table),
+  } else {
+    struct WorkItem {
+      TableId table;
+      TableBuffer buffer;
+    };
+    std::vector<WorkItem> work;
+    work.reserve(buffers_.size());
+    for (auto &entry : buffers_) {
+      auto &buffer = entry.second;
+      const bool has_work = !buffer.inserts.rows.empty() ||
+                            !buffer.bulk_updates.old_rows.empty() ||
+                            !buffer.updates.statements.empty() ||
+                            !buffer.bulk_deletes.old_rows.empty() ||
+                            !buffer.deletes.statements.empty();
+      if (!has_work) continue;
+      const TableKey &key = entry.first;
+      if (!buffer.bulk_updates.old_rows.empty() ||
+          !buffer.bulk_deletes.old_rows.empty()) {
+        delta_tables_.insert(key);
+      }
+      WorkItem item;
+      item.table = TableId{key.schema, key.table};
+      item.buffer = std::move(buffer);
+      work.push_back(std::move(item));
+    }
+
+    if (!work.empty()) {
+      const size_t worker_count =
+          std::min(options_.parallel_workers, work.size());
+      std::atomic<size_t> next_index{0};
+      std::mutex err_mutex;
+      Status first_error = Status::Ok();
+
+      auto apply_table = [this](TableId table, TableBuffer buffer) -> Status {
+        ApplyTxn txn = adapter_->BeginApplyTxn(current_gtid_);
+        if (!txn.status.ok()) return txn.status;
+        Status st = Status::Ok();
+        if (!buffer.inserts.rows.empty()) {
+          RowBatch batch = std::move(buffer.inserts);
+          if (batch.table.table.empty()) batch.table = table;
+          st = adapter_->ApplyInsertDelta(
+              txn, batch.table, std::move(batch),
+              DuckDBAdapter::InsertDeltaMode::kInsert);
+          if (!st.ok()) goto fail;
+        }
+        if (!buffer.bulk_updates.old_rows.empty()) {
+          BulkUpdateBatch batch = std::move(buffer.bulk_updates);
+          if (batch.table.table.empty()) batch.table = table;
+          st = adapter_->ApplyBulkUpdates(txn, std::move(batch.table),
+                                          std::move(batch));
+          if (!st.ok()) goto fail;
+        }
+        if (!buffer.updates.statements.empty()) {
+          UpdateBatch batch = std::move(buffer.updates);
+          if (batch.table.table.empty()) batch.table = table;
+          st = adapter_->ApplyUpdates(txn, std::move(batch.table),
                                       std::move(batch));
-      if (!st.ok()) return st;
-    }
-    if (!buffer.updates.statements.empty()) {
-      UpdateBatch batch = std::move(buffer.updates);
-      TableId table = batch.table;  // Copy before move to avoid UB
-      st = adapter_->ApplyUpdates(apply_txn_, std::move(table), std::move(batch));
-      if (!st.ok()) return st;
-    }
-    if (!buffer.bulk_deletes.old_rows.empty()) {
-      BulkDeleteBatch batch = std::move(buffer.bulk_deletes);
-      TableId table = batch.table;  // Copy before move to avoid UB
-      delta_tables_.insert(TableKey{table.schema, table.table});
-      st = adapter_->ApplyBulkDeletes(apply_txn_, std::move(table),
+          if (!st.ok()) goto fail;
+        }
+        if (!buffer.bulk_deletes.old_rows.empty()) {
+          BulkDeleteBatch batch = std::move(buffer.bulk_deletes);
+          if (batch.table.table.empty()) batch.table = table;
+          st = adapter_->ApplyBulkDeletes(txn, std::move(batch.table),
+                                          std::move(batch));
+          if (!st.ok()) goto fail;
+        }
+        if (!buffer.deletes.statements.empty()) {
+          DeleteBatch batch = std::move(buffer.deletes);
+          if (batch.table.table.empty()) batch.table = table;
+          st = adapter_->ApplyDeletes(txn, std::move(batch.table),
                                       std::move(batch));
-      if (!st.ok()) return st;
-    }
-    if (!buffer.deletes.statements.empty()) {
-      DeleteBatch batch = std::move(buffer.deletes);
-      TableId table = batch.table;  // Copy before move to avoid UB
-      st = adapter_->ApplyDeletes(apply_txn_, std::move(table), std::move(batch));
-      if (!st.ok()) return st;
+          if (!st.ok()) goto fail;
+        }
+
+        st = adapter_->CommitApplyTxn(txn);
+        if (!st.ok()) goto fail;
+        return Status::Ok();
+
+      fail:
+        if (txn.active) {
+          (void)adapter_->RollbackApplyTxn(txn);
+        }
+        std::vector<TableId> tables{table};
+        (void)adapter_->CleanupInsertDeltaTables(tables);
+        (void)adapter_->CleanupDeltaTables(tables);
+        return st;
+      };
+
+      auto worker = [&]() {
+        while (true) {
+          const size_t idx = next_index.fetch_add(1);
+          if (idx >= work.size()) break;
+          Status st = apply_table(work[idx].table, std::move(work[idx].buffer));
+          if (!st.ok()) {
+            std::lock_guard<std::mutex> guard(err_mutex);
+            if (first_error.ok()) first_error = st;
+          }
+        }
+      };
+
+      std::vector<std::thread> threads;
+      threads.reserve(worker_count);
+      for (size_t i = 0; i < worker_count; ++i) {
+        threads.emplace_back(worker);
+      }
+      for (auto &thread : threads) {
+        thread.join();
+      }
+
+      if (!first_error.ok()) {
+        return first_error;
+      }
     }
   }
 

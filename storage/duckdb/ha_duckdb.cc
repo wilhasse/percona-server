@@ -1831,6 +1831,7 @@ static ulonglong duckdb_binlog_apply_batch_gtids = 100;
 static ulonglong duckdb_binlog_apply_batch_rows = 0;
 static ulonglong duckdb_binlog_apply_batch_bytes = 0;
 static ulonglong duckdb_binlog_apply_batch_delay_ms = 200;
+static ulonglong duckdb_binlog_apply_parallel_workers = 1;
 
 static duckdb_se::BinlogApplyThreadOptions duckdb_make_binlog_apply_options() {
   duckdb_se::BinlogApplyThreadOptions options;
@@ -1860,6 +1861,8 @@ static duckdb_se::BinlogApplyThreadOptions duckdb_make_binlog_apply_options() {
       static_cast<size_t>(duckdb_binlog_apply_batch_bytes);
   options.batch_max_delay_ms =
       static_cast<uint64_t>(duckdb_binlog_apply_batch_delay_ms);
+  options.parallel_workers =
+      static_cast<size_t>(duckdb_binlog_apply_parallel_workers);
   return options;
 }
 
@@ -2145,6 +2148,12 @@ static MYSQL_SYSVAR_ULONGLONG(
     "Max delay in ms before forcing a DuckDB apply commit (0 disables).",
     nullptr, nullptr, 200, 0, ~0ULL, 0);
 
+static MYSQL_SYSVAR_ULONGLONG(
+    binlog_apply_parallel_workers, duckdb_binlog_apply_parallel_workers,
+    PLUGIN_VAR_RQCMDARG,
+    "Parallel apply workers per schema (1=disabled).",
+    nullptr, nullptr, 1, 1, 64, 0);
+
 static MYSQL_SYSVAR_ENUM(
     offload_default_mode, duckdb_offload_default_mode, PLUGIN_VAR_RQCMDARG,
     "Default offload mode for new sessions. Updates init_connect to set "
@@ -2182,6 +2191,7 @@ static SYS_VAR *duckdb_system_variables[] = {
     MYSQL_SYSVAR(binlog_apply_batch_rows),
     MYSQL_SYSVAR(binlog_apply_batch_bytes),
     MYSQL_SYSVAR(binlog_apply_batch_delay_ms),
+    MYSQL_SYSVAR(binlog_apply_parallel_workers),
     nullptr};
 
 static int show_duckdb_binlog_apply_paused(MYSQL_THD, SHOW_VAR *var, char *) {

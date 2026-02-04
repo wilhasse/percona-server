@@ -1391,6 +1391,7 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
   applier_options.batch_max_bytes = options.batch_max_bytes;
   applier_options.batch_max_delay =
       std::chrono::milliseconds(options.batch_max_delay_ms);
+  applier_options.parallel_workers = options.parallel_workers;
   applier_options.seed_gtid_set = gtid_set;  // Seed watermark with starting GTID set
 
   std::map<std::string, SchemaApplierState> schema_states;
