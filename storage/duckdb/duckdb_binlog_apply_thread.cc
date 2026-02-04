@@ -1459,7 +1459,8 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
 
       QueuedEvent queued;
       queued.event = std::move(event);
-      if (queued.event.type == BinlogEvent::Type::kWriteRows ||
+      if (queued.event.type == BinlogEvent::Type::kTableMap ||
+          queued.event.type == BinlogEvent::Type::kWriteRows ||
           queued.event.type == BinlogEvent::Type::kUpdateRows ||
           queued.event.type == BinlogEvent::Type::kDeleteRows) {
         const BinlogTableMap *map = streamer.GetTableMap(queued.event.table_id);

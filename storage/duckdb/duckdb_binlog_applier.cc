@@ -1523,36 +1523,41 @@ Status DuckDBBinlogApplier::FlushBuffered(bool force) {
         if (!buffer.inserts.rows.empty()) {
           RowBatch batch = std::move(buffer.inserts);
           if (batch.table.table.empty()) batch.table = table;
+          TableId batch_table = batch.table;
           st = adapter_->ApplyInsertDelta(
-              txn, batch.table, std::move(batch),
+              txn, batch_table, std::move(batch),
               DuckDBAdapter::InsertDeltaMode::kInsert);
           if (!st.ok()) goto fail;
         }
         if (!buffer.bulk_updates.old_rows.empty()) {
           BulkUpdateBatch batch = std::move(buffer.bulk_updates);
           if (batch.table.table.empty()) batch.table = table;
-          st = adapter_->ApplyBulkUpdates(txn, std::move(batch.table),
+          TableId batch_table = batch.table;
+          st = adapter_->ApplyBulkUpdates(txn, std::move(batch_table),
                                           std::move(batch));
           if (!st.ok()) goto fail;
         }
         if (!buffer.updates.statements.empty()) {
           UpdateBatch batch = std::move(buffer.updates);
           if (batch.table.table.empty()) batch.table = table;
-          st = adapter_->ApplyUpdates(txn, std::move(batch.table),
+          TableId batch_table = batch.table;
+          st = adapter_->ApplyUpdates(txn, std::move(batch_table),
                                       std::move(batch));
           if (!st.ok()) goto fail;
         }
         if (!buffer.bulk_deletes.old_rows.empty()) {
           BulkDeleteBatch batch = std::move(buffer.bulk_deletes);
           if (batch.table.table.empty()) batch.table = table;
-          st = adapter_->ApplyBulkDeletes(txn, std::move(batch.table),
+          TableId batch_table = batch.table;
+          st = adapter_->ApplyBulkDeletes(txn, std::move(batch_table),
                                           std::move(batch));
           if (!st.ok()) goto fail;
         }
         if (!buffer.deletes.statements.empty()) {
           DeleteBatch batch = std::move(buffer.deletes);
           if (batch.table.table.empty()) batch.table = table;
-          st = adapter_->ApplyDeletes(txn, std::move(batch.table),
+          TableId batch_table = batch.table;
+          st = adapter_->ApplyDeletes(txn, std::move(batch_table),
                                       std::move(batch));
           if (!st.ok()) goto fail;
         }
