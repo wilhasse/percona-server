@@ -120,6 +120,79 @@ DuckDBAdapter *PickLagAdapter(
   return nullptr;
 }
 
+#ifndef DUCKDB_APPLY_THREAD_TEST
+Status QuerySourceGtidExecuted(const BinlogApplyThreadOptions &options,
+                               MYSQL **mysql_conn,
+                               std::string *gtid_set) {
+  if (!mysql_conn || !gtid_set) {
+    return Status::Error(StatusCode::kInvalid, "GTID query output is null");
+  }
+  gtid_set->clear();
+
+  if (*mysql_conn == nullptr || mysql_ping(*mysql_conn) != 0) {
+    if (*mysql_conn != nullptr) {
+      mysql_close(*mysql_conn);
+      *mysql_conn = nullptr;
+    }
+    MYSQL *conn = mysql_init(nullptr);
+    if (!conn) {
+      return Status::Error(StatusCode::kInvalid, "mysql_init failed");
+    }
+    if (!mysql_real_connect(conn, options.host.c_str(), options.user.c_str(),
+                            options.password.empty()
+                                ? nullptr
+                                : options.password.c_str(),
+                            nullptr, options.port,
+                            options.socket.empty() ? nullptr
+                                                   : options.socket.c_str(),
+                            0)) {
+      const std::string msg = mysql_error(conn);
+      mysql_close(conn);
+      return Status::Error(StatusCode::kInvalid,
+                           "mysql_real_connect failed: " + msg);
+    }
+    *mysql_conn = conn;
+  }
+
+  constexpr const char *kQuery = "SELECT @@GLOBAL.GTID_EXECUTED";
+  if (mysql_real_query(*mysql_conn, kQuery, std::strlen(kQuery)) != 0) {
+    return Status::Error(StatusCode::kInvalid, mysql_error(*mysql_conn));
+  }
+  MYSQL_RES *res = mysql_store_result(*mysql_conn);
+  if (!res) {
+    return Status::Error(StatusCode::kInvalid, mysql_error(*mysql_conn));
+  }
+  MYSQL_ROW row = mysql_fetch_row(res);
+  if (row && row[0]) {
+    *gtid_set = row[0];
+  }
+  mysql_free_result(res);
+  return Status::Ok();
+}
+
+struct MysqlConnectionGuard {
+  explicit MysqlConnectionGuard(MYSQL **conn) : conn_(conn) {}
+  ~MysqlConnectionGuard() {
+    if (conn_ && *conn_) {
+      mysql_close(*conn_);
+      *conn_ = nullptr;
+    }
+  }
+
+ private:
+  MYSQL **conn_;
+};
+#else
+Status QuerySourceGtidExecuted(const BinlogApplyThreadOptions &,
+                               MYSQL **mysql_conn,
+                               std::string *gtid_set) {
+  if (mysql_conn) *mysql_conn = nullptr;
+  if (gtid_set) gtid_set->clear();
+  return Status::Error(StatusCode::kInvalid,
+                       "GTID query not available in test build");
+}
+#endif
+
 int SqlStartResultMetadata(void *, uint, uint, const CHARSET_INFO *) {
   return 0;
 }
@@ -1304,13 +1377,18 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
   std::string current_log_file;
   uint64_t current_log_pos = 0;
   uint64_t last_gtid_lag_update_ms = 0;
+  MYSQL *gtid_mysql = nullptr;
+#ifndef DUCKDB_APPLY_THREAD_TEST
+  MysqlConnectionGuard gtid_mysql_guard(&gtid_mysql);
+#endif
 
   while (!stop_flag->load()) {
     if (use_gtid) {
       const uint64_t now_ms = NowEpochMs();
       if (now_ms - last_gtid_lag_update_ms >= kGtidLagUpdateIntervalMs) {
-        std::string source_gtid_set;
-        Status gtid_st = streamer.QuerySourceGtidExecuted(&source_gtid_set);
+        source_gtid_set.clear();
+        Status gtid_st =
+            QuerySourceGtidExecuted(options, &gtid_mysql, &source_gtid_set);
         if (!gtid_st.ok()) {
           sql_print_warning(
               "DuckDB binlog applier: failed to query source GTID_EXECUTED: %s",
