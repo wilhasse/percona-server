@@ -171,6 +171,7 @@ class DuckDBBinlogApplier {
   size_t buffered_bytes_{0};
   std::map<TableKey, TableBuffer> buffers_;
   std::set<TableKey> insert_delta_tables_;
+  std::set<TableKey> delta_tables_;
 };
 
 }  // namespace duckdb_se

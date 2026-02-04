@@ -1669,7 +1669,7 @@ Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
     RowBatch insert_batch;
     insert_batch.table = table;
     insert_batch.rows = std::move(batch.new_rows);
-    st = AppendRows(txn, std::move(table), std::move(insert_batch));
+    st = ApplyInsertDelta(txn, table, std::move(insert_batch));
     if (!st.ok()) return st;
   } catch (const std::exception &ex) {
     return Status::Error(StatusCode::kDuckDBError, ex.what());
@@ -1803,6 +1803,31 @@ Status DuckDBAdapter::CleanupInsertDeltaTables(
     duckdb::Connection conn(*db_);
     for (const auto &table : tables) {
       TableId delta{table.schema, InsertDeltaTableName(table)};
+      const std::string sql =
+          "DROP TABLE IF EXISTS " + QualifiedName(delta);
+      auto result = conn.Query(sql);
+      if (result->HasError()) {
+        return Status::Error(StatusCode::kDuckDBError, result->GetError());
+      }
+    }
+  } catch (const std::exception &ex) {
+    return Status::Error(StatusCode::kDuckDBError, ex.what());
+  }
+  return Status::Ok();
+}
+
+Status DuckDBAdapter::CleanupDeltaTables(const std::vector<TableId> &tables) {
+  if (tables.empty()) {
+    return Status::Ok();
+  }
+  if (!db_) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "DuckDBAdapter not initialized");
+  }
+  try {
+    duckdb::Connection conn(*db_);
+    for (const auto &table : tables) {
+      TableId delta{table.schema, DeltaTableName(table)};
       const std::string sql =
           "DROP TABLE IF EXISTS " + QualifiedName(delta);
       auto result = conn.Query(sql);

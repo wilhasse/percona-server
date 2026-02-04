@@ -186,6 +186,7 @@ class DuckDBAdapter {
   Status ApplyBulkDeletes(ApplyTxn &txn, TableId table, BulkDeleteBatch batch);
   Status CloseAppenders(ApplyTxn &txn);
   Status CleanupInsertDeltaTables(const std::vector<TableId> &tables);
+  Status CleanupDeltaTables(const std::vector<TableId> &tables);
   Status CommitApplyTxn(ApplyTxn &txn);
   Status RollbackApplyTxn(ApplyTxn &txn);
 
