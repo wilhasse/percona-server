@@ -1495,6 +1495,7 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
   applier_options.seed_gtid_set = gtid_set;  // Seed watermark with starting GTID set
 
   std::map<std::string, SchemaApplierState> schema_states;
+  std::map<uint64_t, BinlogTableMap> table_map_cache;
   std::string current_gtid;
   bool txn_open = false;
   std::string current_log_file;
@@ -1590,13 +1591,20 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
           txn_open = true;
           current_gtid.clear();
         }
-        if (!queued.has_table_map || queued.table_map.table.empty()) {
-          loop_status = Status::Error(StatusCode::kInvalid,
-                                      "Missing table map for row event");
-          had_error = true;
-          break;
+        const BinlogTableMap *map = nullptr;
+        if (queued.has_table_map && !queued.table_map.table.empty()) {
+          map = &queued.table_map;
+        } else {
+          auto it = table_map_cache.find(event.table_id);
+          if (it != table_map_cache.end()) {
+            map = &it->second;
+          } else {
+            loop_status = Status::Error(StatusCode::kInvalid,
+                                        "Missing table map for row event");
+            had_error = true;
+            break;
+          }
         }
-        const BinlogTableMap *map = &queued.table_map;
         if (!ShouldApplySchema(map->schema, options.schema_filter)) {
           break;
         }
@@ -1641,6 +1649,20 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
         } else {
           txn_open = false;
           current_gtid.clear();
+        }
+        break;
+      }
+      case BinlogEvent::Type::kTableMap: {
+        BinlogTableMap map;
+        if (queued.has_table_map) {
+          map = queued.table_map;
+        } else {
+          map.table_id = event.table_id;
+          map.schema = event.schema;
+          map.table = event.table;
+        }
+        if (map.table_id != 0 && !map.table.empty()) {
+          table_map_cache[map.table_id] = std::move(map);
         }
         break;
       }
