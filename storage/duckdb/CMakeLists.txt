@@ -82,9 +82,21 @@ if(NOT WITHOUT_DUCKDB_SE_STORAGE_ENGINE)
     target_include_directories(duckdb_se PRIVATE
       ${DUCKDB_SOURCE_DIR}/src/include
       )
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      # Enforce TLS model on the plugin target, even if the subdir was cached.
+      target_compile_options(duckdb_se PRIVATE ${DUCKDB_TLS_MODEL_FLAG})
+    endif()
   endif()
 
   if(TARGET duckdb_static)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      # Enforce TLS model on DuckDB static libs and extensions.
+      foreach(duckdb_tls_target duckdb_static duckdb_generated_extension_loader core_functions_extension)
+        if(TARGET ${duckdb_tls_target})
+          target_compile_options(${duckdb_tls_target} PRIVATE ${DUCKDB_TLS_MODEL_FLAG})
+        endif()
+      endforeach()
+    endif()
     MYSQL_ADD_EXECUTABLE(duckdb_bench
       duckdb_bench.cc
       duckdb_adapter.cc
@@ -110,5 +122,9 @@ if(NOT WITHOUT_DUCKDB_SE_STORAGE_ENGINE)
     TARGET_INCLUDE_DIRECTORIES(duckdb_snapshot_loader PRIVATE
       ${DUCKDB_SOURCE_DIR}/src/include
     )
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      target_compile_options(duckdb_bench PRIVATE ${DUCKDB_TLS_MODEL_FLAG})
+      target_compile_options(duckdb_snapshot_loader PRIVATE ${DUCKDB_TLS_MODEL_FLAG})
+    endif()
   endif()
 endif()
