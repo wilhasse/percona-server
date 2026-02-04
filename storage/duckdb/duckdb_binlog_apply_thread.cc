@@ -1194,6 +1194,17 @@ Status CommitActiveTransactions(
   return Status::Ok();
 }
 
+void RollbackActiveTransactions(
+    std::map<std::string, SchemaApplierState> *states) {
+  if (!states) return;
+  for (auto &entry : *states) {
+    auto &state = entry.second;
+    if (!state.txn_active || !state.applier) continue;
+    (void)state.applier->RollbackTransaction();
+    state.txn_active = false;
+  }
+}
+
 Status ApplyRowEvent(const BinlogEvent &event, const BinlogTableMap &map,
                      const BinlogApplyThreadOptions &options,
                      SchemaApplierState &state, const std::string &gtid) {
@@ -1434,6 +1445,7 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
         continue;
       }
+      RollbackActiveTransactions(&schema_states);
       return st;
     }
 
@@ -1447,7 +1459,10 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
         if (txn_open) {
           st = CommitActiveTransactions(&schema_states, current_log_file,
                                         current_log_pos);
-          if (!st.ok()) return st;
+          if (!st.ok()) {
+            RollbackActiveTransactions(&schema_states);
+            return st;
+          }
         }
         current_gtid = event.gtid;
         txn_open = true;
@@ -1475,9 +1490,15 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
         SchemaApplierState *state = nullptr;
         st = EnsureSchemaApplier(map->schema, options, applier_options,
                                  &schema_states, &state);
-        if (!st.ok()) return st;
+        if (!st.ok()) {
+          RollbackActiveTransactions(&schema_states);
+          return st;
+        }
         st = ApplyRowEvent(event, *map, options, *state, current_gtid);
-        if (!st.ok()) return st;
+        if (!st.ok()) {
+          RollbackActiveTransactions(&schema_states);
+          return st;
+        }
         break;
       }
       case BinlogEvent::Type::kQuery: {
@@ -1490,13 +1511,19 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
         }
         st = ApplyDdlEvent(event, options, applier_options, &schema_states,
                            current_gtid);
-        if (!st.ok()) return st;
+        if (!st.ok()) {
+          RollbackActiveTransactions(&schema_states);
+          return st;
+        }
         break;
       }
       case BinlogEvent::Type::kXid: {
         st = CommitActiveTransactions(&schema_states, current_log_file,
                                       current_log_pos);
-        if (!st.ok()) return st;
+        if (!st.ok()) {
+          RollbackActiveTransactions(&schema_states);
+          return st;
+        }
         txn_open = false;
         current_gtid.clear();
         break;
