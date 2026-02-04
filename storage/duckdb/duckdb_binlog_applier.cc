@@ -1652,4 +1652,8 @@ void DuckDBBinlogApplier::ResetBatchState() {
   batch_start_time_ = std::chrono::steady_clock::time_point{};
 }
 
+bool DuckDBBinlogApplier::ApplyTxnActive() const {
+  return apply_txn_.active;
+}
+
 }  // namespace duckdb_se

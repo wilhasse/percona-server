@@ -1041,8 +1041,10 @@ Status ApplyDdlEvent(const BinlogEvent &event,
   }
 
   if (!state->txn_active) {
-    st = EnsureSchemaVersionFresh(state);
-    if (!st.ok()) return st;
+    if (!state->applier || !state->applier->ApplyTxnActive()) {
+      st = EnsureSchemaVersionFresh(state);
+      if (!st.ok()) return st;
+    }
     st = state->applier->BeginTransaction(Gtid{gtid});
     if (!st.ok()) return st;
     state->txn_active = true;
@@ -1202,6 +1204,9 @@ void RollbackActiveTransactions(
     if (!state.txn_active || !state.applier) continue;
     (void)state.applier->RollbackTransaction();
     state.txn_active = false;
+    state.schema_version = 0;
+    state.schema_version_loaded = false;
+    state.known_tables.clear();
   }
 }
 
