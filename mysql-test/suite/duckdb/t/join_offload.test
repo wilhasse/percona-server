@@ -45,16 +45,41 @@ ALTER TABLE dim SECONDARY_LOAD;
 ALTER TABLE fact SECONDARY_LOAD;
 --enable_query_log
 
+CREATE TABLE join_offload_result (
+  name VARCHAR(20),
+  c BIGINT,
+  total BIGINT
+) ENGINE=InnoDB;
+
+CREATE TABLE join_mysql_result LIKE join_offload_result;
+
 --let $se_before=`SELECT VARIABLE_VALUE FROM performance_schema.session_status WHERE VARIABLE_NAME='Secondary_engine_execution_count'`
-SELECT d.name, COUNT(*) AS c, SUM(f.amount) AS total
-  FROM fact f JOIN dim d ON f.dim_id = d.id
-  GROUP BY d.name
-  ORDER BY d.name;
+INSERT INTO join_offload_result
+  SELECT d.name, COUNT(*) AS c, SUM(f.amount) AS total
+    FROM fact f JOIN dim d ON f.dim_id = d.id
+    GROUP BY d.name
+    ORDER BY d.name;
 --let $se_after=`SELECT VARIABLE_VALUE FROM performance_schema.session_status WHERE VARIABLE_NAME='Secondary_engine_execution_count'`
 --disable_query_log
 --let $se_delta= $se_after - $se_before
 --enable_query_log
 --eval SELECT $se_delta AS se_delta;
+
+SET @@session.use_secondary_engine = OFF;
+INSERT INTO join_mysql_result
+  SELECT d.name, COUNT(*) AS c, SUM(f.amount) AS total
+    FROM fact f JOIN dim d ON f.dim_id = d.id
+    GROUP BY d.name
+    ORDER BY d.name;
+
+SELECT /*+ SET_VAR(use_secondary_engine=OFF) */ d.name, COUNT(*) AS c, SUM(f.amount) AS total
+  FROM fact f JOIN dim d ON f.dim_id = d.id
+  GROUP BY d.name
+  ORDER BY d.name;
+
+SET @@session.use_secondary_engine = ON;
+--let $diff_tables=duckdb_join.join_offload_result, duckdb_join.join_mysql_result
+--source include/diff_tables.inc
 
 --let $se_before=`SELECT VARIABLE_VALUE FROM performance_schema.session_status WHERE VARIABLE_NAME='Secondary_engine_execution_count'`
 SELECT d.label, COUNT(*) AS c

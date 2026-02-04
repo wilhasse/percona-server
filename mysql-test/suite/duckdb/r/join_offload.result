@@ -1,4 +1,24 @@
+CREATE TABLE join_offload_result (
+name VARCHAR(20),
+c BIGINT,
+total BIGINT
+) ENGINE=InnoDB;
+CREATE TABLE join_mysql_result LIKE join_offload_result;
+INSERT INTO join_offload_result
 SELECT d.name, COUNT(*) AS c, SUM(f.amount) AS total
+FROM fact f JOIN dim d ON f.dim_id = d.id
+GROUP BY d.name
+ORDER BY d.name;
+SELECT 1 - 0 AS se_delta;;
+se_delta
+1
+SET @@session.use_secondary_engine = OFF;
+INSERT INTO join_mysql_result
+SELECT d.name, COUNT(*) AS c, SUM(f.amount) AS total
+FROM fact f JOIN dim d ON f.dim_id = d.id
+GROUP BY d.name
+ORDER BY d.name;
+SELECT /*+ SET_VAR(use_secondary_engine=OFF) */ d.name, COUNT(*) AS c, SUM(f.amount) AS total
 FROM fact f JOIN dim d ON f.dim_id = d.id
 GROUP BY d.name
 ORDER BY d.name;
@@ -6,9 +26,8 @@ name	c	total
 Alpha	2	30
 Beta	1	5
 Gamma	2	16
-SELECT 1 - 0 AS se_delta;;
-se_delta
-1
+SET @@session.use_secondary_engine = ON;
+include/diff_tables.inc [duckdb_join.join_offload_result, duckdb_join.join_mysql_result]
 SELECT d.label, COUNT(*) AS c
 FROM fact f JOIN dim_unloaded d ON f.dim_id = d.id
 GROUP BY d.label
