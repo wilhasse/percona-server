@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -168,6 +169,7 @@ class DuckDBBinlogApplier {
   size_t buffered_rows_{0};
   size_t buffered_bytes_{0};
   std::map<TableKey, TableBuffer> buffers_;
+  std::set<TableKey> insert_delta_tables_;
 };
 
 }  // namespace duckdb_se

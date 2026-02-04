@@ -808,6 +808,7 @@ Status DuckDBBinlogApplier::AppendInsertRows(TableId table, RowBatch batch) {
   buffer.byte_count += bytes_added;
   buffered_rows_ += rows_added;
   buffered_bytes_ += bytes_added;
+  insert_delta_tables_.insert(key);
 
   return FlushBuffered(false);
 }
@@ -1229,6 +1230,7 @@ Status DuckDBBinlogApplier::CommitTransaction() {
   in_txn_ = false;
   txn_has_ddl_ = false;
   ResetBatchState();
+  insert_delta_tables_.clear();
   ResetBuffers();
   return Status::Ok();
 }
@@ -1245,11 +1247,21 @@ Status DuckDBBinlogApplier::RollbackTransaction() {
     st = adapter_->RollbackApplyTxn(apply_txn_);
   }
 
+  if (!insert_delta_tables_.empty()) {
+    std::vector<TableId> tables;
+    tables.reserve(insert_delta_tables_.size());
+    for (const auto &key : insert_delta_tables_) {
+      tables.push_back(TableId{key.schema, key.table});
+    }
+    (void)adapter_->CleanupInsertDeltaTables(tables);
+  }
+
   apply_txn_ = ApplyTxn{};
   in_txn_ = false;
   skip_txn_ = false;
   txn_has_ddl_ = false;
   ResetBatchState();
+  insert_delta_tables_.clear();
   ResetBuffers();
   return st;
 }
@@ -1293,7 +1305,7 @@ Status DuckDBBinlogApplier::FlushBuffered(bool force) {
     if (!buffer.inserts.rows.empty()) {
       RowBatch batch = std::move(buffer.inserts);
       TableId table = batch.table;  // Copy before move to avoid UB
-      st = adapter_->AppendRows(apply_txn_, std::move(table), std::move(batch));
+      st = adapter_->ApplyInsertDelta(apply_txn_, table, std::move(batch));
       if (!st.ok()) return st;
     }
     if (!buffer.bulk_updates.old_rows.empty()) {

@@ -179,11 +179,13 @@ class DuckDBAdapter {
 
   ApplyTxn BeginApplyTxn(Gtid gtid);
   Status AppendRows(ApplyTxn &txn, TableId table, RowBatch batch);
+  Status ApplyInsertDelta(ApplyTxn &txn, TableId table, RowBatch batch);
   Status ApplyUpdates(ApplyTxn &txn, TableId table, UpdateBatch batch);
   Status ApplyDeletes(ApplyTxn &txn, TableId table, DeleteBatch batch);
   Status ApplyBulkUpdates(ApplyTxn &txn, TableId table, BulkUpdateBatch batch);
   Status ApplyBulkDeletes(ApplyTxn &txn, TableId table, BulkDeleteBatch batch);
   Status CloseAppenders(ApplyTxn &txn);
+  Status CleanupInsertDeltaTables(const std::vector<TableId> &tables);
   Status CommitApplyTxn(ApplyTxn &txn);
   Status RollbackApplyTxn(ApplyTxn &txn);
 
@@ -208,7 +210,9 @@ class DuckDBAdapter {
   Status CopyTableOn(duckdb::Connection &conn, TableId source,
                      const MySQLTableDef &target_def, bool manage_txn);
   Status EnsureDeltaTable(duckdb::Connection &conn, TableId table);
+  Status EnsureInsertDeltaTable(duckdb::Connection &conn, TableId table);
   std::string DeltaTableName(const TableId &table) const;
+  std::string InsertDeltaTableName(const TableId &table) const;
   Status RenameTable(TableId from, TableId to);
   Status TruncateTable(TableId table);
  Status CopyTable(TableId source, const MySQLTableDef &target_def);

@@ -768,6 +768,10 @@ std::string DuckDBAdapter::DeltaTableName(const TableId &table) const {
   return "__delta_" + table.table;
 }
 
+std::string DuckDBAdapter::InsertDeltaTableName(const TableId &table) const {
+  return "__delta_insert_" + table.table;
+}
+
 Status DuckDBAdapter::EnsureDeltaTable(duckdb::Connection &conn,
                                        TableId table) {
   if (table.table.empty()) {
@@ -783,6 +787,34 @@ Status DuckDBAdapter::EnsureDeltaTable(duckdb::Connection &conn,
 
   std::string sql = "CREATE TABLE IF NOT EXISTS ";
   TableId delta{table.schema, DeltaTableName(table)};
+  sql += QualifiedName(delta);
+  sql += " (";
+  for (size_t i = 0; i < columns.size(); ++i) {
+    const std::string type =
+        columns[i].type.empty() ? "VARCHAR" : columns[i].type;
+    sql += QuoteIdent(columns[i].name) + " " + type;
+    if (i + 1 < columns.size()) sql += ", ";
+  }
+  sql += ")";
+
+  return ExecuteDDLOn(conn, sql);
+}
+
+Status DuckDBAdapter::EnsureInsertDeltaTable(duckdb::Connection &conn,
+                                             TableId table) {
+  if (table.table.empty()) {
+    return Status::Error(StatusCode::kInvalid, "Missing table name");
+  }
+
+  std::vector<ColumnInfo> columns;
+  Status st = GetTableInfoOn(conn, table, &columns);
+  if (!st.ok()) return st;
+  if (columns.empty()) {
+    return Status::Error(StatusCode::kInvalid, "No columns for insert delta");
+  }
+
+  std::string sql = "CREATE TABLE IF NOT EXISTS ";
+  TableId delta{table.schema, InsertDeltaTableName(table)};
   sql += QualifiedName(delta);
   sql += " (";
   for (size_t i = 0; i < columns.size(); ++i) {
@@ -1456,6 +1488,70 @@ Status DuckDBAdapter::AppendRows(ApplyTxn &txn, TableId table, RowBatch batch) {
   return Status::Ok();
 }
 
+Status DuckDBAdapter::ApplyInsertDelta(ApplyTxn &txn, TableId table,
+                                       RowBatch batch) {
+  if (!txn.active || !txn.conn) {
+    return Status::Error(StatusCode::kInvalid, "Apply transaction not active");
+  }
+  if (batch.rows.empty()) {
+    return Status::Ok();
+  }
+
+  Status st = EnsureInsertDeltaTable(*txn.conn, table);
+  if (!st.ok()) return st;
+
+  TableId delta{table.schema, InsertDeltaTableName(table)};
+  // Append into insert-delta table for idempotent merge.
+  st = AppendRows(txn, delta, std::move(batch));
+  if (!st.ok()) return st;
+
+  std::vector<std::string> columns;
+  st = GetTableColumnsOn(*txn.conn, table, &columns);
+  if (!st.ok()) return st;
+  if (columns.empty()) {
+    return Status::Error(StatusCode::kInvalid, "No columns for insert merge");
+  }
+
+  std::vector<std::string> pk_columns;
+  st = GetPrimaryKeyColumnsOn(*txn.conn, table, &pk_columns);
+  if (!st.ok()) return st;
+
+  const std::string target = QualifiedName(table);
+  const std::string delta_name = QualifiedName(delta);
+
+  std::ostringstream sql;
+  sql << "INSERT INTO " << target << " (";
+  for (size_t i = 0; i < columns.size(); ++i) {
+    sql << QuoteIdent(columns[i]);
+    if (i + 1 < columns.size()) sql << ", ";
+  }
+  sql << ") SELECT ";
+  for (size_t i = 0; i < columns.size(); ++i) {
+    sql << "d." << QuoteIdent(columns[i]);
+    if (i + 1 < columns.size()) sql << ", ";
+  }
+  sql << " FROM " << delta_name << " d";
+  if (!pk_columns.empty()) {
+    sql << " WHERE NOT EXISTS (SELECT 1 FROM " << target << " t WHERE ";
+    for (size_t i = 0; i < pk_columns.size(); ++i) {
+      if (i > 0) sql << " AND ";
+      sql << "t." << QuoteIdent(pk_columns[i]) << " IS NOT DISTINCT FROM "
+          << "d." << QuoteIdent(pk_columns[i]);
+    }
+    sql << ")";
+  }
+
+  auto result = txn.conn->Query(sql.str());
+  if (result->HasError()) {
+    return Status::Error(StatusCode::kDuckDBError, result->GetError());
+  }
+
+  const std::string cleanup_sql = "DELETE FROM " + delta_name;
+  st = ExecuteDDLOn(*txn.conn, cleanup_sql);
+  if (!st.ok()) return st;
+  return Status::Ok();
+}
+
 Status DuckDBAdapter::ApplyUpdates(ApplyTxn &txn, TableId,
                                   UpdateBatch batch) {
   if (!txn.active || !txn.conn) {
@@ -1688,6 +1784,32 @@ Status DuckDBAdapter::CloseAppenders(ApplyTxn &txn) {
       }
     }
     txn.appenders.clear();
+  } catch (const std::exception &ex) {
+    return Status::Error(StatusCode::kDuckDBError, ex.what());
+  }
+  return Status::Ok();
+}
+
+Status DuckDBAdapter::CleanupInsertDeltaTables(
+    const std::vector<TableId> &tables) {
+  if (tables.empty()) {
+    return Status::Ok();
+  }
+  if (!db_) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "DuckDBAdapter not initialized");
+  }
+  try {
+    duckdb::Connection conn(*db_);
+    for (const auto &table : tables) {
+      TableId delta{table.schema, InsertDeltaTableName(table)};
+      const std::string sql =
+          "DROP TABLE IF EXISTS " + QualifiedName(delta);
+      auto result = conn.Query(sql);
+      if (result->HasError()) {
+        return Status::Error(StatusCode::kDuckDBError, result->GetError());
+      }
+    }
   } catch (const std::exception &ex) {
     return Status::Error(StatusCode::kDuckDBError, ex.what());
   }
