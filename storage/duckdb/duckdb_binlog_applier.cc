@@ -195,6 +195,41 @@ Status LoadWatermarkGtidSet(duckdb::Connection &conn, std::string *out_set) {
   return Status::Ok();
 }
 
+Status ReadReplSchemaVersion(duckdb::Connection &conn, int64_t *version,
+                             bool *found) {
+  if (!version || !found) {
+    return Status::Error(StatusCode::kInvalid,
+                         "Schema version output is null");
+  }
+  *version = 0;
+  *found = false;
+  auto result = conn.Query(
+      "SELECT schema_version FROM __repl_state WHERE channel = '" +
+      std::string(kReplChannel) + "' LIMIT 1");
+  if (result->HasError()) {
+    return Status::Error(StatusCode::kDuckDBError, result->GetError());
+  }
+  auto chunk = result->Fetch();
+  if (!chunk || chunk->size() == 0) {
+    return Status::Ok();
+  }
+  auto val = chunk->GetValue(0, 0);
+  if (val.IsNull()) {
+    return Status::Ok();
+  }
+  const std::string value = val.ToString();
+  if (value.empty()) {
+    return Status::Ok();
+  }
+  try {
+    *version = std::stoll(value);
+    *found = true;
+  } catch (const std::exception &ex) {
+    return Status::Error(StatusCode::kInvalid, ex.what());
+  }
+  return Status::Ok();
+}
+
 Status UpdateSchemaVersion(duckdb::Connection &conn) {
   std::string error;
   if (!EnsureReplStateTable(conn, &error)) {
@@ -1623,6 +1658,15 @@ Status DuckDBBinlogApplier::ApplyWatermark() {
   bool found = repl_state_found_;
   std::string snapshot = repl_snapshot_set_;
   std::string applied_set = repl_applied_set_;
+  int64_t schema_version = 0;
+  bool schema_found = false;
+  if (found) {
+    Status st = ReadReplSchemaVersion(*apply_txn_.conn, &schema_version,
+                                      &schema_found);
+    if (!st.ok()) return st;
+  }
+  const std::string schema_sql =
+      schema_found ? std::to_string(schema_version) : "NULL";
 
   const std::string commit_ts = GetCurrentTimestampString();
   std::string sql;
@@ -1698,11 +1742,12 @@ Status DuckDBBinlogApplier::ApplyWatermark() {
       const std::string snapshot_sql =
           snapshot.empty() ? "''" : "'" + EscapeLiteral(snapshot) + "'";
       std::string insert_cols =
-          "channel, snapshot_gtid_set, applied_gtid_set, last_commit_ts";
+          "channel, snapshot_gtid_set, applied_gtid_set, last_commit_ts, "
+          "schema_version";
       std::string insert_vals = "'" + std::string(kReplChannel) + "', " +
                                 snapshot_sql + ", '" +
                                 EscapeLiteral(merged_set) + "', '" +
-                                EscapeLiteral(commit_ts) + "'";
+                                EscapeLiteral(commit_ts) + "', " + schema_sql;
       if (update_binlog) {
         insert_cols += ", binlog_file, binlog_pos";
         insert_vals += ", '" + EscapeLiteral(current_binlog_file_) + "', " +
