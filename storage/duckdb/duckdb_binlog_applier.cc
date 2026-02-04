@@ -1315,7 +1315,8 @@ Status DuckDBBinlogApplier::FlushBuffered(bool force) {
     if (!buffer.inserts.rows.empty()) {
       RowBatch batch = std::move(buffer.inserts);
       TableId table = batch.table;  // Copy before move to avoid UB
-      st = adapter_->ApplyInsertDelta(apply_txn_, table, std::move(batch));
+      st = adapter_->ApplyInsertDelta(apply_txn_, table, std::move(batch),
+                                      DuckDBAdapter::InsertDeltaMode::kInsert);
       if (!st.ok()) return st;
     }
     if (!buffer.bulk_updates.old_rows.empty()) {

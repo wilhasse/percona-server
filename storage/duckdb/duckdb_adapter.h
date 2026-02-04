@@ -178,8 +178,10 @@ class DuckDBAdapter {
   Status ApplyDDLInTxn(ApplyTxn &txn, DDLChange change);
 
   ApplyTxn BeginApplyTxn(Gtid gtid);
+  enum class InsertDeltaMode { kInsert, kUpsert };
   Status AppendRows(ApplyTxn &txn, TableId table, RowBatch batch);
-  Status ApplyInsertDelta(ApplyTxn &txn, TableId table, RowBatch batch);
+  Status ApplyInsertDelta(ApplyTxn &txn, TableId table, RowBatch batch,
+                          InsertDeltaMode mode = InsertDeltaMode::kInsert);
   Status ApplyUpdates(ApplyTxn &txn, TableId table, UpdateBatch batch);
   Status ApplyDeletes(ApplyTxn &txn, TableId table, DeleteBatch batch);
   Status ApplyBulkUpdates(ApplyTxn &txn, TableId table, BulkUpdateBatch batch);

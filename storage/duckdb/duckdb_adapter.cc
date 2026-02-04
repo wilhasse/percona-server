@@ -1489,7 +1489,7 @@ Status DuckDBAdapter::AppendRows(ApplyTxn &txn, TableId table, RowBatch batch) {
 }
 
 Status DuckDBAdapter::ApplyInsertDelta(ApplyTxn &txn, TableId table,
-                                       RowBatch batch) {
+                                       RowBatch batch, InsertDeltaMode mode) {
   if (!txn.active || !txn.conn) {
     return Status::Error(StatusCode::kInvalid, "Apply transaction not active");
   }
@@ -1531,14 +1531,15 @@ Status DuckDBAdapter::ApplyInsertDelta(ApplyTxn &txn, TableId table,
     if (i + 1 < columns.size()) sql << ", ";
   }
   sql << " FROM " << delta_name << " d";
-  if (!pk_columns.empty()) {
-    sql << " WHERE NOT EXISTS (SELECT 1 FROM " << target << " t WHERE ";
-    for (size_t i = 0; i < pk_columns.size(); ++i) {
-      if (i > 0) sql << " AND ";
-      sql << "t." << QuoteIdent(pk_columns[i]) << " IS NOT DISTINCT FROM "
-          << "d." << QuoteIdent(pk_columns[i]);
+  if (mode == InsertDeltaMode::kUpsert) {
+    sql << " ON CONFLICT DO UPDATE SET ";
+    for (size_t i = 0; i < columns.size(); ++i) {
+      if (i > 0) sql << ", ";
+      const std::string col = QuoteIdent(columns[i]);
+      sql << col << " = excluded." << col;
     }
-    sql << ")";
+  } else {
+    sql << " ON CONFLICT DO NOTHING";
   }
 
   auto result = txn.conn->Query(sql.str());
@@ -1669,7 +1670,8 @@ Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
     RowBatch insert_batch;
     insert_batch.table = table;
     insert_batch.rows = std::move(batch.new_rows);
-    st = ApplyInsertDelta(txn, table, std::move(insert_batch));
+    st = ApplyInsertDelta(txn, table, std::move(insert_batch),
+                          InsertDeltaMode::kUpsert);
     if (!st.ok()) return st;
   } catch (const std::exception &ex) {
     return Status::Error(StatusCode::kDuckDBError, ex.what());
