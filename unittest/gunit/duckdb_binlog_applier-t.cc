@@ -35,6 +35,9 @@
 #include "storage/duckdb/duckdb_binlog_applier.h"
 #include "storage/duckdb/duckdb_gtid_utils.h"
 
+// Stub server logger for gunit link; the real implementation lives in mysqld.
+int log_message(int, ...) { return 0; }
+
 #ifdef _WIN32
 #include <process.h>
 #else
