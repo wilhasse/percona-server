@@ -26,8 +26,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -74,6 +76,57 @@ struct SchemaApplierState {
   std::unordered_set<std::string> known_tables;
 };
 
+struct QueuedEvent {
+  BinlogEvent event;
+  BinlogTableMap table_map;
+  bool has_table_map{false};
+  Status status;
+  bool has_status{false};
+};
+
+class EventQueue {
+ public:
+  explicit EventQueue(size_t capacity) : capacity_(capacity) {}
+
+  bool Push(QueuedEvent item) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_not_full_.wait(lock,
+                      [&]() { return closed_ || queue_.size() < capacity_; });
+    if (closed_) return false;
+    queue_.push_back(std::move(item));
+    cv_not_empty_.notify_one();
+    return true;
+  }
+
+  bool Pop(QueuedEvent *out) {
+    if (!out) return false;
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_not_empty_.wait(lock, [&]() { return closed_ || !queue_.empty(); });
+    if (queue_.empty()) return false;
+    *out = std::move(queue_.front());
+    queue_.pop_front();
+    cv_not_full_.notify_one();
+    return true;
+  }
+
+  void Close() {
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      closed_ = true;
+    }
+    cv_not_empty_.notify_all();
+    cv_not_full_.notify_all();
+  }
+
+ private:
+  size_t capacity_{0};
+  bool closed_{false};
+  std::mutex mutex_;
+  std::condition_variable cv_not_empty_;
+  std::condition_variable cv_not_full_;
+  std::deque<QueuedEvent> queue_;
+};
+
 struct ApplyThreadState {
   std::thread worker;
   std::atomic<bool> stop{false};
@@ -102,6 +155,7 @@ struct SqlExecContext {
 };
 
 constexpr uint64_t kGtidLagUpdateIntervalMs = 5000;
+constexpr size_t kEventQueueCapacity = 4096;
 
 uint64_t NowEpochMs() {
   return static_cast<uint64_t>(
@@ -1384,6 +1438,44 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
   }
   sql_print_information("DuckDB binlog applier: Stream opened successfully");
 
+  EventQueue queue(kEventQueueCapacity);
+  auto reader_loop = [&]() {
+    while (!stop_flag->load()) {
+      BinlogEvent event;
+      Status read_st = streamer.NextEvent(&event);
+      if (!read_st.ok()) {
+        if (stop_flag->load()) break;
+        if (read_st.code == StatusCode::kInvalid &&
+            read_st.message == "No binlog data available") {
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+          continue;
+        }
+        QueuedEvent queued;
+        queued.status = read_st;
+        queued.has_status = true;
+        queue.Push(std::move(queued));
+        break;
+      }
+
+      QueuedEvent queued;
+      queued.event = std::move(event);
+      if (queued.event.type == BinlogEvent::Type::kWriteRows ||
+          queued.event.type == BinlogEvent::Type::kUpdateRows ||
+          queued.event.type == BinlogEvent::Type::kDeleteRows) {
+        const BinlogTableMap *map = streamer.GetTableMap(queued.event.table_id);
+        if (map) {
+          queued.table_map = *map;
+          queued.has_table_map = true;
+        }
+      }
+      if (!queue.Push(std::move(queued))) {
+        break;
+      }
+    }
+    queue.Close();
+  };
+  std::thread reader(reader_loop);
+
   DuckDBBinlogApplier::Options applier_options;
   applier_options.use_gtid = use_gtid;
   applier_options.batch_max_gtids = options.batch_max_gtids;
@@ -1405,6 +1497,8 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
   MysqlConnectionGuard gtid_mysql_guard(&gtid_mysql);
 #endif
 
+  Status loop_status = Status::Ok();
+  bool had_error = false;
   while (!stop_flag->load()) {
     if (use_gtid) {
       const uint64_t now_ms = NowEpochMs();
@@ -1442,19 +1536,21 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
       }
     }
 
-    BinlogEvent event;
-    st = streamer.NextEvent(&event);
-    if (!st.ok()) {
+    QueuedEvent queued;
+    if (!queue.Pop(&queued)) {
       if (stop_flag->load()) break;
-      if (st.code == StatusCode::kInvalid &&
-          st.message == "No binlog data available") {
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        continue;
-      }
-      RollbackActiveTransactions(&schema_states);
-      return st;
+      loop_status = Status::Error(StatusCode::kInvalid,
+                                  "Binlog reader stopped unexpectedly");
+      had_error = true;
+      break;
+    }
+    if (queued.has_status) {
+      loop_status = queued.status;
+      had_error = true;
+      break;
     }
 
+    BinlogEvent &event = queued.event;
     if (!event.log_file.empty() && event.log_pos > 0) {
       current_log_file = event.log_file;
       current_log_pos = event.log_pos;
@@ -1466,10 +1562,11 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
           st = CommitActiveTransactions(&schema_states, current_log_file,
                                         current_log_pos);
           if (!st.ok()) {
-            RollbackActiveTransactions(&schema_states);
-            return st;
+            loop_status = st;
+            had_error = true;
           }
         }
+        if (had_error) break;
         current_gtid = event.gtid;
         txn_open = true;
         break;
@@ -1485,11 +1582,11 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
           txn_open = true;
           current_gtid.clear();
         }
-        const BinlogTableMap *map = streamer.GetTableMap(event.table_id);
-        if (!map) {
+        if (!queued.has_table_map) {
           sql_print_warning("DuckDB binlog applier: missing table map");
           break;
         }
+        const BinlogTableMap *map = &queued.table_map;
         if (!ShouldApplySchema(map->schema, options.schema_filter)) {
           break;
         }
@@ -1497,13 +1594,15 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
         st = EnsureSchemaApplier(map->schema, options, applier_options,
                                  &schema_states, &state);
         if (!st.ok()) {
-          RollbackActiveTransactions(&schema_states);
-          return st;
+          loop_status = st;
+          had_error = true;
+          break;
         }
         st = ApplyRowEvent(event, *map, options, *state, current_gtid);
         if (!st.ok()) {
-          RollbackActiveTransactions(&schema_states);
-          return st;
+          loop_status = st;
+          had_error = true;
+          break;
         }
         break;
       }
@@ -1518,8 +1617,8 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
         st = ApplyDdlEvent(event, options, applier_options, &schema_states,
                            current_gtid);
         if (!st.ok()) {
-          RollbackActiveTransactions(&schema_states);
-          return st;
+          loop_status = st;
+          had_error = true;
         }
         break;
       }
@@ -1527,22 +1626,30 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
         st = CommitActiveTransactions(&schema_states, current_log_file,
                                       current_log_pos);
         if (!st.ok()) {
-          RollbackActiveTransactions(&schema_states);
-          return st;
+          loop_status = st;
+          had_error = true;
+        } else {
+          txn_open = false;
+          current_gtid.clear();
         }
-        txn_open = false;
-        current_gtid.clear();
         break;
       }
       default:
         break;
     }
+    if (had_error) break;
   }
 
-  (void)CommitActiveTransactions(&schema_states, current_log_file,
-                                 current_log_pos);
+  if (had_error) {
+    RollbackActiveTransactions(&schema_states);
+  } else {
+    (void)CommitActiveTransactions(&schema_states, current_log_file,
+                                   current_log_pos);
+  }
+  queue.Close();
+  if (reader.joinable()) reader.join();
   streamer.Close();
-  return Status::Ok();
+  return loop_status;
 }
 
 #ifndef DUCKDB_APPLY_THREAD_TEST
