@@ -1193,27 +1193,6 @@ Status DuckDBBinlogApplier::CommitTransaction() {
     return Status::Ok();
   }
 
-  DUCKDB_APPLY_VERBOSE("DuckDB CommitTransaction: calling FlushBuffered");
-  Status st = FlushBuffered(true);
-  if (!st.ok()) {
-    sql_print_warning("DuckDB CommitTransaction: FlushBuffered failed: %s",
-                      st.message.c_str());
-    RollbackTransaction();
-    return st;
-  }
-
-  const bool use_parallel = options_.parallel_workers > 1 && !txn_has_ddl_;
-  if (!use_parallel) {
-    DUCKDB_APPLY_VERBOSE("DuckDB CommitTransaction: calling EnsureApplyTxn");
-    st = EnsureApplyTxn();
-    if (!st.ok()) {
-      sql_print_warning("DuckDB CommitTransaction: EnsureApplyTxn failed: %s",
-                        st.message.c_str());
-      RollbackTransaction();
-      return st;
-    }
-  }
-
   bool force_commit = !options_.use_gtid || txn_has_ddl_;
   bool should_pause = false;
   auto &state = GetApplyState();
@@ -1233,11 +1212,36 @@ Status DuckDBBinlogApplier::CommitTransaction() {
     }
   }
 
-  if (!ShouldCommitBatch(force_commit)) {
+  // Check if we should commit the batch first, before flushing
+  const bool will_commit = ShouldCommitBatch(force_commit);
+
+  // Only force flush if we're about to commit, otherwise let thresholds decide
+  DUCKDB_APPLY_VERBOSE("DuckDB CommitTransaction: calling FlushBuffered");
+  Status st = FlushBuffered(will_commit);
+  if (!st.ok()) {
+    sql_print_warning("DuckDB CommitTransaction: FlushBuffered failed: %s",
+                      st.message.c_str());
+    RollbackTransaction();
+    return st;
+  }
+
+  if (!will_commit) {
     in_txn_ = false;
     txn_has_ddl_ = false;
-    ResetBuffers();
+    ResetBuffers();  // Reset buffers to avoid memory growth
     return Status::Ok();
+  }
+
+  const bool use_parallel = options_.parallel_workers > 1 && !txn_has_ddl_;
+  if (!use_parallel) {
+    DUCKDB_APPLY_VERBOSE("DuckDB CommitTransaction: calling EnsureApplyTxn");
+    st = EnsureApplyTxn();
+    if (!st.ok()) {
+      sql_print_warning("DuckDB CommitTransaction: EnsureApplyTxn failed: %s",
+                        st.message.c_str());
+      RollbackTransaction();
+      return st;
+    }
   }
 
   if (use_parallel && !apply_txn_.active) {
