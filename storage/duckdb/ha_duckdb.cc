@@ -1485,13 +1485,10 @@ int ha_duckdb::write_row(uchar *buf) {
     return HA_ERR_WRONG_COMMAND;
   }
   ha_statistic_increment(&System_status_var::ha_write_count);
-  if (buf == nullptr || table == nullptr) return HA_ERR_GENERIC;
+  if (buf == nullptr || table == nullptr || !m_conn) return HA_ERR_GENERIC;
 
   try {
-    duckdb::DBConfig config(false);
-    duckdb::DuckDB db(m_table_path, &config);
-    duckdb::Connection conn(db);
-    duckdb::Appender appender(conn, m_table_name);
+    duckdb::Appender appender(*m_conn, m_table_name);
 
     FieldOffsetGuard guard(table, buf);
     const uint field_count = table->s->fields;
@@ -1531,7 +1528,8 @@ int ha_duckdb::update_row(const uchar *old_data, uchar *new_data) {
     return HA_ERR_WRONG_COMMAND;
   }
   ha_statistic_increment(&System_status_var::ha_update_count);
-  if (old_data == nullptr || new_data == nullptr || table == nullptr) {
+  if (old_data == nullptr || new_data == nullptr || table == nullptr ||
+      !m_conn) {
     return HA_ERR_GENERIC;
   }
 
@@ -1554,10 +1552,7 @@ int ha_duckdb::update_row(const uchar *old_data, uchar *new_data) {
   sql += build_where_clause(where_fields, where_values);
 
   try {
-    duckdb::DBConfig config(false);
-    duckdb::DuckDB db(m_table_path, &config);
-    duckdb::Connection conn(db);
-    auto result = conn.Query(sql);
+    auto result = m_conn->Query(sql);
     if (result->HasError()) {
       my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), result->GetError().c_str());
       return HA_ERR_GENERIC;
@@ -1579,7 +1574,7 @@ int ha_duckdb::delete_row(const uchar *buf) {
     return HA_ERR_WRONG_COMMAND;
   }
   ha_statistic_increment(&System_status_var::ha_delete_count);
-  if (buf == nullptr || table == nullptr) return HA_ERR_GENERIC;
+  if (buf == nullptr || table == nullptr || !m_conn) return HA_ERR_GENERIC;
 
   const std::vector<Field *> where_fields =
       collect_fields(table, table->read_set);
@@ -1594,10 +1589,7 @@ int ha_duckdb::delete_row(const uchar *buf) {
   sql += build_where_clause(where_fields, where_values);
 
   try {
-    duckdb::DBConfig config(false);
-    duckdb::DuckDB db(m_table_path, &config);
-    duckdb::Connection conn(db);
-    auto result = conn.Query(sql);
+    auto result = m_conn->Query(sql);
     if (result->HasError()) {
       my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), result->GetError().c_str());
       return HA_ERR_GENERIC;
