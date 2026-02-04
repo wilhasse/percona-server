@@ -1665,6 +1665,9 @@ Status DuckDBBinlogApplier::ApplyWatermark() {
                                       &schema_found);
     if (!st.ok()) return st;
   }
+  DUCKDB_APPLY_VERBOSE(
+      "DuckDB ApplyWatermark: schema_version=%s",
+      schema_found ? std::to_string(schema_version).c_str() : "NULL");
   const std::string schema_sql =
       schema_found ? std::to_string(schema_version) : "NULL";
 
