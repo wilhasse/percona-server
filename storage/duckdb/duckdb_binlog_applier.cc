@@ -57,6 +57,8 @@ struct ParsedUpdate {
   std::map<std::string, Cell> where_values;
 };
 
+constexpr size_t kParallelMinInsertShardRows = 1024;
+
 struct BinlogApplyState {
   std::atomic<bool> paused{false};
   std::atomic<uint64_t> throttle_rows_per_sec{0};
@@ -1417,6 +1419,19 @@ Status DuckDBBinlogApplier::FlushBuffered(bool force) {
       TableId table;
       TableBuffer buffer;
     };
+    const auto buffer_row_count = [](const TableBuffer &buffer) -> size_t {
+      return buffer.inserts.rows.size() + buffer.bulk_updates.old_rows.size() +
+             buffer.updates.statements.size() +
+             buffer.bulk_deletes.old_rows.size() +
+             buffer.deletes.statements.size();
+    };
+    const auto is_insert_only = [](const TableBuffer &buffer) -> bool {
+      return !buffer.inserts.rows.empty() &&
+             buffer.bulk_updates.old_rows.empty() &&
+             buffer.updates.statements.empty() &&
+             buffer.bulk_deletes.old_rows.empty() &&
+             buffer.deletes.statements.empty();
+    };
     std::vector<WorkItem> work;
     work.reserve(buffers_.size());
     for (auto &entry : buffers_) {
@@ -1432,15 +1447,71 @@ Status DuckDBBinlogApplier::FlushBuffered(bool force) {
           !buffer.bulk_deletes.old_rows.empty()) {
         delta_tables_.insert(key);
       }
-      WorkItem item;
-      item.table = TableId{key.schema, key.table};
-      item.buffer = std::move(buffer);
-      work.push_back(std::move(item));
+      const bool insert_only = is_insert_only(buffer);
+      const size_t insert_rows = buffer.inserts.rows.size();
+      size_t shard_count = 1;
+      if (insert_only && options_.parallel_workers > 1 &&
+          insert_rows >= kParallelMinInsertShardRows * 2) {
+        shard_count = std::min(
+            options_.parallel_workers,
+            insert_rows / kParallelMinInsertShardRows);
+        if (shard_count < 2) shard_count = 1;
+      }
+      if (shard_count == 1) {
+        WorkItem item;
+        item.table = TableId{key.schema, key.table};
+        item.buffer = std::move(buffer);
+        work.push_back(std::move(item));
+      } else {
+        DUCKDB_APPLY_VERBOSE(
+            "DuckDB FlushBuffered: sharding %s.%s inserts=%zu shards=%zu",
+            key.schema.c_str(), key.table.c_str(), insert_rows, shard_count);
+        std::vector<TableBuffer> shards(shard_count);
+        for (auto &shard : shards) {
+          shard.inserts.table = buffer.inserts.table;
+          shard.columns = buffer.columns;
+          shard.column_index = buffer.column_index;
+          shard.columns_loaded = buffer.columns_loaded;
+        }
+        auto rows = std::move(buffer.inserts.rows);
+        for (auto &row : rows) {
+          const size_t idx = HashRow(row) % shard_count;
+          shards[idx].inserts.rows.push_back(std::move(row));
+        }
+        for (auto &shard : shards) {
+          if (shard.inserts.rows.empty()) continue;
+          WorkItem item;
+          item.table = TableId{key.schema, key.table};
+          item.buffer = std::move(shard);
+          work.push_back(std::move(item));
+        }
+      }
     }
 
     if (!work.empty()) {
       const size_t worker_count =
           std::min(options_.parallel_workers, work.size());
+      DUCKDB_APPLY_VERBOSE(
+          "DuckDB FlushBuffered: parallel work_items=%zu workers=%zu",
+          work.size(), worker_count);
+      std::vector<std::pair<std::string, size_t>> table_rows;
+      table_rows.reserve(work.size());
+      for (const auto &item : work) {
+        const size_t rows = buffer_row_count(item.buffer);
+        if (rows == 0) continue;
+        table_rows.emplace_back(
+            item.table.schema + "." + item.table.table, rows);
+      }
+      std::sort(table_rows.begin(), table_rows.end(),
+                [](const auto &lhs, const auto &rhs) {
+                  return lhs.second > rhs.second;
+                });
+      const size_t max_log = std::min<size_t>(3, table_rows.size());
+      for (size_t i = 0; i < max_log; ++i) {
+        DUCKDB_APPLY_VERBOSE("DuckDB FlushBuffered: work[%zu] %s rows=%zu",
+                             i, table_rows[i].first.c_str(),
+                             table_rows[i].second);
+      }
       std::atomic<size_t> next_index{0};
       std::mutex err_mutex;
       Status first_error = Status::Ok();
