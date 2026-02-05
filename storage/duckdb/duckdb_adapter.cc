@@ -917,7 +917,8 @@ std::string DuckDBAdapter::QualifiedName(const TableId &table) const {
   if (table.schema.empty()) {
     return QuoteIdent(table.table);
   }
-  return QuoteIdent(table.schema) + "." + QuoteIdent(table.table);
+  return QuoteIdent(table.schema) + "." + QuoteIdent("main") + "." +
+         QuoteIdent(table.table);
 }
 
 std::string DuckDBAdapter::EscapeLiteral(const std::string &value) const {
@@ -962,14 +963,6 @@ Status DuckDBAdapter::CreateTable(MySQLTableDef def) {
 
 Status DuckDBAdapter::CreateTableOn(duckdb::Connection &conn,
                                     MySQLTableDef def) {
-  if (!def.schema.empty()) {
-    const std::string schema_sql =
-        "CREATE SCHEMA IF NOT EXISTS " + QuoteIdent(def.schema);
-    auto schema_result = conn.Query(schema_sql);
-    if (schema_result->HasError()) {
-      return Status::Error(StatusCode::kDuckDBError, schema_result->GetError());
-    }
-  }
   std::string sql = def.ddl_sql;
   if (sql.empty()) {
     TableId id{def.schema, def.name};

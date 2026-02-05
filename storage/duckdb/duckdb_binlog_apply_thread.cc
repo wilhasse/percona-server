@@ -89,10 +89,11 @@ bool IsDuckdbInternalTableName(const std::string &name) {
 Status RegisterExistingTablesForSchema(DuckDBAdapter &adapter,
                                        const std::string &schema,
                                        const std::string &path) {
-  const std::string schema_name = schema.empty() ? "main" : schema;
   const std::string sql =
-      "SELECT table_name FROM information_schema.tables WHERE table_schema = " +
-      QuoteDuckdbLiteral(schema_name);
+      "SELECT table_name FROM information_schema.tables WHERE table_schema = "
+      "'main'" +
+      (schema.empty() ? ""
+                      : " AND table_catalog = " + QuoteDuckdbLiteral(schema));
   auto result = adapter.ExecuteQuery(sql, {});
   if (!result.ok) {
     return Status::Error(StatusCode::kDuckDBError, result.error);
@@ -107,6 +108,27 @@ Status RegisterExistingTablesForSchema(DuckDBAdapter &adapter,
       const std::string table = name_val.ToString();
       if (IsDuckdbInternalTableName(table)) continue;
       RegisterLoadedTable(schema, table, path, /*replicated=*/true);
+    }
+  }
+
+  if (!schema.empty()) {
+    const std::string legacy_sql =
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = " +
+        QuoteDuckdbLiteral(schema);
+    result = adapter.ExecuteQuery(legacy_sql, {});
+    if (!result.ok) {
+      return Status::Error(StatusCode::kDuckDBError, result.error);
+    }
+    while (true) {
+      auto chunk = result.result->Fetch();
+      if (!chunk || chunk->size() == 0) break;
+      for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
+        auto name_val = chunk->GetValue(0, row);
+        if (name_val.IsNull()) continue;
+        const std::string table = name_val.ToString();
+        if (IsDuckdbInternalTableName(table)) continue;
+        RegisterLoadedTable(schema, table, path, /*replicated=*/true);
+      }
     }
   }
   return Status::Ok();
@@ -1044,14 +1066,28 @@ Status FetchTableDefFromSource(const BinlogApplyThreadOptions &options,
 
 bool DuckdbTableExists(DuckDBAdapter &adapter, const std::string &schema,
                        const std::string &table) {
-  const std::string schema_name = schema.empty() ? "main" : schema;
   const std::string sql =
-      "SELECT 1 FROM information_schema.tables WHERE table_schema = '" +
-      schema_name + "' AND table_name = '" + table + "' LIMIT 1";
+      "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' "
+      "AND table_name = '" +
+      table + "'" +
+      (schema.empty() ? "" : " AND table_catalog = '" + schema + "'") +
+      " LIMIT 1";
   auto result = adapter.ExecuteQuery(sql, {});
   if (!result.ok) return false;
   auto chunk = result.result->Fetch();
-  return chunk && chunk->size() > 0;
+  if (chunk && chunk->size() > 0) return true;
+
+  if (!schema.empty()) {
+    const std::string legacy_sql =
+        "SELECT 1 FROM information_schema.tables WHERE table_schema = '" +
+        schema + "' AND table_name = '" + table + "' LIMIT 1";
+    result = adapter.ExecuteQuery(legacy_sql, {});
+    if (!result.ok) return false;
+    chunk = result.result->Fetch();
+    if (chunk && chunk->size() > 0) return true;
+  }
+
+  return false;
 }
 
 bool IsTableCached(const SchemaApplierState &state, const std::string &table) {

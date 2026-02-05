@@ -186,6 +186,8 @@ std::string qualified_table_name(const std::string &schema,
   return qualified;
 }
 
+std::string value_to_sql(const duckdb::Value &val);
+
 bool DuckdbTableExistsInFile(const std::string &path,
                              const std::string &schema,
                              const std::string &table, bool *exists) {
@@ -195,11 +197,14 @@ bool DuckdbTableExistsInFile(const std::string &path,
     duckdb::DBConfig config(true);
     duckdb::DuckDB db(path, &config);
     duckdb::Connection conn(db);
-    const std::string schema_name = schema.empty() ? "main" : schema;
     const std::string sql =
-        "SELECT 1 FROM information_schema.tables WHERE table_schema = " +
-        value_to_sql(duckdb::Value(schema_name)) + " AND table_name = " +
-        value_to_sql(duckdb::Value(table)) + " LIMIT 1";
+        "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' "
+        "AND table_name = " +
+        value_to_sql(duckdb::Value(table)) +
+        (schema.empty() ? std::string()
+                        : " AND table_catalog = " +
+                              value_to_sql(duckdb::Value(schema))) +
+        " LIMIT 1";
     auto result = conn.Query(sql);
     if (result->HasError()) {
       sql_print_warning("DuckDB table check failed: %s",
@@ -213,8 +218,8 @@ bool DuckdbTableExistsInFile(const std::string &path,
     }
     if (!schema.empty()) {
       const std::string fallback_sql =
-          "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' "
-          "AND table_name = " +
+          "SELECT 1 FROM information_schema.tables WHERE table_schema = " +
+          value_to_sql(duckdb::Value(schema)) + " AND table_name = " +
           value_to_sql(duckdb::Value(table)) + " LIMIT 1";
       result = conn.Query(fallback_sql);
       if (result->HasError()) {
