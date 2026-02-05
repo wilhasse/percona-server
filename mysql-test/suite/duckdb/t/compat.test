@@ -1,5 +1,9 @@
 --source include/have_duckdb_plugin.inc
 
+--disable_query_log
+CALL mtr.add_suppression("DuckDB analytics node should run with read_only=ON");
+CALL mtr.add_suppression("Got timeout reading communication packets");
+CALL mtr.add_suppression("A message intended for a client cannot be sent");
 --let $duckdb_installed=0
 --let $duckdb_plugin_present=`SELECT COUNT(*) FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_NAME='DUCKDB'`
 --if ($duckdb_plugin_present == 0) {
@@ -16,9 +20,9 @@ CREATE DATABASE duckdb_compat;
 USE duckdb_compat;
 
 CREATE TABLE t1 (id INT, val VARCHAR(20)) ENGINE=InnoDB SECONDARY_ENGINE=DUCKDB;
-ALTER TABLE t1 SECONDARY_LOAD;
-
 INSERT INTO t1 VALUES (1,NULL),(2,'foo'),(3,'bar');
+ALTER TABLE t1 SECONDARY_LOAD;
+--enable_query_log
 
 SELECT id FROM t1 WHERE IFNULL(val,'') = '' ORDER BY id;
 SELECT id FROM t1 WHERE LOCATE('ar', val) > 0 ORDER BY id;
@@ -35,6 +39,7 @@ SELECT id FROM t1
   WHERE UNIX_TIMESTAMP('1970-01-01 00:00:00') = 0
   ORDER BY id;
 
+--disable_query_log
 ALTER TABLE t1 SECONDARY_UNLOAD;
 DROP TABLE t1;
 DROP DATABASE duckdb_compat;
@@ -45,3 +50,4 @@ SET @@session.secondary_engine_cost_threshold = @save_threshold;
 --if ($duckdb_installed == 1) {
   UNINSTALL PLUGIN duckdb;
 }
+--enable_query_log

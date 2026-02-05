@@ -649,11 +649,45 @@ DuckdbRewriteResult RewriteForDuckdb(const std::string &sql) {
             continue;
           }
           if (upper == "FROM_UNIXTIME") {
-            out.append("TO_TIMESTAMP");
+            size_t close_paren = 0;
+            std::vector<std::string> args;
+            std::string reason;
+            if (!ParseArguments(sql, lookahead, &close_paren, &args,
+                                &reason)) {
+              result.ok = false;
+              result.reason = reason;
+              return result;
+            }
+            if (args.size() != 1) {
+              result.ok = false;
+              result.reason = "FROM_UNIXTIME requires exactly 1 argument";
+              return result;
+            }
+            out.append("CAST(TO_TIMESTAMP(");
+            out.append(Trim(args[0]));
+            out.append(") AS TIMESTAMP)");
+            i = close_paren + 1;
             continue;
           }
           if (upper == "UNIX_TIMESTAMP") {
-            out.append("EPOCH");
+            size_t close_paren = 0;
+            std::vector<std::string> args;
+            std::string reason;
+            if (!ParseArguments(sql, lookahead, &close_paren, &args,
+                                &reason)) {
+              result.ok = false;
+              result.reason = reason;
+              return result;
+            }
+            if (args.size() != 1) {
+              result.ok = false;
+              result.reason = "UNIX_TIMESTAMP requires exactly 1 argument";
+              return result;
+            }
+            out.append("EPOCH(CAST(");
+            out.append(Trim(args[0]));
+            out.append(" AS TIMESTAMP))");
+            i = close_paren + 1;
             continue;
           }
         }

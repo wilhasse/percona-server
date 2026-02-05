@@ -1,19 +1,33 @@
+SELECT id FROM t1 WHERE IFNULL(val,'') = '' ORDER BY id;
 id
 1
+SELECT id FROM t1 WHERE LOCATE('ar', val) > 0 ORDER BY id;
 id
 3
+SELECT id FROM t1 ORDER BY id LIMIT 1,1;
 id
 2
+SELECT `id` FROM `t1` WHERE LOCATE('foo', `val`) > 0 ORDER BY `id`;
 id
 2
+SELECT id FROM t1
+WHERE DATE_FORMAT(FROM_UNIXTIME(0), '%Y') = '1970'
+  ORDER BY id;
 id
 1
 2
 3
+SELECT id FROM t1
+WHERE DATE_FORMAT(STR_TO_DATE('2020-02-03', '%Y-%m-%d'), '%Y-%m-%d') =
+'2020-02-03'
+  ORDER BY id;
 id
 1
 2
 3
+SELECT id FROM t1
+WHERE UNIX_TIMESTAMP('1970-01-01 00:00:00') = 0
+ORDER BY id;
 id
 1
 2
