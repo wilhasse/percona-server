@@ -57,6 +57,34 @@ struct ParsedUpdate {
   std::map<std::string, Cell> where_values;
 };
 
+std::string QuoteIdent(const std::string &name) {
+  std::string out;
+  out.reserve(name.size() + 2);
+  out.push_back('"');
+  for (char ch : name) {
+    if (ch == '"') out.push_back('"');
+    out.push_back(ch);
+  }
+  out.push_back('"');
+  return out;
+}
+
+Status DropDeltaTables(duckdb::Connection &conn, const TableId &table) {
+  if (table.table.empty()) return Status::Ok();
+  const std::string base = table.table;
+  const std::string delta = QuoteIdent("__delta_" + base);
+  const std::string insert_delta = QuoteIdent("__delta_insert_" + base);
+  auto result = conn.Query("DROP TABLE IF EXISTS " + delta);
+  if (result->HasError()) {
+    return Status::Error(StatusCode::kDuckDBError, result->GetError());
+  }
+  result = conn.Query("DROP TABLE IF EXISTS " + insert_delta);
+  if (result->HasError()) {
+    return Status::Error(StatusCode::kDuckDBError, result->GetError());
+  }
+  return Status::Ok();
+}
+
 constexpr size_t kParallelMinInsertShardRows = 1024;
 
 struct BinlogApplyState {
@@ -1160,6 +1188,8 @@ Status DuckDBBinlogApplier::ApplyDDL(DDLChange change) {
     return Status::Ok();
   }
 
+  const TableId table = change.table;
+  const TableId new_table = change.new_table;
   txn_has_ddl_ = true;
   Status st = FlushBuffered(true);
   if (!st.ok()) {
@@ -1176,7 +1206,16 @@ Status DuckDBBinlogApplier::ApplyDDL(DDLChange change) {
 
   st = adapter_->ApplyDDLInTxn(apply_txn_, std::move(change));
   if (!st.ok()) return st;
-  return UpdateSchemaVersion(*apply_txn_.conn);
+  st = UpdateSchemaVersion(*apply_txn_.conn);
+  if (!st.ok()) return st;
+
+  if (apply_txn_.conn) {
+    st = DropDeltaTables(*apply_txn_.conn, table);
+    if (!st.ok()) return st;
+    st = DropDeltaTables(*apply_txn_.conn, new_table);
+    if (!st.ok()) return st;
+  }
+  return Status::Ok();
 }
 
 Status DuckDBBinlogApplier::CommitTransaction() {

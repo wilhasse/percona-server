@@ -38,6 +38,12 @@
 // Stub server logger for gunit link; the real implementation lives in mysqld.
 int log_message(int, ...) { return 0; }
 
+// Stub verbose flag helpers; implemented in the plugin, but not linked here.
+namespace duckdb_se {
+void SetDuckdbBinlogApplyVerbose(bool) {}
+bool DuckdbBinlogApplyVerbose() { return false; }
+}  // namespace duckdb_se
+
 #ifdef _WIN32
 #include <process.h>
 #else
@@ -196,11 +202,19 @@ void CleanupDuckdbFiles(const std::string &path) {
 
 void ExpectOk(const Status &st) { ASSERT_TRUE(st.ok()) << st.message; }
 
+BinlogApplierOptions MakeTestOptions() {
+  BinlogApplierOptions options;
+  options.batch_max_gtids = 1;
+  options.batch_max_delay = std::chrono::milliseconds(0);
+  return options;
+}
+
 MySQLTableDef MakeSimpleTable() {
   MySQLTableDef def;
   def.name = "t";
   def.columns.push_back({"id", "INTEGER", true});
   def.columns.push_back({"val", "VARCHAR", false});
+  def.primary_key.push_back("id");
   return def;
 }
 
@@ -227,21 +241,30 @@ int64_t QueryCount(DuckDBAdapter &adapter, const std::string &sql) {
 }
 
 int64_t QueryChecksum(DuckDBAdapter &adapter) {
-  const std::string sql =
-      "SELECT COALESCE(SUM(CAST(\"id\" AS BIGINT)), 0) + "
-      "COALESCE(SUM(LENGTH(\"val\")), 0) FROM t";
+  const std::string sql = "SELECT \"id\", \"val\" FROM t";
   SessionCtx ctx;
   auto result = adapter.ExecuteQuery(sql, ctx);
   if (!result.ok || !result.result) {
     ADD_FAILURE() << "DuckDB query failed: " << result.error;
     return 0;
   }
-  auto chunk = result.result->Fetch();
-  if (!chunk || chunk->size() == 0) {
-    ADD_FAILURE() << "DuckDB checksum query returned no rows";
-    return 0;
+  int64_t checksum = 0;
+  while (true) {
+    auto chunk = result.result->Fetch();
+    if (!chunk || chunk->size() == 0) break;
+    for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
+      auto id_val = chunk->GetValue(0, row);
+      if (!id_val.IsNull()) {
+        checksum += id_val.GetValue<int64_t>();
+      }
+      auto val = chunk->GetValue(1, row);
+      if (!val.IsNull()) {
+        const std::string str = val.ToString();
+        checksum += static_cast<int64_t>(str.size());
+      }
+    }
   }
-  return chunk->GetValue(0, 0).GetValue<int64_t>();
+  return checksum;
 }
 
 duckdb::Value QuerySingleValue(DuckDBAdapter &adapter,
@@ -305,7 +328,7 @@ TEST(DuckDBBinlogApplierTest, RestartPersistsDataAndWatermark) {
   ExpectOk(adapter.Init(path, cfg));
   ExpectOk(adapter.CreateTable(MakeSimpleTable()));
 
-  DuckDBBinlogApplier applier(&adapter);
+  DuckDBBinlogApplier applier(&adapter, MakeTestOptions());
   ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(1)}));
   ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
   ExpectOk(applier.CommitTransaction());
@@ -340,7 +363,7 @@ TEST(DuckDBBinlogApplierTest, KillDuringApplyKeepsCommittedData) {
   ExpectOk(adapter.Init(path, cfg));
   ExpectOk(adapter.CreateTable(MakeSimpleTable()));
 
-  DuckDBBinlogApplier applier(&adapter);
+  DuckDBBinlogApplier applier(&adapter, MakeTestOptions());
   ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(1)}));
   ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
   ExpectOk(applier.CommitTransaction());
@@ -360,7 +383,7 @@ TEST(DuckDBBinlogApplierTest, KillDuringApplyKeepsCommittedData) {
     auto st = child_adapter.Init(path, child_cfg);
     if (!st.ok()) _exit(2);
 
-    BinlogApplierOptions options;
+    BinlogApplierOptions options = MakeTestOptions();
     options.max_rows = 1;
     DuckDBBinlogApplier child_applier(&child_adapter, options);
     st = child_applier.BeginTransaction(Gtid{MakeGtid(2)});
@@ -412,7 +435,7 @@ TEST(DuckDBBinlogApplierTest, IdempotentReplaySkipsAppliedGtid) {
   ExpectOk(adapter.Init(path, cfg));
   ExpectOk(adapter.CreateTable(MakeSimpleTable()));
 
-  DuckDBBinlogApplier applier(&adapter);
+  DuckDBBinlogApplier applier(&adapter, MakeTestOptions());
   ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(10)}));
   ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
   ExpectOk(applier.CommitTransaction());
@@ -444,7 +467,7 @@ TEST(DuckDBBinlogApplierTest, BulkUpdateDeleteFullRowImage) {
   ExpectOk(adapter.Init(path, cfg));
   ExpectOk(adapter.CreateTable(MakeSimpleTable()));
 
-  DuckDBBinlogApplier applier(&adapter);
+  DuckDBBinlogApplier applier(&adapter, MakeTestOptions());
   ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(20)}));
   ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
   ExpectOk(applier.CommitTransaction());
@@ -480,7 +503,7 @@ TEST(DuckDBBinlogApplierTest, BulkUpdatePreservesOrderOnChainedUpdates) {
   ExpectOk(adapter.Init(path, cfg));
   ExpectOk(adapter.CreateTable(MakeSimpleTable()));
 
-  DuckDBBinlogApplier applier(&adapter);
+  DuckDBBinlogApplier applier(&adapter, MakeTestOptions());
   ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(30)}));
   ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
   ExpectOk(applier.CommitTransaction());
@@ -514,7 +537,7 @@ TEST(DuckDBBinlogApplierTest, ApplyDDLInTransaction) {
   cfg.read_only = false;
   ExpectOk(adapter.Init(path, cfg));
 
-  DuckDBBinlogApplier applier(&adapter);
+  DuckDBBinlogApplier applier(&adapter, MakeTestOptions());
   DDLChange create_change;
   create_change.type = DDLChange::Type::kCreate;
   create_change.new_def = MakeSimpleTable();
@@ -543,7 +566,7 @@ TEST(DuckDBBinlogApplierTest, DdlSequenceWithDml) {
   cfg.read_only = false;
   ExpectOk(adapter.Init(path, cfg));
 
-  DuckDBBinlogApplier applier(&adapter);
+  DuckDBBinlogApplier applier(&adapter, MakeTestOptions());
 
   DDLChange create_change;
   create_change.type = DDLChange::Type::kCreate;
@@ -625,7 +648,7 @@ TEST(DuckDBBinlogApplierTest, CopyFallbackPreservesData) {
   cfg.read_only = false;
   ExpectOk(adapter.Init(path, cfg));
 
-  DuckDBBinlogApplier applier(&adapter);
+  DuckDBBinlogApplier applier(&adapter, MakeTestOptions());
   DDLChange create_change;
   create_change.type = DDLChange::Type::kCreate;
   create_change.new_def = MakeSimpleTable();
@@ -681,7 +704,7 @@ TEST(DuckDBBinlogApplierTest, PauseResumeBlocksApply) {
   std::atomic<bool> finished{false};
   std::promise<void> started;
   auto started_future = started.get_future();
-  DuckDBBinlogApplier applier(&adapter);
+  DuckDBBinlogApplier applier(&adapter, MakeTestOptions());
 
   std::thread worker([&]() {
     started.set_value();
@@ -718,7 +741,7 @@ TEST(DuckDBBinlogApplierTest, ThrottleAppliesSleep) {
   ExpectOk(adapter.CreateTable(MakeSimpleTable()));
 
   SetBinlogApplyThrottleRowsPerSec(1);
-  DuckDBBinlogApplier applier(&adapter);
+  DuckDBBinlogApplier applier(&adapter, MakeTestOptions());
   ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(60)}));
   ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
   const auto start = std::chrono::steady_clock::now();
@@ -746,7 +769,7 @@ TEST(DuckDBBinlogApplierTest, LagMetricsUpdateOnCommit) {
   ExpectOk(adapter.Init(path, cfg));
   ExpectOk(adapter.CreateTable(MakeSimpleTable()));
 
-  DuckDBBinlogApplier applier(&adapter);
+  DuckDBBinlogApplier applier(&adapter, MakeTestOptions());
   ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(70)}));
   ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
   ExpectOk(applier.CommitTransaction());
@@ -769,7 +792,7 @@ TEST(DuckDBBinlogApplierTest, FlushDoesNotCommitMidTransaction) {
   ExpectOk(adapter.Init(path, cfg));
   ExpectOk(adapter.CreateTable(MakeSimpleTable()));
 
-  BinlogApplierOptions options;
+  BinlogApplierOptions options = MakeTestOptions();
   options.max_rows = 1;
   options.max_bytes = 0;
   options.max_delay = std::chrono::milliseconds(0);

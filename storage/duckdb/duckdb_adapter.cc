@@ -53,6 +53,19 @@ duckdb::Appender *GetOrCreateAppender(ApplyTxn &txn,
   return slot.get();
 }
 
+Status FlushAppenderForTable(ApplyTxn &txn, const std::string &table_name) {
+  auto it = txn.appenders.find(table_name);
+  if (it == txn.appenders.end() || !it->second) {
+    return Status::Ok();
+  }
+  try {
+    it->second->Flush();
+  } catch (const std::exception &ex) {
+    return Status::Error(StatusCode::kDuckDBError, ex.what());
+  }
+  return Status::Ok();
+}
+
 // Generate a DuckDB-compatible timestamp literal for the current time.
 // Uses C++ chrono to avoid reliance on DuckDB's now()/CURRENT_TIMESTAMP
 // functions which may require core_functions extension.
@@ -1504,6 +1517,8 @@ Status DuckDBAdapter::ApplyInsertDelta(ApplyTxn &txn, TableId table,
   // Append into insert-delta table for idempotent merge.
   st = AppendRows(txn, delta, std::move(batch));
   if (!st.ok()) return st;
+  st = FlushAppenderForTable(txn, delta.table);
+  if (!st.ok()) return st;
 
   std::vector<std::string> columns;
   st = GetTableColumnsOn(*txn.conn, table, &columns);
@@ -1620,6 +1635,8 @@ Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
       delta_appender->EndRow();
       ++row_idx;
     }
+    st = FlushAppenderForTable(txn, delta_name);
+    if (!st.ok()) return st;
 
     std::vector<std::string> columns;
     st = GetTableColumnsOn(*txn.conn, table, &columns);
@@ -1708,6 +1725,8 @@ Status DuckDBAdapter::ApplyBulkDeletes(ApplyTxn &txn, TableId table,
       }
       delta_appender->EndRow();
     }
+    st = FlushAppenderForTable(txn, delta_name);
+    if (!st.ok()) return st;
 
     std::vector<std::string> columns;
     st = GetTableColumnsOn(*txn.conn, table, &columns);
