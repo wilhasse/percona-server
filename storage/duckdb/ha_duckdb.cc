@@ -574,8 +574,17 @@ std::string default_duckdb_path(const TABLE_SHARE *share) {
 
 std::string resolve_duckdb_path(const TABLE_SHARE *share) {
   if (share->secondary_engine_attribute.length > 0) {
-    return std::string(share->secondary_engine_attribute.str,
-                       share->secondary_engine_attribute.length);
+    std::string attr(share->secondary_engine_attribute.str,
+                     share->secondary_engine_attribute.length);
+    if (attr.size() >= 7 &&
+        attr.compare(attr.size() - 7, 7, ".duckdb") == 0) {
+      return attr;
+    }
+    if (!attr.empty() && attr.back() != FN_LIBCHAR) attr.push_back(FN_LIBCHAR);
+    std::string file;
+    file.append(share->db.str, share->db.length);
+    file.append(".duckdb");
+    return attr + file;
   }
   return default_duckdb_path(share);
 }
@@ -610,7 +619,10 @@ bool backup_stale_wal(const std::string &path) {
 bool ensure_duckdb_file(const std::string &path) {
   // Check if directory exists; DuckDB will create the file itself
   MY_STAT stat_buf;
-  std::string dir = path.substr(0, path.rfind(FN_LIBCHAR));
+  const size_t dir_pos = path.rfind(FN_LIBCHAR);
+  std::string dir = (dir_pos == std::string::npos)
+                        ? std::string(".")
+                        : path.substr(0, dir_pos);
   if (my_stat(dir.c_str(), &stat_buf, MYF(0)) == nullptr) {
     return false;  // Directory doesn't exist
   }
