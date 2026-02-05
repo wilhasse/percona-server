@@ -27,6 +27,7 @@
 #include <cctype>
 #include <chrono>
 #include <sstream>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "sql/log.h"
@@ -811,14 +812,54 @@ Status DuckDBAdapter::EnsureDeltaTable(duckdb::Connection &conn,
     return Status::Error(StatusCode::kInvalid, "No columns for delta table");
   }
 
+  std::vector<std::string> names;
+  names.reserve(columns.size());
+  for (const auto &col : columns) {
+    names.push_back(col.name);
+  }
+  return EnsureDeltaTableWithColumns(conn, table, names);
+}
+
+Status DuckDBAdapter::EnsureDeltaTableWithColumns(
+    duckdb::Connection &conn, TableId table,
+    const std::vector<std::string> &columns) {
+  if (table.table.empty()) {
+    return Status::Error(StatusCode::kInvalid, "Missing table name");
+  }
+  if (columns.empty()) {
+    return Status::Error(StatusCode::kInvalid,
+                         "No columns provided for delta table");
+  }
+
+  std::vector<ColumnInfo> info;
+  Status st = GetTableInfoOn(conn, table, &info);
+  if (!st.ok()) return st;
+  if (info.empty()) {
+    return Status::Error(StatusCode::kInvalid, "No columns for delta table");
+  }
+
+  std::unordered_map<std::string, std::string> type_by_name;
+  type_by_name.reserve(info.size());
+  for (const auto &col : info) {
+    type_by_name.emplace(col.name,
+                         col.type.empty() ? "VARCHAR" : col.type);
+  }
+
   std::string sql = "CREATE TABLE IF NOT EXISTS ";
   TableId delta{table.schema, DeltaTableName(table)};
-  sql += QualifiedName(delta);
+  const std::string delta_name = QualifiedName(delta);
+  const std::string drop_sql = "DROP TABLE IF EXISTS " + delta_name;
+  st = ExecuteDDLOn(conn, drop_sql);
+  if (!st.ok()) return st;
+  sql += delta_name;
   sql += " (";
   for (size_t i = 0; i < columns.size(); ++i) {
-    const std::string type =
-        columns[i].type.empty() ? "VARCHAR" : columns[i].type;
-    sql += QuoteIdent(columns[i].name) + " " + type;
+    const auto it = type_by_name.find(columns[i]);
+    if (it == type_by_name.end()) {
+      return Status::Error(StatusCode::kInvalid,
+                           "Delta column not found in table");
+    }
+    sql += QuoteIdent(columns[i]) + " " + it->second;
     if (i + 1 < columns.size()) sql += ", ";
   }
   sql += ")";
@@ -1624,8 +1665,54 @@ Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
                          "Bulk update row counts do not match");
   }
 
-  Status st = EnsureDeltaTable(*txn.conn, table);
+  std::vector<std::string> columns;
+  Status st = GetTableColumnsOn(*txn.conn, table, &columns);
   if (!st.ok()) return st;
+  if (columns.empty()) {
+    return Status::Error(StatusCode::kInvalid,
+                         "No columns available for bulk update");
+  }
+  std::vector<std::string> pk_columns;
+  st = GetPrimaryKeyColumnsOn(*txn.conn, table, &pk_columns);
+  if (!st.ok()) return st;
+
+  const bool use_pk = !pk_columns.empty();
+  const std::vector<std::string> &delta_columns =
+      use_pk ? pk_columns : columns;
+
+  st = EnsureDeltaTableWithColumns(*txn.conn, table, delta_columns);
+  if (!st.ok()) return st;
+
+  std::vector<size_t> delta_indexes;
+  if (use_pk) {
+    std::unordered_map<std::string, size_t> column_index;
+    column_index.reserve(columns.size());
+    for (size_t i = 0; i < columns.size(); ++i) {
+      column_index.emplace(columns[i], i);
+    }
+    delta_indexes.reserve(delta_columns.size());
+    for (const auto &col : delta_columns) {
+      auto it = column_index.find(col);
+      if (it == column_index.end()) {
+        return Status::Error(StatusCode::kInvalid,
+                             "PK column not found in table");
+      }
+      delta_indexes.push_back(it->second);
+    }
+  }
+
+  for (const auto &row : batch.old_rows) {
+    if (row.size() != columns.size()) {
+      return Status::Error(StatusCode::kInvalid,
+                           "Bulk update row does not match column count");
+    }
+  }
+  for (const auto &row : batch.new_rows) {
+    if (row.size() != columns.size()) {
+      return Status::Error(StatusCode::kInvalid,
+                           "Bulk update row does not match column count");
+    }
+  }
 
   try {
     const std::string delta_name = DeltaTableName(table);
@@ -1645,15 +1732,28 @@ Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
     for (const auto &row : batch.old_rows) {
       delta_appender->BeginRow();
       size_t col_idx = 0;
-      for (const auto &cell : row) {
-        Status st = AppendCellValue(*delta_appender, cell);
-        if (!st.ok()) {
-          sql_print_warning(
-              "DuckDB ApplyBulkUpdates: AppendCellValue failed row=%zu col=%zu",
-              row_idx, col_idx);
-          return st;
+      if (use_pk) {
+        for (const auto idx : delta_indexes) {
+          Status st = AppendCellValue(*delta_appender, row[idx]);
+          if (!st.ok()) {
+            sql_print_warning(
+                "DuckDB ApplyBulkUpdates: AppendCellValue failed row=%zu col=%zu",
+                row_idx, col_idx);
+            return st;
+          }
+          ++col_idx;
         }
-        ++col_idx;
+      } else {
+        for (const auto &cell : row) {
+          Status st = AppendCellValue(*delta_appender, cell);
+          if (!st.ok()) {
+            sql_print_warning(
+                "DuckDB ApplyBulkUpdates: AppendCellValue failed row=%zu col=%zu",
+                row_idx, col_idx);
+            return st;
+          }
+          ++col_idx;
+        }
       }
       delta_appender->EndRow();
       ++row_idx;
@@ -1661,35 +1761,10 @@ Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
     st = FlushAppenderForTable(txn, delta);
     if (!st.ok()) return st;
 
-    std::vector<std::string> columns;
-    st = GetTableColumnsOn(*txn.conn, table, &columns);
-    if (!st.ok()) return st;
-    if (columns.empty()) {
-      return Status::Error(StatusCode::kInvalid,
-                           "No columns available for bulk update");
-    }
-    std::vector<std::string> pk_columns;
-    st = GetPrimaryKeyColumnsOn(*txn.conn, table, &pk_columns);
-    if (!st.ok()) return st;
-
-    for (const auto &row : batch.old_rows) {
-      if (row.size() != columns.size()) {
-        return Status::Error(StatusCode::kInvalid,
-                             "Bulk update row does not match column count");
-      }
-    }
-    for (const auto &row : batch.new_rows) {
-      if (row.size() != columns.size()) {
-        return Status::Error(StatusCode::kInvalid,
-                             "Bulk update row does not match column count");
-      }
-    }
-
     const std::string target = QualifiedName(table);
     const std::string delta_quoted = QualifiedName(delta);
 
-    const std::vector<std::string> &join_columns =
-        pk_columns.empty() ? columns : pk_columns;
+    const std::vector<std::string> &join_columns = delta_columns;
     std::string join_sql;
     for (size_t i = 0; i < join_columns.size(); ++i) {
       if (i > 0) join_sql += " AND ";
@@ -1729,8 +1804,48 @@ Status DuckDBAdapter::ApplyBulkDeletes(ApplyTxn &txn, TableId table,
     return Status::Ok();
   }
 
-  Status st = EnsureDeltaTable(*txn.conn, table);
+  std::vector<std::string> columns;
+  Status st = GetTableColumnsOn(*txn.conn, table, &columns);
   if (!st.ok()) return st;
+  if (columns.empty()) {
+    return Status::Error(StatusCode::kInvalid,
+                         "No columns available for bulk delete");
+  }
+  std::vector<std::string> pk_columns;
+  st = GetPrimaryKeyColumnsOn(*txn.conn, table, &pk_columns);
+  if (!st.ok()) return st;
+
+  const bool use_pk = !pk_columns.empty();
+  const std::vector<std::string> &delta_columns =
+      use_pk ? pk_columns : columns;
+
+  st = EnsureDeltaTableWithColumns(*txn.conn, table, delta_columns);
+  if (!st.ok()) return st;
+
+  std::vector<size_t> delta_indexes;
+  if (use_pk) {
+    std::unordered_map<std::string, size_t> column_index;
+    column_index.reserve(columns.size());
+    for (size_t i = 0; i < columns.size(); ++i) {
+      column_index.emplace(columns[i], i);
+    }
+    delta_indexes.reserve(delta_columns.size());
+    for (const auto &col : delta_columns) {
+      auto it = column_index.find(col);
+      if (it == column_index.end()) {
+        return Status::Error(StatusCode::kInvalid,
+                             "PK column not found in table");
+      }
+      delta_indexes.push_back(it->second);
+    }
+  }
+
+  for (const auto &row : batch.old_rows) {
+    if (row.size() != columns.size()) {
+      return Status::Error(StatusCode::kInvalid,
+                           "Bulk delete row does not match column count");
+    }
+  }
 
   try {
     const std::string delta_name = DeltaTableName(table);
@@ -1742,38 +1857,26 @@ Status DuckDBAdapter::ApplyBulkDeletes(ApplyTxn &txn, TableId table,
 
     for (const auto &row : batch.old_rows) {
       delta_appender->BeginRow();
-      for (const auto &cell : row) {
-        Status st = AppendCellValue(*delta_appender, cell);
-        if (!st.ok()) return st;
+      if (use_pk) {
+        for (const auto idx : delta_indexes) {
+          Status st = AppendCellValue(*delta_appender, row[idx]);
+          if (!st.ok()) return st;
+        }
+      } else {
+        for (const auto &cell : row) {
+          Status st = AppendCellValue(*delta_appender, cell);
+          if (!st.ok()) return st;
+        }
       }
       delta_appender->EndRow();
     }
     st = FlushAppenderForTable(txn, delta);
     if (!st.ok()) return st;
 
-    std::vector<std::string> columns;
-    st = GetTableColumnsOn(*txn.conn, table, &columns);
-    if (!st.ok()) return st;
-    if (columns.empty()) {
-      return Status::Error(StatusCode::kInvalid,
-                           "No columns available for bulk delete");
-    }
-    std::vector<std::string> pk_columns;
-    st = GetPrimaryKeyColumnsOn(*txn.conn, table, &pk_columns);
-    if (!st.ok()) return st;
-
-    for (const auto &row : batch.old_rows) {
-      if (row.size() != columns.size()) {
-        return Status::Error(StatusCode::kInvalid,
-                             "Bulk delete row does not match column count");
-      }
-    }
-
     const std::string target = QualifiedName(table);
     const std::string delta_quoted = QualifiedName(delta);
 
-    const std::vector<std::string> &join_columns =
-        pk_columns.empty() ? columns : pk_columns;
+    const std::vector<std::string> &join_columns = delta_columns;
     std::string join_sql;
     for (size_t i = 0; i < join_columns.size(); ++i) {
       if (i > 0) join_sql += " AND ";

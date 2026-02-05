@@ -213,6 +213,8 @@ class DuckDBAdapter {
   Status CopyTableOn(duckdb::Connection &conn, TableId source,
                      const MySQLTableDef &target_def, bool manage_txn);
   Status EnsureDeltaTable(duckdb::Connection &conn, TableId table);
+  Status EnsureDeltaTableWithColumns(duckdb::Connection &conn, TableId table,
+                                     const std::vector<std::string> &columns);
   Status EnsureInsertDeltaTable(duckdb::Connection &conn, TableId table);
   std::string DeltaTableName(const TableId &table) const;
   std::string InsertDeltaTableName(const TableId &table) const;
