@@ -797,7 +797,7 @@ Status DuckDBBinlogApplier::BeginTransaction(Gtid gtid) {
   current_gtid_ = std::move(gtid);
   in_txn_ = true;
   skip_txn_ = false;
-  if (!BatchingEnabled() || !apply_txn_.active) {
+  if (!BatchingEnabled()) {
     ResetBuffers();
     apply_txn_ = ApplyTxn{};
   }
@@ -1254,8 +1254,15 @@ Status DuckDBBinlogApplier::CommitTransaction() {
   // Check if we should commit the batch first, before flushing
   const bool will_commit = ShouldCommitBatch(force_commit);
 
-  // Only force flush if we're about to commit, otherwise let thresholds decide
-  DUCKDB_APPLY_VERBOSE("DuckDB CommitTransaction: calling FlushBuffered");
+  // When batching, let flush thresholds decide when to write buffered data
+  // to DuckDB.  Buffers accumulate across binlog transaction boundaries
+  // and get flushed when row/byte/delay thresholds are met or when the
+  // batch commits.  Force flush only when the batch is about to commit.
+  DUCKDB_APPLY_VERBOSE(
+      "DuckDB CommitTransaction: will_commit=%d have_buffered=%d "
+      "buffered_rows=%zu batch_gtid_count=%zu",
+      will_commit ? 1 : 0, have_buffered_ ? 1 : 0, buffered_rows_,
+      batch_gtid_count_);
   Status st = FlushBuffered(will_commit);
   if (!st.ok()) {
     sql_print_warning("DuckDB CommitTransaction: FlushBuffered failed: %s",
@@ -1267,7 +1274,8 @@ Status DuckDBBinlogApplier::CommitTransaction() {
   if (!will_commit) {
     in_txn_ = false;
     txn_has_ddl_ = false;
-    ResetBuffers();  // Reset buffers to avoid memory growth
+    // Do NOT reset buffers — they accumulate across transactions until
+    // flush thresholds trigger or the batch commits.
     return Status::Ok();
   }
 
@@ -1402,6 +1410,10 @@ Status DuckDBBinlogApplier::FlushBuffered(bool force) {
     return Status::Ok();
   }
 
+  DUCKDB_APPLY_VERBOSE(
+      "DuckDB FlushBuffered: FLUSHING force=%d buffered_rows=%zu "
+      "buffered_bytes=%zu buffers=%zu",
+      force ? 1 : 0, buffered_rows_, buffered_bytes_, buffers_.size());
   WaitIfPaused();
   const auto apply_start = std::chrono::steady_clock::now();
   const bool use_parallel =
