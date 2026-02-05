@@ -996,10 +996,12 @@ Status FetchTableDefFromSource(const BinlogApplyThreadOptions &options,
 }
 #endif
 
-bool DuckdbTableExists(DuckDBAdapter &adapter, const std::string &table) {
+bool DuckdbTableExists(DuckDBAdapter &adapter, const std::string &schema,
+                       const std::string &table) {
+  const std::string schema_name = schema.empty() ? "main" : schema;
   const std::string sql =
-      "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' "
-      "AND table_name = '" + table + "' LIMIT 1";
+      "SELECT 1 FROM information_schema.tables WHERE table_schema = '" +
+      schema_name + "' AND table_name = '" + table + "' LIMIT 1";
   auto result = adapter.ExecuteQuery(sql, {});
   if (!result.ok) return false;
   auto chunk = result.result->Fetch();
@@ -1027,7 +1029,7 @@ Status EnsureRowEventTable(const BinlogApplyThreadOptions &options,
   }
   if (IsTableCached(state, map.table)) return Status::Ok();
 
-  bool exists = DuckdbTableExists(*state.adapter, map.table);
+  bool exists = DuckdbTableExists(*state.adapter, map.schema, map.table);
   MySQLTableDef def;
   Status st = FetchTableDefFromSource(options, map.schema, map.table, &def);
   if (!st.ok()) return st;
@@ -1107,7 +1109,8 @@ Status ApplyDdlEvent(const BinlogEvent &event,
   DDLChange change = std::move(parsed.change);
   if (change.type == DDLChange::Type::kCreate) {
     if (parsed.if_not_exists &&
-        DuckdbTableExists(*state->adapter, change.table.table)) {
+        DuckdbTableExists(*state->adapter, change.table.schema,
+                          change.table.table)) {
       MySQLTableDef def;
       st = FetchTableDefFromSource(options, parsed.schema, change.table.table,
                                    &def);

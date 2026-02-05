@@ -43,18 +43,31 @@
 namespace duckdb_se {
 namespace {
 
-duckdb::Appender *GetOrCreateAppender(ApplyTxn &txn,
-                                      const std::string &table_name) {
+std::string AppenderKey(const TableId &table) {
+  if (table.schema.empty()) {
+    return table.table;
+  }
+  return table.schema + "." + table.table;
+}
+
+duckdb::Appender *GetOrCreateAppender(ApplyTxn &txn, const TableId &table) {
   if (!txn.conn) return nullptr;
-  auto &slot = txn.appenders[table_name];
+  const std::string key = AppenderKey(table);
+  auto &slot = txn.appenders[key];
   if (!slot) {
-    slot = std::make_unique<duckdb::Appender>(*txn.conn, table_name);
+    if (table.schema.empty()) {
+      slot = std::make_unique<duckdb::Appender>(*txn.conn, table.table);
+    } else {
+      slot = std::make_unique<duckdb::Appender>(*txn.conn, table.schema,
+                                                table.table);
+    }
   }
   return slot.get();
 }
 
-Status FlushAppenderForTable(ApplyTxn &txn, const std::string &table_name) {
-  auto it = txn.appenders.find(table_name);
+Status FlushAppenderForTable(ApplyTxn &txn, const TableId &table) {
+  const std::string key = AppenderKey(table);
+  auto it = txn.appenders.find(key);
   if (it == txn.appenders.end() || !it->second) {
     return Status::Ok();
   }
@@ -860,11 +873,10 @@ std::string DuckDBAdapter::QuoteIdent(const std::string &name) const {
 }
 
 std::string DuckDBAdapter::QualifiedName(const TableId &table) const {
-  // Always use just table name (main schema) since:
-  // 1. MySQL ha_duckdb creates tables without schema prefix
-  // 2. Schema separation is handled at DuckDB file level (<schema>.duckdb)
-  // 3. Binlog applier creates per-schema DuckDB instances
-  return QuoteIdent(table.table);
+  if (table.schema.empty()) {
+    return QuoteIdent(table.table);
+  }
+  return QuoteIdent(table.schema) + "." + QuoteIdent(table.table);
 }
 
 std::string DuckDBAdapter::EscapeLiteral(const std::string &value) const {
@@ -909,6 +921,14 @@ Status DuckDBAdapter::CreateTable(MySQLTableDef def) {
 
 Status DuckDBAdapter::CreateTableOn(duckdb::Connection &conn,
                                     MySQLTableDef def) {
+  if (!def.schema.empty()) {
+    const std::string schema_sql =
+        "CREATE SCHEMA IF NOT EXISTS " + QuoteIdent(def.schema);
+    auto schema_result = conn.Query(schema_sql);
+    if (schema_result->HasError()) {
+      return Status::Error(StatusCode::kDuckDBError, schema_result->GetError());
+    }
+  }
   std::string sql = def.ddl_sql;
   if (sql.empty()) {
     TableId id{def.schema, def.name};
@@ -1054,8 +1074,12 @@ Status DuckDBAdapter::GetTableInfoOn(duckdb::Connection &conn, TableId table,
   auto st = EnsureInitialized();
   if (!st.ok()) return st;
 
+  std::string qualified = table.table;
+  if (!table.schema.empty()) {
+    qualified = table.schema + "." + table.table;
+  }
   const std::string sql =
-      "PRAGMA table_info('" + EscapeLiteral(table.table) + "')";
+      "PRAGMA table_info('" + EscapeLiteral(qualified) + "')";
 
   try {
     auto result = conn.Query(sql);
@@ -1465,14 +1489,13 @@ Status DuckDBAdapter::AppendRows(ApplyTxn &txn, TableId table, RowBatch batch) {
   }
 
   try {
-    // Always use main schema; schema separation is at the DuckDB file level.
     if (table.table.empty()) {
       return Status::Error(StatusCode::kInvalid, "Missing table name");
     }
     DUCKDB_ADAPTER_VERBOSE(
         "DuckDB AppendRows: using appender for %s, rows=%zu",
         table.table.c_str(), batch.rows.size());
-    duckdb::Appender *appender = GetOrCreateAppender(txn, table.table);
+    duckdb::Appender *appender = GetOrCreateAppender(txn, table);
     if (!appender) {
       return Status::Error(StatusCode::kInvalid, "Appender init failed");
     }
@@ -1517,7 +1540,7 @@ Status DuckDBAdapter::ApplyInsertDelta(ApplyTxn &txn, TableId table,
   // Append into insert-delta table for idempotent merge.
   st = AppendRows(txn, delta, std::move(batch));
   if (!st.ok()) return st;
-  st = FlushAppenderForTable(txn, delta.table);
+  st = FlushAppenderForTable(txn, delta);
   if (!st.ok()) return st;
 
   std::vector<std::string> columns;
@@ -1605,12 +1628,12 @@ Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
   if (!st.ok()) return st;
 
   try {
-    // Use main schema only - schema separation is at DuckDB file level
     const std::string delta_name = DeltaTableName(table);
+    TableId delta{table.schema, delta_name};
     DUCKDB_ADAPTER_VERBOSE(
         "DuckDB ApplyBulkUpdates: using appender for %s",
         delta_name.c_str());
-    duckdb::Appender *delta_appender = GetOrCreateAppender(txn, delta_name);
+    duckdb::Appender *delta_appender = GetOrCreateAppender(txn, delta);
     if (!delta_appender) {
       return Status::Error(StatusCode::kInvalid, "Appender init failed");
     }
@@ -1635,7 +1658,7 @@ Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
       delta_appender->EndRow();
       ++row_idx;
     }
-    st = FlushAppenderForTable(txn, delta_name);
+    st = FlushAppenderForTable(txn, delta);
     if (!st.ok()) return st;
 
     std::vector<std::string> columns;
@@ -1663,7 +1686,7 @@ Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
     }
 
     const std::string target = QualifiedName(table);
-    const std::string delta_quoted = QuoteIdent(delta_name);
+    const std::string delta_quoted = QualifiedName(delta);
 
     const std::vector<std::string> &join_columns =
         pk_columns.empty() ? columns : pk_columns;
@@ -1710,9 +1733,9 @@ Status DuckDBAdapter::ApplyBulkDeletes(ApplyTxn &txn, TableId table,
   if (!st.ok()) return st;
 
   try {
-    // Use main schema only - schema separation is at DuckDB file level
     const std::string delta_name = DeltaTableName(table);
-    duckdb::Appender *delta_appender = GetOrCreateAppender(txn, delta_name);
+    TableId delta{table.schema, delta_name};
+    duckdb::Appender *delta_appender = GetOrCreateAppender(txn, delta);
     if (!delta_appender) {
       return Status::Error(StatusCode::kInvalid, "Appender init failed");
     }
@@ -1725,7 +1748,7 @@ Status DuckDBAdapter::ApplyBulkDeletes(ApplyTxn &txn, TableId table,
       }
       delta_appender->EndRow();
     }
-    st = FlushAppenderForTable(txn, delta_name);
+    st = FlushAppenderForTable(txn, delta);
     if (!st.ok()) return st;
 
     std::vector<std::string> columns;
@@ -1747,7 +1770,7 @@ Status DuckDBAdapter::ApplyBulkDeletes(ApplyTxn &txn, TableId table,
     }
 
     const std::string target = QualifiedName(table);
-    const std::string delta_quoted = QuoteIdent(delta_name);
+    const std::string delta_quoted = QualifiedName(delta);
 
     const std::vector<std::string> &join_columns =
         pk_columns.empty() ? columns : pk_columns;

@@ -727,12 +727,10 @@ std::string MakeLoadingTableName(const std::string &base) {
 
 std::string QualifiedDuckdbName(const std::string &schema,
                                 const std::string &table) {
-  // Always use just table name (main schema) since:
-  // 1. MySQL ha_duckdb creates tables without schema prefix
-  // 2. Schema separation is handled at DuckDB file level (<schema>.duckdb)
-  // 3. Binlog applier expects tables in main schema
-  (void)schema;  // Schema is implicit via DuckDB file
-  return QuoteDuckdbIdent(table);
+  if (schema.empty()) {
+    return QuoteDuckdbIdent(table);
+  }
+  return QuoteDuckdbIdent(schema) + "." + QuoteDuckdbIdent(table);
 }
 
 bool ExecQuery(MYSQL *mysql, const std::string &sql) {
@@ -761,12 +759,12 @@ bool UnlockTablesForSnapshot(MYSQL *mysql) {
 bool DuckdbTableExists(DuckDBAdapter &adapter, const std::string &schema,
                        const std::string &table, bool *exists) {
   if (!exists) return false;
-  // Look for table in 'main' schema since that's where MySQL SE creates them.
-  const std::string main_sql =
-      "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main'"
-      " AND table_name = " +
+  const std::string schema_name = schema.empty() ? "main" : schema;
+  const std::string schema_sql =
+      "SELECT 1 FROM information_schema.tables WHERE table_schema = " +
+      QuoteDuckdbLiteral(schema_name) + " AND table_name = " +
       QuoteDuckdbLiteral(table) + " LIMIT 1";
-  auto result = adapter.ExecuteQuery(main_sql, {});
+  auto result = adapter.ExecuteQuery(schema_sql, {});
   if (!result.ok) {
     std::cerr << "DuckDB table check failed: " << result.error << "\n";
     return false;
@@ -777,21 +775,22 @@ bool DuckdbTableExists(DuckDBAdapter &adapter, const std::string &schema,
     return true;
   }
 
-  // Backward compatibility: older builds may have schema-qualified tables.
+  // Backward compatibility: older builds may have tables in main schema.
   if (!schema.empty()) {
-    const std::string schema_sql =
-        "SELECT 1 FROM information_schema.tables WHERE table_schema = " +
-        QuoteDuckdbLiteral(schema) + " AND table_name = " +
+    const std::string main_sql =
+        "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main'"
+        " AND table_name = " +
         QuoteDuckdbLiteral(table) + " LIMIT 1";
-    result = adapter.ExecuteQuery(schema_sql, {});
+    result = adapter.ExecuteQuery(main_sql, {});
     if (!result.ok) {
       std::cerr << "DuckDB table check failed: " << result.error << "\n";
       return false;
     }
     chunk = result.result->Fetch();
     if (chunk && chunk->size() > 0) {
-      std::cerr << "DuckDB table exists in schema '" << schema
-                << "' (legacy layout). Use --overwrite to rebuild in main.\n";
+      std::cerr << "DuckDB table exists in schema 'main' (legacy layout). "
+                   "Use --overwrite to rebuild in schema '"
+                << schema << "'.\n";
       *exists = true;
       return true;
     }

@@ -404,6 +404,8 @@ std::string RewriteQualifiedTables(
     bool matched = false;
     for (const auto &pattern : patterns) {
       if (MatchCI(sql, i, pattern.quoted_pattern)) {
+        out.append(pattern.quoted_schema);
+        out.push_back('.');
         out.append(pattern.quoted_table);
         i += pattern.quoted_pattern.size();
         matched = true;
@@ -417,6 +419,8 @@ std::string RewriteQualifiedTables(
           if (MatchCI(sql, table_start, pattern.quoted_table)) {
             const size_t table_end =
                 table_start + pattern.quoted_table.size();
+            out.append(pattern.quoted_schema);
+            out.push_back('.');
             out.append(pattern.quoted_table);
             i = table_end;
             matched = true;
@@ -424,6 +428,8 @@ std::string RewriteQualifiedTables(
           }
           if (MatchCI(sql, table_start, pattern.table)) {
             const size_t table_end = table_start + pattern.table.size();
+            out.append(pattern.quoted_schema);
+            out.push_back('.');
             out.append(pattern.quoted_table);
             i = table_end;
             matched = true;
@@ -443,6 +449,8 @@ std::string RewriteQualifiedTables(
             const bool right_ok =
                 (table_end >= len) || !IsIdentChar(sql[table_end]);
             if (left_ok && right_ok) {
+              out.append(pattern.quoted_schema);
+              out.push_back('.');
               out.append(pattern.quoted_table);
               i = table_end;
               matched = true;
@@ -455,6 +463,8 @@ std::string RewriteQualifiedTables(
             const bool right_ok =
                 (table_end >= len) || !IsIdentChar(sql[table_end]);
             if (left_ok && right_ok) {
+              out.append(pattern.quoted_schema);
+              out.push_back('.');
               out.append(pattern.quoted_table);
               i = table_end;
               matched = true;
@@ -471,6 +481,8 @@ std::string RewriteQualifiedTables(
             (table_end >= len) || !IsIdentChar(sql[table_end]);
         const bool not_qualified = (i == 0) || sql[i - 1] != '.';
         if (left_ok && right_ok && not_qualified) {
+          out.append(pattern.quoted_schema);
+          out.push_back('.');
           out.append(pattern.quoted_table);
           i = table_end;
           matched = true;

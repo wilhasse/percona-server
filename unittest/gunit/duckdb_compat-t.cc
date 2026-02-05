@@ -62,8 +62,9 @@ TEST(DuckDBCompatTest, RewriteQualifiedJoinWithBackticks) {
   const std::string rewritten = RewriteQualifiedTables(rewrite.sql, tables);
 
   EXPECT_EQ(
-      "SELECT \"t1\".\"id\", \"t2\".\"val\" FROM \"t1\" \"t1\" JOIN "
-      "\"t2\" \"t2\" ON \"t1\".\"id\" = \"t2\".\"id\"",
+      "SELECT \"db\".\"t1\".\"id\", \"db\".\"t2\".\"val\" FROM \"db\".\"t1\" "
+      "\"t1\" JOIN \"db\".\"t2\" \"t2\" ON \"db\".\"t1\".\"id\" = "
+      "\"db\".\"t2\".\"id\"",
       rewritten);
 }
 
@@ -76,7 +77,7 @@ TEST(DuckDBCompatTest, RewriteSkipsStringLiterals) {
   const auto tables = MakeTables({{"db", "t1"}});
   const std::string rewritten = RewriteQualifiedTables(rewrite.sql, tables);
 
-  EXPECT_EQ("SELECT 'db.t1' AS s FROM \"t1\"", rewritten);
+  EXPECT_EQ("SELECT 'db.t1' AS s FROM \"db\".\"t1\"", rewritten);
 }
 
 TEST(DuckDBCompatTest, RewriteOnlyMappedTables) {
@@ -89,8 +90,10 @@ TEST(DuckDBCompatTest, RewriteOnlyMappedTables) {
   const auto tables = MakeTables({{"db", "t1"}});
   const std::string rewritten = RewriteQualifiedTables(rewrite.sql, tables);
 
-  EXPECT_EQ("SELECT * FROM other.t2 JOIN \"t1\" ON other.t2.id = \"t1\".id",
-            rewritten);
+  EXPECT_EQ(
+      "SELECT * FROM other.t2 JOIN \"db\".\"t1\" ON other.t2.id = "
+      "\"db\".\"t1\".id",
+      rewritten);
 }
 
 TEST(DuckDBCompatTest, RewriteIfFunction) {

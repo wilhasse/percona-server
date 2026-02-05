@@ -97,6 +97,7 @@ class ha_duckdb : public handler {
 
   THR_LOCK_DATA m_lock;
   std::string m_table_path;
+  std::string m_schema_name;
   std::string m_table_name;
   std::unique_ptr<duckdb::DuckDB> m_db;
   std::unique_ptr<duckdb::Connection> m_conn;

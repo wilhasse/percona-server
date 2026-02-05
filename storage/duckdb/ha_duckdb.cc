@@ -173,6 +173,19 @@ std::string quote_ident(const char *name, size_t length) {
   return out;
 }
 
+std::string qualified_table_name(const std::string &schema,
+                                 const std::string &table) {
+  if (schema.empty()) {
+    return quote_ident(table.c_str(), table.size());
+  }
+  std::string qualified;
+  qualified.reserve(schema.size() + table.size() + 3);
+  qualified.append(quote_ident(schema.c_str(), schema.size()));
+  qualified.push_back('.');
+  qualified.append(quote_ident(table.c_str(), table.size()));
+  return qualified;
+}
+
 bool is_binary_field(const Field *field) {
   switch (field->type()) {
     case MYSQL_TYPE_BLOB:
@@ -1301,9 +1314,25 @@ int ha_duckdb::create(const char *, TABLE *table_arg, HA_CREATE_INFO *,
     duckdb::DBConfig config(false);
     duckdb::DuckDB db(path, &config);
     duckdb::Connection conn(db);
+    std::string schema_name;
+    if (table_arg->s->db.str != nullptr && table_arg->s->db.length > 0) {
+      schema_name.assign(table_arg->s->db.str, table_arg->s->db.length);
+    }
+    if (!schema_name.empty()) {
+      const std::string schema_sql =
+          "CREATE SCHEMA IF NOT EXISTS " +
+          quote_ident(schema_name.c_str(), schema_name.size());
+      auto schema_result = conn.Query(schema_sql);
+      if (schema_result->HasError()) {
+        my_error(ER_CANT_CREATE_TABLE, MYF(0), table_arg->s->table_name.str,
+                 HA_ERR_GENERIC, schema_result->GetError().c_str());
+        return HA_ERR_GENERIC;
+      }
+    }
     std::string create_sql = "CREATE TABLE ";
-    create_sql += quote_ident(table_arg->s->table_name.str,
-                              table_arg->s->table_name.length);
+    const std::string table_name(table_arg->s->table_name.str,
+                                 table_arg->s->table_name.length);
+    create_sql += qualified_table_name(schema_name, table_name);
     create_sql += " (";
     for (uint i = 0; i < table_arg->s->fields; ++i) {
       const Field *field = table_arg->field[i];
@@ -1380,6 +1409,10 @@ int ha_duckdb::open(const char *, int, unsigned int, const dd::Table *) {
   }
   thr_lock_data_init(&share->lock, &m_lock, nullptr);
   m_table_path = share->path;
+  m_schema_name.clear();
+  if (table_share->db.str != nullptr && table_share->db.length > 0) {
+    m_schema_name.assign(table_share->db.str, table_share->db.length);
+  }
   m_table_name = std::string(table_share->table_name.str,
                              table_share->table_name.length);
 
@@ -1412,9 +1445,8 @@ int ha_duckdb::rnd_init(bool) {
   if (!m_conn) return HA_ERR_GENERIC;
 
   try {
-    const std::string query = "SELECT * FROM " +
-                              quote_ident(m_table_name.c_str(),
-                                          m_table_name.size());
+    const std::string query =
+        "SELECT * FROM " + qualified_table_name(m_schema_name, m_table_name);
     m_result = m_conn->SendQuery(query);
     if (!m_result || m_result->HasError()) {
       const std::string err = m_result ? m_result->GetError() :
@@ -1500,28 +1532,51 @@ int ha_duckdb::write_row(uchar *buf) {
   if (buf == nullptr || table == nullptr || !m_conn) return HA_ERR_GENERIC;
 
   try {
-    duckdb::Appender appender(*m_conn, m_table_name);
-
-    FieldOffsetGuard guard(table, buf);
-    const uint field_count = table->s->fields;
-    appender.BeginRow();
-    for (uint i = 0; i < field_count; ++i) {
-      Field *field = table->field[i];
-      if (field->is_null()) {
-        appender.Append(duckdb::Value());
-        continue;
+    if (m_schema_name.empty()) {
+      duckdb::Appender appender(*m_conn, m_table_name);
+      FieldOffsetGuard guard(table, buf);
+      const uint field_count = table->s->fields;
+      appender.BeginRow();
+      for (uint i = 0; i < field_count; ++i) {
+        Field *field = table->field[i];
+        if (field->is_null()) {
+          appender.Append(duckdb::Value());
+          continue;
+        }
+        String tmp;
+        field->val_str(&tmp);
+        if (is_binary_field(field)) {
+          appender.Append(duckdb::Value::BLOB_RAW(
+              std::string(tmp.ptr(), tmp.length())));
+        } else {
+          appender.Append(tmp.ptr(), static_cast<uint32_t>(tmp.length()));
+        }
       }
-      String tmp;
-      field->val_str(&tmp);
-      if (is_binary_field(field)) {
-        appender.Append(duckdb::Value::BLOB_RAW(
-            std::string(tmp.ptr(), tmp.length())));
-      } else {
-        appender.Append(tmp.ptr(), static_cast<uint32_t>(tmp.length()));
+      appender.EndRow();
+      appender.Close();
+    } else {
+      duckdb::Appender appender(*m_conn, m_schema_name, m_table_name);
+      FieldOffsetGuard guard(table, buf);
+      const uint field_count = table->s->fields;
+      appender.BeginRow();
+      for (uint i = 0; i < field_count; ++i) {
+        Field *field = table->field[i];
+        if (field->is_null()) {
+          appender.Append(duckdb::Value());
+          continue;
+        }
+        String tmp;
+        field->val_str(&tmp);
+        if (is_binary_field(field)) {
+          appender.Append(duckdb::Value::BLOB_RAW(
+              std::string(tmp.ptr(), tmp.length())));
+        } else {
+          appender.Append(tmp.ptr(), static_cast<uint32_t>(tmp.length()));
+        }
       }
+      appender.EndRow();
+      appender.Close();
     }
-    appender.EndRow();
-    appender.Close();
   } catch (const std::exception &ex) {
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), ex.what());
     return HA_ERR_GENERIC;
@@ -1557,7 +1612,7 @@ int ha_duckdb::update_row(const uchar *old_data, uchar *new_data) {
       collect_values(table, old_data, where_fields);
 
   std::string sql = "UPDATE ";
-  sql += quote_ident(m_table_name.c_str(), m_table_name.size());
+  sql += qualified_table_name(m_schema_name, m_table_name);
   sql += " SET ";
   sql += build_set_clause(set_fields, set_values);
   sql += " WHERE ";
@@ -1596,7 +1651,7 @@ int ha_duckdb::delete_row(const uchar *buf) {
       collect_values(table, buf, where_fields);
 
   std::string sql = "DELETE FROM ";
-  sql += quote_ident(m_table_name.c_str(), m_table_name.size());
+  sql += qualified_table_name(m_schema_name, m_table_name);
   sql += " WHERE ";
   sql += build_where_clause(where_fields, where_values);
 
@@ -1659,6 +1714,7 @@ int ha_duckdb::load_table(const TABLE &table) {
       (table.s->db.str != nullptr && table.s->db.length > 0)
           ? std::string(table.s->db.str, table.s->db.length)
           : std::string();
+  const std::string schema_name = db_name;
   if (loaded_tables != nullptr &&
       loaded_tables->is_replicated(db_name, table.s->table_name.str)) {
     std::ostringstream oss;
@@ -1681,18 +1737,30 @@ int ha_duckdb::load_table(const TABLE &table) {
   try {
     duckdb::DuckDB db(path);
     duckdb::Connection con(db);
+    if (!schema_name.empty()) {
+      const std::string schema_sql =
+          "CREATE SCHEMA IF NOT EXISTS " +
+          quote_ident(schema_name.c_str(), schema_name.size());
+      auto schema_result = con.Query(schema_sql);
+      if (schema_result->HasError()) {
+        my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+                 schema_result->GetError().c_str());
+        return HA_ERR_GENERIC;
+      }
+    }
     const std::string table_name(table.s->table_name.str,
                                  table.s->table_name.length);
     const std::string temp_table =
         make_loading_table_name(table_name, table.in_use);
     const std::string quoted_table =
-        quote_ident(table.s->table_name.str, table.s->table_name.length);
+        qualified_table_name(schema_name, table_name);
     const std::string quoted_temp =
-        quote_ident(temp_table.c_str(), temp_table.size());
+        qualified_table_name(schema_name, temp_table);
 
     const std::string exists_sql =
-        "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' "
-        "AND table_name = " + value_to_sql(duckdb::Value(table_name)) +
+        "SELECT 1 FROM information_schema.tables WHERE table_schema = " +
+        value_to_sql(duckdb::Value(schema_name.empty() ? "main" : schema_name)) +
+        " AND table_name = " + value_to_sql(duckdb::Value(table_name)) +
         " LIMIT 1";
     auto exists_result = con.Query(exists_sql);
     if (exists_result->HasError()) {
@@ -1735,33 +1803,61 @@ int ha_duckdb::load_table(const TABLE &table) {
       return HA_ERR_GENERIC;
     }
 
-    duckdb::Appender appender(con, temp_table);
-
-    handler *primary = table.file;
-    TABLE &mutable_table = const_cast<TABLE &>(table);
-    if (primary->ha_rnd_init(true) != 0) {
-      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-               "Failed to initialize primary table scan");
-      return HA_ERR_GENERIC;
-    }
-    auto scan_guard = create_scope_guard([&]() { primary->ha_rnd_end(); });
-
-    int error = 0;
-    while (!(error = primary->ha_rnd_next(mutable_table.record[0]))) {
-      appender.BeginRow();
-      for (uint i = 0; i < table.s->fields; ++i) {
-        Field *field = mutable_table.field[i];
-        appender.Append(field_value(field));
+    if (schema_name.empty()) {
+      duckdb::Appender appender(con, temp_table);
+      handler *primary = table.file;
+      TABLE &mutable_table = const_cast<TABLE &>(table);
+      if (primary->ha_rnd_init(true) != 0) {
+        my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+                 "Failed to initialize primary table scan");
+        return HA_ERR_GENERIC;
       }
-      appender.EndRow();
-    }
-    if (error != HA_ERR_END_OF_FILE && error != 0) {
-      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-               "Primary table scan failed");
-      return HA_ERR_GENERIC;
-    }
+      auto scan_guard = create_scope_guard([&]() { primary->ha_rnd_end(); });
 
-    appender.Close();
+      int error = 0;
+      while (!(error = primary->ha_rnd_next(mutable_table.record[0]))) {
+        appender.BeginRow();
+        for (uint i = 0; i < table.s->fields; ++i) {
+          Field *field = mutable_table.field[i];
+          appender.Append(field_value(field));
+        }
+        appender.EndRow();
+      }
+      if (error != HA_ERR_END_OF_FILE && error != 0) {
+        my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+                 "Primary table scan failed");
+        return HA_ERR_GENERIC;
+      }
+
+      appender.Close();
+    } else {
+      duckdb::Appender appender(con, schema_name, temp_table);
+      handler *primary = table.file;
+      TABLE &mutable_table = const_cast<TABLE &>(table);
+      if (primary->ha_rnd_init(true) != 0) {
+        my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+                 "Failed to initialize primary table scan");
+        return HA_ERR_GENERIC;
+      }
+      auto scan_guard = create_scope_guard([&]() { primary->ha_rnd_end(); });
+
+      int error = 0;
+      while (!(error = primary->ha_rnd_next(mutable_table.record[0]))) {
+        appender.BeginRow();
+        for (uint i = 0; i < table.s->fields; ++i) {
+          Field *field = mutable_table.field[i];
+          appender.Append(field_value(field));
+        }
+        appender.EndRow();
+      }
+      if (error != HA_ERR_END_OF_FILE && error != 0) {
+        my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+                 "Primary table scan failed");
+        return HA_ERR_GENERIC;
+      }
+
+      appender.Close();
+    }
 
     auto begin_result = con.Query("BEGIN TRANSACTION");
     if (begin_result->HasError()) {
