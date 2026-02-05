@@ -23,6 +23,24 @@ Status: design note for DUCKM-84.
 SET PERSIST init_connect='SET SESSION use_secondary_engine=ON; SET SESSION secondary_engine_cost_threshold=0;';
 ```
 
+### Plugin-managed defaults (recommended)
+The DuckDB plugin exposes sysvars that update `init_connect` for you:
+
+```
+SET GLOBAL duckdb_offload_default_mode = ON;
+SET GLOBAL duckdb_offload_cost_threshold = 0;
+```
+
+Notes:
+- `init_connect` only applies to non-SUPER users.
+- Changing these sysvars updates the `init_connect` snippet automatically.
+
+## Verifying offload
+- Use `EXPLAIN` (or `EXPLAIN FORMAT=JSON`) and confirm the plan indicates
+  secondary-engine execution for eligible queries.
+- In `FORCED` mode, a query that is not offloadable will error; in `ON` mode
+  it will fall back to MySQL.
+
 ## Open questions
 - Should we surface mixed-engine join fallback in docs or via a server warning?
 - Should the plugin provide a helper/sysvar to set per-session defaults for
