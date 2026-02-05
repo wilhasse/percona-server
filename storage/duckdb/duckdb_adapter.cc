@@ -59,7 +59,7 @@ duckdb::Appender *GetOrCreateAppender(ApplyTxn &txn, const TableId &table) {
     if (table.schema.empty()) {
       slot = std::make_unique<duckdb::Appender>(*txn.conn, table.table);
     } else {
-      slot = std::make_unique<duckdb::Appender>(*txn.conn, table.schema,
+      slot = std::make_unique<duckdb::Appender>(*txn.conn, "main",
                                                 table.table);
     }
   }

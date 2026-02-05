@@ -1626,7 +1626,7 @@ int ha_duckdb::write_row(uchar *buf) {
       appender.EndRow();
       appender.Close();
     } else {
-      duckdb::Appender appender(*m_conn, m_schema_name, m_table_name);
+      duckdb::Appender appender(*m_conn, "main", m_table_name);
       FieldOffsetGuard guard(table, buf);
       const uint field_count = table->s->fields;
       appender.BeginRow();
@@ -1895,7 +1895,7 @@ int ha_duckdb::load_table(const TABLE &table) {
 
       appender.Close();
     } else {
-      duckdb::Appender appender(con, schema_name, temp_table);
+      duckdb::Appender appender(con, "main", temp_table);
       handler *primary = table.file;
       TABLE &mutable_table = const_cast<TABLE &>(table);
       if (primary->ha_rnd_init(true) != 0) {
@@ -1936,8 +1936,9 @@ int ha_duckdb::load_table(const TABLE &table) {
                drop_result->GetError().c_str());
       return HA_ERR_GENERIC;
     }
-    auto rename_result = con.Query("ALTER TABLE " + quoted_temp +
-                                   " RENAME TO " + quoted_table);
+    auto rename_result = con.Query(
+        "ALTER TABLE " + quoted_temp + " RENAME TO " +
+        quote_ident(table_name.c_str(), table_name.size()));
     if (rename_result->HasError()) {
       con.Query("ROLLBACK");
       my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
