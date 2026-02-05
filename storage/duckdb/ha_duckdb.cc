@@ -179,8 +179,10 @@ std::string qualified_table_name(const std::string &schema,
     return quote_ident(table.c_str(), table.size());
   }
   std::string qualified;
-  qualified.reserve(schema.size() + table.size() + 3);
+  qualified.reserve(schema.size() + table.size() + 8);
   qualified.append(quote_ident(schema.c_str(), schema.size()));
+  qualified.push_back('.');
+  qualified.append(quote_ident("main", 4));
   qualified.push_back('.');
   qualified.append(quote_ident(table.c_str(), table.size()));
   return qualified;
@@ -1372,17 +1374,6 @@ int ha_duckdb::create(const char *, TABLE *table_arg, HA_CREATE_INFO *,
     if (table_arg->s->db.str != nullptr && table_arg->s->db.length > 0) {
       schema_name.assign(table_arg->s->db.str, table_arg->s->db.length);
     }
-    if (!schema_name.empty()) {
-      const std::string schema_sql =
-          "CREATE SCHEMA IF NOT EXISTS " +
-          quote_ident(schema_name.c_str(), schema_name.size());
-      auto schema_result = conn.Query(schema_sql);
-      if (schema_result->HasError()) {
-        my_error(ER_CANT_CREATE_TABLE, MYF(0), table_arg->s->table_name.str,
-                 HA_ERR_GENERIC, schema_result->GetError().c_str());
-        return HA_ERR_GENERIC;
-      }
-    }
     std::string create_sql = "CREATE TABLE ";
     const std::string table_name(table_arg->s->table_name.str,
                                  table_arg->s->table_name.length);
@@ -1817,17 +1808,6 @@ int ha_duckdb::load_table(const TABLE &table) {
   try {
     duckdb::DuckDB db(path);
     duckdb::Connection con(db);
-    if (!schema_name.empty()) {
-      const std::string schema_sql =
-          "CREATE SCHEMA IF NOT EXISTS " +
-          quote_ident(schema_name.c_str(), schema_name.size());
-      auto schema_result = con.Query(schema_sql);
-      if (schema_result->HasError()) {
-        my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-                 schema_result->GetError().c_str());
-        return HA_ERR_GENERIC;
-      }
-    }
     const std::string table_name(table.s->table_name.str,
                                  table.s->table_name.length);
     const std::string temp_table =
@@ -1838,9 +1818,13 @@ int ha_duckdb::load_table(const TABLE &table) {
         qualified_table_name(schema_name, temp_table);
 
     const std::string exists_sql =
-        "SELECT 1 FROM information_schema.tables WHERE table_schema = " +
-        value_to_sql(duckdb::Value(schema_name.empty() ? "main" : schema_name)) +
-        " AND table_name = " + value_to_sql(duckdb::Value(table_name)) +
+        "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' "
+        "AND table_name = " +
+        value_to_sql(duckdb::Value(table_name)) +
+        (schema_name.empty()
+             ? std::string()
+             : " AND table_catalog = " +
+                   value_to_sql(duckdb::Value(schema_name))) +
         " LIMIT 1";
     auto exists_result = con.Query(exists_sql);
     if (exists_result->HasError()) {
