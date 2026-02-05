@@ -66,6 +66,52 @@
 namespace duckdb_se {
 namespace {
 
+std::string QuoteDuckdbLiteral(const std::string &value) {
+  std::string out;
+  out.reserve(value.size() + 2);
+  out.push_back('\'');
+  for (char ch : value) {
+    if (ch == '\'') out.push_back('\'');
+    out.push_back(ch);
+  }
+  out.push_back('\'');
+  return out;
+}
+
+bool IsDuckdbInternalTableName(const std::string &name) {
+  if (name == "__repl_state") return true;
+  if (name.rfind("__delta_", 0) == 0) return true;
+  if (name.rfind("__delta_insert_", 0) == 0) return true;
+  if (name.rfind("__loading_", 0) == 0) return true;
+  return false;
+}
+
+Status RegisterExistingTablesForSchema(DuckDBAdapter &adapter,
+                                       const std::string &schema,
+                                       const std::string &path) {
+  const std::string schema_name = schema.empty() ? "main" : schema;
+  const std::string sql =
+      "SELECT table_name FROM information_schema.tables WHERE table_schema = " +
+      QuoteDuckdbLiteral(schema_name);
+  auto result = adapter.ExecuteQuery(sql, {});
+  if (!result.ok) {
+    return Status::Error(StatusCode::kDuckDBError, result.error);
+  }
+
+  while (true) {
+    auto chunk = result.result->Fetch();
+    if (!chunk || chunk->size() == 0) break;
+    for (duckdb::idx_t row = 0; row < chunk->size(); ++row) {
+      auto name_val = chunk->GetValue(0, row);
+      if (name_val.IsNull()) continue;
+      const std::string table = name_val.ToString();
+      if (IsDuckdbInternalTableName(table)) continue;
+      RegisterLoadedTable(schema, table, path, /*replicated=*/true);
+    }
+  }
+  return Status::Ok();
+}
+
 struct SchemaApplierState {
   std::string schema;
   std::unique_ptr<DuckDBAdapter> adapter;
@@ -1227,6 +1273,8 @@ Status EnsureSchemaApplier(const std::string &schema,
     entry.applier = std::make_unique<DuckDBBinlogApplier>(entry.adapter.get(),
                                                           applier_options);
     st = LoadSchemaVersion(&entry);
+    if (!st.ok()) return st;
+    st = RegisterExistingTablesForSchema(*entry.adapter, schema, path);
     if (!st.ok()) return st;
   }
   *out_state = &entry;
