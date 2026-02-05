@@ -1765,16 +1765,29 @@ Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
     const std::string delta_quoted = QualifiedName(delta);
 
     const std::vector<std::string> &join_columns = delta_columns;
+    std::string delta_source;
+    if (use_pk) {
+      std::ostringstream distinct_sql;
+      distinct_sql << "(SELECT DISTINCT ";
+      for (size_t i = 0; i < join_columns.size(); ++i) {
+        if (i > 0) distinct_sql << ", ";
+        distinct_sql << QuoteIdent(join_columns[i]);
+      }
+      distinct_sql << " FROM " << delta_quoted << ") d";
+      delta_source = distinct_sql.str();
+    } else {
+      delta_source = delta_quoted + " d";
+    }
+
     std::string join_sql;
     for (size_t i = 0; i < join_columns.size(); ++i) {
       if (i > 0) join_sql += " AND ";
       const std::string col = QuoteIdent(join_columns[i]);
-      join_sql += target + "." + col + " IS NOT DISTINCT FROM " + delta_quoted +
-                  "." + col;
+      join_sql += target + "." + col + " IS NOT DISTINCT FROM d." + col;
     }
 
     const std::string delete_sql =
-        "DELETE FROM " + target + " USING " + delta_quoted + " WHERE " + join_sql;
+        "DELETE FROM " + target + " USING " + delta_source + " WHERE " + join_sql;
     st = ExecuteDDLOn(*txn.conn, delete_sql);
     if (!st.ok()) return st;
 
@@ -1877,16 +1890,29 @@ Status DuckDBAdapter::ApplyBulkDeletes(ApplyTxn &txn, TableId table,
     const std::string delta_quoted = QualifiedName(delta);
 
     const std::vector<std::string> &join_columns = delta_columns;
+    std::string delta_source;
+    if (use_pk) {
+      std::ostringstream distinct_sql;
+      distinct_sql << "(SELECT DISTINCT ";
+      for (size_t i = 0; i < join_columns.size(); ++i) {
+        if (i > 0) distinct_sql << ", ";
+        distinct_sql << QuoteIdent(join_columns[i]);
+      }
+      distinct_sql << " FROM " << delta_quoted << ") d";
+      delta_source = distinct_sql.str();
+    } else {
+      delta_source = delta_quoted + " d";
+    }
+
     std::string join_sql;
     for (size_t i = 0; i < join_columns.size(); ++i) {
       if (i > 0) join_sql += " AND ";
       const std::string col = QuoteIdent(join_columns[i]);
-      join_sql += target + "." + col + " IS NOT DISTINCT FROM " + delta_quoted +
-                  "." + col;
+      join_sql += target + "." + col + " IS NOT DISTINCT FROM d." + col;
     }
 
     const std::string delete_sql =
-        "DELETE FROM " + target + " USING " + delta_quoted + " WHERE " + join_sql;
+        "DELETE FROM " + target + " USING " + delta_source + " WHERE " + join_sql;
     st = ExecuteDDLOn(*txn.conn, delete_sql);
     if (!st.ok()) return st;
 
