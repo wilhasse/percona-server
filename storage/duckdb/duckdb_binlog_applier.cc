@@ -1840,44 +1840,36 @@ Status DuckDBBinlogApplier::ApplyWatermark() {
         "DuckDB ApplyWatermark: MergeGtidIntoSet succeeded, merged_set='%s'",
         merged_set.c_str());
 
-    if (found) {
-      // Use DELETE + INSERT instead of UPDATE to work around DuckDB UTF-8
-      // validation issue that can occur during UPDATE processing.
-      DUCKDB_APPLY_VERBOSE(
-          "DuckDB ApplyWatermark: building DELETE+INSERT SQL (found=true)");
-      std::string delete_sql = "DELETE FROM __repl_state WHERE channel = '" +
-                               std::string(kReplChannel) + "'";
-      auto del_result = apply_txn_.conn->Query(delete_sql);
-      if (del_result->HasError()) {
-        sql_print_warning("DuckDB ApplyWatermark: DELETE failed: %s",
-                          del_result->GetError().c_str());
-        return Status::Error(StatusCode::kDuckDBError, del_result->GetError());
-      }
-      DUCKDB_APPLY_VERBOSE("DuckDB ApplyWatermark: DELETE succeeded");
-      // Fall through to INSERT path below
+    DUCKDB_APPLY_VERBOSE(
+        "DuckDB ApplyWatermark: building UPSERT SQL, binlog_file='%s' len=%zu",
+        current_binlog_file_.c_str(), current_binlog_file_.size());
+    const std::string snapshot_sql =
+        snapshot.empty() ? "''" : "'" + EscapeLiteral(snapshot) + "'";
+    std::string insert_cols =
+        "channel, snapshot_gtid_set, applied_gtid_set, last_commit_ts, "
+        "schema_version";
+    std::string insert_vals = "'" + std::string(kReplChannel) + "', " +
+                              snapshot_sql + ", '" + EscapeLiteral(merged_set) +
+                              "', '" + EscapeLiteral(commit_ts) + "', " +
+                              schema_sql;
+    std::string update_sql =
+        "applied_gtid_set = excluded.applied_gtid_set, "
+        "last_commit_ts = excluded.last_commit_ts, "
+        "schema_version = COALESCE(excluded.schema_version, "
+        "__repl_state.schema_version), "
+        "snapshot_gtid_set = CASE WHEN excluded.snapshot_gtid_set = '' "
+        "THEN __repl_state.snapshot_gtid_set "
+        "ELSE excluded.snapshot_gtid_set END";
+    if (update_binlog) {
+      insert_cols += ", binlog_file, binlog_pos";
+      insert_vals += ", '" + EscapeLiteral(current_binlog_file_) + "', " +
+                     std::to_string(current_binlog_pos_);
+      update_sql +=
+          ", binlog_file = excluded.binlog_file, "
+          "binlog_pos = excluded.binlog_pos";
     }
-    // Always INSERT (either fresh row or after DELETE)
-    {
-      DUCKDB_APPLY_VERBOSE(
-          "DuckDB ApplyWatermark: building INSERT SQL, binlog_file='%s' len=%zu",
-          current_binlog_file_.c_str(), current_binlog_file_.size());
-      const std::string snapshot_sql =
-          snapshot.empty() ? "''" : "'" + EscapeLiteral(snapshot) + "'";
-      std::string insert_cols =
-          "channel, snapshot_gtid_set, applied_gtid_set, last_commit_ts, "
-          "schema_version";
-      std::string insert_vals = "'" + std::string(kReplChannel) + "', " +
-                                snapshot_sql + ", '" +
-                                EscapeLiteral(merged_set) + "', '" +
-                                EscapeLiteral(commit_ts) + "', " + schema_sql;
-      if (update_binlog) {
-        insert_cols += ", binlog_file, binlog_pos";
-        insert_vals += ", '" + EscapeLiteral(current_binlog_file_) + "', " +
-                       std::to_string(current_binlog_pos_);
-      }
-      sql = "INSERT INTO __repl_state (" + insert_cols + ") VALUES (" +
-            insert_vals + ")";
-    }
+    sql = "INSERT INTO __repl_state (" + insert_cols + ") VALUES (" +
+          insert_vals + ") ON CONFLICT(channel) DO UPDATE SET " + update_sql;
     repl_applied_set_ = merged_set;
   } else {
     if (!update_binlog) {
