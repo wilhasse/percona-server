@@ -1227,7 +1227,9 @@ Status DuckDBBinlogApplier::CommitTransaction() {
   if (skip_txn_) {
     in_txn_ = false;
     skip_txn_ = false;
-    ResetBuffers();
+    if (!BatchingEnabled() || !have_buffered_) {
+      ResetBuffers();
+    }
     txn_has_ddl_ = false;
     return Status::Ok();
   }
