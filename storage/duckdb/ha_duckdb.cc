@@ -186,6 +186,55 @@ std::string qualified_table_name(const std::string &schema,
   return qualified;
 }
 
+bool DuckdbTableExistsInFile(const std::string &path,
+                             const std::string &schema,
+                             const std::string &table, bool *exists) {
+  if (!exists) return false;
+  *exists = false;
+  try {
+    duckdb::DBConfig config(true);
+    duckdb::DuckDB db(path, &config);
+    duckdb::Connection conn(db);
+    const std::string schema_name = schema.empty() ? "main" : schema;
+    const std::string sql =
+        "SELECT 1 FROM information_schema.tables WHERE table_schema = " +
+        value_to_sql(duckdb::Value(schema_name)) + " AND table_name = " +
+        value_to_sql(duckdb::Value(table)) + " LIMIT 1";
+    auto result = conn.Query(sql);
+    if (result->HasError()) {
+      sql_print_warning("DuckDB table check failed: %s",
+                        result->GetError().c_str());
+      return false;
+    }
+    auto chunk = result->Fetch();
+    if (chunk && chunk->size() > 0) {
+      *exists = true;
+      return true;
+    }
+    if (!schema.empty()) {
+      const std::string fallback_sql =
+          "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' "
+          "AND table_name = " +
+          value_to_sql(duckdb::Value(table)) + " LIMIT 1";
+      result = conn.Query(fallback_sql);
+      if (result->HasError()) {
+        sql_print_warning("DuckDB table check failed: %s",
+                          result->GetError().c_str());
+        return false;
+      }
+      chunk = result->Fetch();
+      if (chunk && chunk->size() > 0) {
+        *exists = true;
+        return true;
+      }
+    }
+  } catch (const std::exception &ex) {
+    sql_print_warning("DuckDB table existence check failed: %s", ex.what());
+    return false;
+  }
+  return true;
+}
+
 bool is_binary_field(const Field *field) {
   switch (field->type()) {
     case MYSQL_TYPE_BLOB:
@@ -1373,6 +1422,32 @@ int ha_duckdb::create(const char *, TABLE *table_arg, HA_CREATE_INFO *,
 int ha_duckdb::open(const char *, int, unsigned int, const dd::Table *) {
   DuckdbTableState *share =
       loaded_tables->get(table_share->db.str, table_share->table_name.str);
+  if (share == nullptr && table_share->is_secondary_engine()) {
+    const std::string path = resolve_duckdb_path(table_share);
+    MY_STAT stat_buf;
+    if (my_stat(path.c_str(), &stat_buf, MYF(0)) != nullptr) {
+      std::string schema;
+      if (table_share->db.str != nullptr && table_share->db.length > 0) {
+        schema.assign(table_share->db.str, table_share->db.length);
+      }
+      std::string table_name;
+      if (table_share->table_name.str != nullptr &&
+          table_share->table_name.length > 0) {
+        table_name.assign(table_share->table_name.str,
+                          table_share->table_name.length);
+      }
+      if (!table_name.empty()) {
+        bool exists = false;
+        if (DuckdbTableExistsInFile(path, schema, table_name, &exists) &&
+            exists) {
+          const bool replicated = !table_share->secondary_load;
+          loaded_tables->add(schema, table_name, path, replicated);
+          share =
+              loaded_tables->get(table_share->db.str, table_share->table_name.str);
+        }
+      }
+    }
+  }
   if (share == nullptr && table_share->is_secondary_engine()) {
     std::string reason = build_missing_loaded_tables_reason(current_thd);
     if (reason.empty()) {
