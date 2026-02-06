@@ -95,9 +95,13 @@ struct BinlogApplyState {
   std::atomic<uint64_t> applied_transactions{0};
   std::atomic<uint64_t> applied_rows{0};
   std::atomic<uint64_t> applied_bytes{0};
+  std::atomic<uint64_t> last_batch_size{0};
   std::atomic<uint64_t> last_flush_rows{0};
   std::atomic<uint64_t> last_flush_bytes{0};
   std::atomic<uint64_t> last_flush_ms{0};
+  std::atomic<uint64_t> last_stage_ms{0};
+  std::atomic<uint64_t> last_merge_delete_ms{0};
+  std::atomic<uint64_t> last_apply_total_ms{0};
   std::atomic<uint64_t> last_throttle_ms{0};
   std::atomic<uint64_t> total_throttle_ms{0};
   std::atomic<uint64_t> last_commit_epoch_ms{0};
@@ -708,9 +712,13 @@ BinlogApplyMetrics GetBinlogApplyMetrics() {
   metrics.applied_transactions = state.applied_transactions.load();
   metrics.applied_rows = state.applied_rows.load();
   metrics.applied_bytes = state.applied_bytes.load();
+  metrics.last_batch_size = state.last_batch_size.load();
   metrics.last_flush_rows = state.last_flush_rows.load();
   metrics.last_flush_bytes = state.last_flush_bytes.load();
   metrics.last_flush_ms = state.last_flush_ms.load();
+  metrics.last_stage_ms = state.last_stage_ms.load();
+  metrics.last_merge_delete_ms = state.last_merge_delete_ms.load();
+  metrics.last_apply_total_ms = state.last_apply_total_ms.load();
   metrics.last_throttle_ms = state.last_throttle_ms.load();
   metrics.total_throttle_ms = state.total_throttle_ms.load();
   metrics.last_commit_epoch_ms = state.last_commit_epoch_ms.load();
@@ -1304,44 +1312,51 @@ Status DuckDBBinlogApplier::CommitTransaction() {
     }
   }
 
-  const auto commit_start = std::chrono::steady_clock::now();
-  DUCKDB_APPLY_VERBOSE("DuckDB CommitTransaction: calling ApplyWatermark");
-  st = ApplyWatermark();
-  if (!st.ok()) {
-    sql_print_warning("DuckDB CommitTransaction: ApplyWatermark failed: %s",
-                      st.message.c_str());
-    RollbackTransaction();
-    return st;
-  }
-
-  DUCKDB_APPLY_VERBOSE("DuckDB CommitTransaction: calling CommitApplyTxn");
-  st = adapter_->CommitApplyTxn(apply_txn_);
+  st = CommitApplyBatch(current_gtid_.value, should_pause);
   if (!st.ok()) {
     RollbackTransaction();
     return st;
   }
-  const auto commit_end = std::chrono::steady_clock::now();
-  const auto commit_ms =
-      std::chrono::duration_cast<std::chrono::milliseconds>(commit_end -
-                                                            commit_start);
-  state.applied_transactions.fetch_add(1);
-  state.last_commit_epoch_ms.store(NowEpochMs());
-  state.last_commit_ms.store(static_cast<uint64_t>(commit_ms.count()));
-  {
-    std::lock_guard<std::mutex> guard(state.gtid_mutex);
-    state.last_gtid = current_gtid_.value;
-  }
-  if (should_pause) {
-    SetBinlogApplyPaused(true);
-  }
-
-  apply_txn_ = ApplyTxn{};
   in_txn_ = false;
   txn_has_ddl_ = false;
-  ResetBatchState();
-  insert_delta_tables_.clear();
-  delta_tables_.clear();
-  ResetBuffers();
+  return Status::Ok();
+}
+
+Status DuckDBBinlogApplier::CommitPendingBatch() {
+  if (in_txn_) {
+    return Status::Error(
+        StatusCode::kInvalid,
+        "Cannot commit pending DuckDB batch during active transaction");
+  }
+  if (!BatchingEnabled() || !HasPendingBatchWork()) {
+    return Status::Ok();
+  }
+
+  auto rollback_pending = [this]() {
+    if (!apply_txn_.active) return;
+    (void)adapter_->RollbackApplyTxn(apply_txn_);
+    apply_txn_ = ApplyTxn{};
+  };
+
+  WaitIfPaused();
+  Status st = FlushBuffered(true);
+  if (!st.ok()) {
+    rollback_pending();
+    return st;
+  }
+  st = EnsureApplyTxn();
+  if (!st.ok()) {
+    rollback_pending();
+    return st;
+  }
+
+  const std::string last_gtid =
+      batch_gtids_.empty() ? current_gtid_.value : batch_gtids_.back();
+  st = CommitApplyBatch(last_gtid, false);
+  if (!st.ok()) {
+    rollback_pending();
+    return st;
+  }
   return Status::Ok();
 }
 
@@ -1428,6 +1443,7 @@ Status DuckDBBinlogApplier::FlushBuffered(bool force) {
   }
 
   Status st = Status::Ok();
+  ApplyOperationMetrics apply_metrics;
   if (!use_parallel) {
     for (auto &entry : buffers_) {
       auto &buffer = entry.second;
@@ -1435,7 +1451,8 @@ Status DuckDBBinlogApplier::FlushBuffered(bool force) {
         RowBatch batch = std::move(buffer.inserts);
         TableId table = batch.table;  // Copy before move to avoid UB
         st = adapter_->ApplyInsertDelta(apply_txn_, table, std::move(batch),
-                                        DuckDBAdapter::InsertDeltaMode::kInsert);
+                                        DuckDBAdapter::InsertDeltaMode::kInsert,
+                                        &apply_metrics);
         if (!st.ok()) return st;
       }
       if (!buffer.bulk_updates.old_rows.empty()) {
@@ -1445,30 +1462,40 @@ Status DuckDBBinlogApplier::FlushBuffered(bool force) {
         insert_delta_tables_.insert(key);
         delta_tables_.insert(key);
         st = adapter_->ApplyBulkUpdates(apply_txn_, std::move(table),
-                                        std::move(batch));
+                                        std::move(batch), &apply_metrics);
         if (!st.ok()) return st;
       }
       if (!buffer.updates.statements.empty()) {
         UpdateBatch batch = std::move(buffer.updates);
         TableId table = batch.table;  // Copy before move to avoid UB
+        const auto merge_start = std::chrono::steady_clock::now();
         st = adapter_->ApplyUpdates(apply_txn_, std::move(table),
                                     std::move(batch));
         if (!st.ok()) return st;
+        apply_metrics.merge_delete_ms += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - merge_start)
+                .count());
       }
       if (!buffer.bulk_deletes.old_rows.empty()) {
         BulkDeleteBatch batch = std::move(buffer.bulk_deletes);
         TableId table = batch.table;  // Copy before move to avoid UB
         delta_tables_.insert(TableKey{table.schema, table.table});
         st = adapter_->ApplyBulkDeletes(apply_txn_, std::move(table),
-                                        std::move(batch));
+                                        std::move(batch), &apply_metrics);
         if (!st.ok()) return st;
       }
       if (!buffer.deletes.statements.empty()) {
         DeleteBatch batch = std::move(buffer.deletes);
         TableId table = batch.table;  // Copy before move to avoid UB
+        const auto merge_start = std::chrono::steady_clock::now();
         st = adapter_->ApplyDeletes(apply_txn_, std::move(table),
                                     std::move(batch));
         if (!st.ok()) return st;
+        apply_metrics.merge_delete_ms += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - merge_start)
+                .count());
       }
     }
   } else {
@@ -1572,18 +1599,22 @@ Status DuckDBBinlogApplier::FlushBuffered(bool force) {
       std::atomic<size_t> next_index{0};
       std::mutex err_mutex;
       Status first_error = Status::Ok();
+      std::atomic<uint64_t> parallel_stage_ms{0};
+      std::atomic<uint64_t> parallel_merge_delete_ms{0};
 
-      auto apply_table = [this](TableId table, TableBuffer buffer) -> Status {
+      auto apply_table = [this, &parallel_stage_ms, &parallel_merge_delete_ms](
+                             TableId table, TableBuffer buffer) -> Status {
         ApplyTxn txn = adapter_->BeginApplyTxn(current_gtid_);
         if (!txn.status.ok()) return txn.status;
         Status st = Status::Ok();
+        ApplyOperationMetrics local_metrics;
         if (!buffer.inserts.rows.empty()) {
           RowBatch batch = std::move(buffer.inserts);
           if (batch.table.table.empty()) batch.table = table;
           TableId batch_table = batch.table;
           st = adapter_->ApplyInsertDelta(
               txn, batch_table, std::move(batch),
-              DuckDBAdapter::InsertDeltaMode::kInsert);
+              DuckDBAdapter::InsertDeltaMode::kInsert, &local_metrics);
           if (!st.ok()) goto fail;
         }
         if (!buffer.bulk_updates.old_rows.empty()) {
@@ -1591,36 +1622,48 @@ Status DuckDBBinlogApplier::FlushBuffered(bool force) {
           if (batch.table.table.empty()) batch.table = table;
           TableId batch_table = batch.table;
           st = adapter_->ApplyBulkUpdates(txn, std::move(batch_table),
-                                          std::move(batch));
+                                          std::move(batch), &local_metrics);
           if (!st.ok()) goto fail;
         }
         if (!buffer.updates.statements.empty()) {
           UpdateBatch batch = std::move(buffer.updates);
           if (batch.table.table.empty()) batch.table = table;
           TableId batch_table = batch.table;
+          const auto merge_start = std::chrono::steady_clock::now();
           st = adapter_->ApplyUpdates(txn, std::move(batch_table),
                                       std::move(batch));
           if (!st.ok()) goto fail;
+          local_metrics.merge_delete_ms += static_cast<uint64_t>(
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - merge_start)
+                  .count());
         }
         if (!buffer.bulk_deletes.old_rows.empty()) {
           BulkDeleteBatch batch = std::move(buffer.bulk_deletes);
           if (batch.table.table.empty()) batch.table = table;
           TableId batch_table = batch.table;
           st = adapter_->ApplyBulkDeletes(txn, std::move(batch_table),
-                                          std::move(batch));
+                                          std::move(batch), &local_metrics);
           if (!st.ok()) goto fail;
         }
         if (!buffer.deletes.statements.empty()) {
           DeleteBatch batch = std::move(buffer.deletes);
           if (batch.table.table.empty()) batch.table = table;
           TableId batch_table = batch.table;
+          const auto merge_start = std::chrono::steady_clock::now();
           st = adapter_->ApplyDeletes(txn, std::move(batch_table),
                                       std::move(batch));
           if (!st.ok()) goto fail;
+          local_metrics.merge_delete_ms += static_cast<uint64_t>(
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - merge_start)
+                  .count());
         }
 
         st = adapter_->CommitApplyTxn(txn);
         if (!st.ok()) goto fail;
+        parallel_stage_ms.fetch_add(local_metrics.stage_ms);
+        parallel_merge_delete_ms.fetch_add(local_metrics.merge_delete_ms);
         return Status::Ok();
 
       fail:
@@ -1657,6 +1700,8 @@ Status DuckDBBinlogApplier::FlushBuffered(bool force) {
       if (!first_error.ok()) {
         return first_error;
       }
+      apply_metrics.stage_ms += parallel_stage_ms.load();
+      apply_metrics.merge_delete_ms += parallel_merge_delete_ms.load();
     }
   }
 
@@ -1666,7 +1711,7 @@ Status DuckDBBinlogApplier::FlushBuffered(bool force) {
                                                             apply_start);
   const size_t flush_rows = buffered_rows_;
   const size_t flush_bytes = buffered_bytes_;
-  UpdateMetrics(flush_rows, flush_bytes, apply_ms);
+  UpdateMetrics(flush_rows, flush_bytes, apply_ms, apply_metrics);
   MaybeThrottle(flush_rows, flush_bytes, apply_ms);
   ResetBuffers();
   return Status::Ok();
@@ -1701,11 +1746,17 @@ void DuckDBBinlogApplier::WaitIfPaused() const {
 }
 
 void DuckDBBinlogApplier::UpdateMetrics(size_t rows, size_t bytes,
-                                        std::chrono::milliseconds apply_ms) {
+                                        std::chrono::milliseconds apply_ms,
+                                        const ApplyOperationMetrics &metrics) {
   auto &state = GetApplyState();
+  state.last_batch_size.store(rows);
   state.last_flush_rows.store(rows);
   state.last_flush_bytes.store(bytes);
-  state.last_flush_ms.store(static_cast<uint64_t>(apply_ms.count()));
+  const uint64_t apply_total_ms = static_cast<uint64_t>(apply_ms.count());
+  state.last_flush_ms.store(apply_total_ms);
+  state.last_stage_ms.store(metrics.stage_ms);
+  state.last_merge_delete_ms.store(metrics.merge_delete_ms);
+  state.last_apply_total_ms.store(apply_total_ms);
   state.applied_rows.fetch_add(rows);
   state.applied_bytes.fetch_add(bytes);
   batch_rows_ += rows;
@@ -1933,6 +1984,47 @@ Status DuckDBBinlogApplier::ApplyWatermark() {
   return Status::Ok();
 }
 
+Status DuckDBBinlogApplier::CommitApplyBatch(const std::string &last_gtid,
+                                             bool should_pause) {
+  auto &state = GetApplyState();
+  const auto commit_start = std::chrono::steady_clock::now();
+  DUCKDB_APPLY_VERBOSE("DuckDB CommitTransaction: calling ApplyWatermark");
+  Status st = ApplyWatermark();
+  if (!st.ok()) {
+    sql_print_warning("DuckDB CommitTransaction: ApplyWatermark failed: %s",
+                      st.message.c_str());
+    return st;
+  }
+
+  DUCKDB_APPLY_VERBOSE("DuckDB CommitTransaction: calling CommitApplyTxn");
+  st = adapter_->CommitApplyTxn(apply_txn_);
+  if (!st.ok()) {
+    return st;
+  }
+
+  const auto commit_end = std::chrono::steady_clock::now();
+  const auto commit_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(commit_end -
+                                                            commit_start);
+  state.applied_transactions.fetch_add(1);
+  state.last_commit_epoch_ms.store(NowEpochMs());
+  state.last_commit_ms.store(static_cast<uint64_t>(commit_ms.count()));
+  {
+    std::lock_guard<std::mutex> guard(state.gtid_mutex);
+    state.last_gtid = last_gtid;
+  }
+  if (should_pause) {
+    SetBinlogApplyPaused(true);
+  }
+
+  apply_txn_ = ApplyTxn{};
+  ResetBatchState();
+  insert_delta_tables_.clear();
+  delta_tables_.clear();
+  ResetBuffers();
+  return Status::Ok();
+}
+
 std::string DuckDBBinlogApplier::EscapeLiteral(const std::string &value) const {
   std::string out;
   out.reserve(value.size() + 4);
@@ -1983,6 +2075,11 @@ void DuckDBBinlogApplier::ResetBatchState() {
 
 bool DuckDBBinlogApplier::ApplyTxnActive() const {
   return apply_txn_.active;
+}
+
+bool DuckDBBinlogApplier::HasPendingBatchWork() const {
+  return !in_txn_ &&
+         (have_buffered_ || apply_txn_.active || batch_gtid_count_ > 0);
 }
 
 }  // namespace duckdb_se

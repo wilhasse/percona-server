@@ -80,6 +80,13 @@ Status FlushAppenderForTable(ApplyTxn &txn, const TableId &table) {
   return Status::Ok();
 }
 
+uint64_t ElapsedMillis(std::chrono::steady_clock::time_point start) {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - start)
+          .count());
+}
+
 // Generate a DuckDB-compatible timestamp literal for the current time.
 // Uses C++ chrono to avoid reliance on DuckDB's now()/CURRENT_TIMESTAMP
 // functions which may require core_functions extension.
@@ -1559,7 +1566,8 @@ Status DuckDBAdapter::AppendRows(ApplyTxn &txn, TableId table, RowBatch batch) {
 }
 
 Status DuckDBAdapter::ApplyInsertDelta(ApplyTxn &txn, TableId table,
-                                       RowBatch batch, InsertDeltaMode mode) {
+                                       RowBatch batch, InsertDeltaMode mode,
+                                       ApplyOperationMetrics *metrics) {
   if (!txn.active || !txn.conn) {
     return Status::Error(StatusCode::kInvalid, "Apply transaction not active");
   }
@@ -1567,6 +1575,7 @@ Status DuckDBAdapter::ApplyInsertDelta(ApplyTxn &txn, TableId table,
     return Status::Ok();
   }
 
+  const auto stage_start = std::chrono::steady_clock::now();
   Status st = EnsureInsertDeltaTable(*txn.conn, table);
   if (!st.ok()) return st;
 
@@ -1576,7 +1585,11 @@ Status DuckDBAdapter::ApplyInsertDelta(ApplyTxn &txn, TableId table,
   if (!st.ok()) return st;
   st = FlushAppenderForTable(txn, delta);
   if (!st.ok()) return st;
+  if (metrics) {
+    metrics->stage_ms += ElapsedMillis(stage_start);
+  }
 
+  const auto merge_start = std::chrono::steady_clock::now();
   std::vector<std::string> columns;
   st = GetTableColumnsOn(*txn.conn, table, &columns);
   if (!st.ok()) return st;
@@ -1622,6 +1635,9 @@ Status DuckDBAdapter::ApplyInsertDelta(ApplyTxn &txn, TableId table,
   const std::string cleanup_sql = "DELETE FROM " + delta_name;
   st = ExecuteDDLOn(*txn.conn, cleanup_sql);
   if (!st.ok()) return st;
+  if (metrics) {
+    metrics->merge_delete_ms += ElapsedMillis(merge_start);
+  }
   return Status::Ok();
 }
 
@@ -1646,7 +1662,8 @@ Status DuckDBAdapter::ApplyUpdates(ApplyTxn &txn, TableId,
 }
 
 Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
-                                       BulkUpdateBatch batch) {
+                                       BulkUpdateBatch batch,
+                                       ApplyOperationMetrics *metrics) {
   if (!txn.active || !txn.conn) {
     return Status::Error(StatusCode::kInvalid, "Apply transaction not active");
   }
@@ -1673,6 +1690,7 @@ Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
   const std::vector<std::string> &delta_columns =
       use_pk ? pk_columns : columns;
 
+  const auto stage_start = std::chrono::steady_clock::now();
   st = EnsureDeltaTableWithColumns(*txn.conn, table, delta_columns);
   if (!st.ok()) return st;
 
@@ -1753,7 +1771,11 @@ Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
     }
     st = FlushAppenderForTable(txn, delta);
     if (!st.ok()) return st;
+    if (metrics) {
+      metrics->stage_ms += ElapsedMillis(stage_start);
+    }
 
+    const auto merge_start = std::chrono::steady_clock::now();
     const std::string target = QualifiedName(table);
     const std::string delta_quoted = QualifiedName(delta);
 
@@ -1787,12 +1809,15 @@ Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
     const std::string cleanup_sql = "DELETE FROM " + delta_quoted;
     st = ExecuteDDLOn(*txn.conn, cleanup_sql);
     if (!st.ok()) return st;
+    if (metrics) {
+      metrics->merge_delete_ms += ElapsedMillis(merge_start);
+    }
 
     RowBatch insert_batch;
     insert_batch.table = table;
     insert_batch.rows = std::move(batch.new_rows);
     st = ApplyInsertDelta(txn, table, std::move(insert_batch),
-                          InsertDeltaMode::kUpsert);
+                          InsertDeltaMode::kUpsert, metrics);
     if (!st.ok()) return st;
   } catch (const std::exception &ex) {
     return Status::Error(StatusCode::kDuckDBError, ex.what());
@@ -1802,7 +1827,8 @@ Status DuckDBAdapter::ApplyBulkUpdates(ApplyTxn &txn, TableId table,
 }
 
 Status DuckDBAdapter::ApplyBulkDeletes(ApplyTxn &txn, TableId table,
-                                       BulkDeleteBatch batch) {
+                                       BulkDeleteBatch batch,
+                                       ApplyOperationMetrics *metrics) {
   if (!txn.active || !txn.conn) {
     return Status::Error(StatusCode::kInvalid, "Apply transaction not active");
   }
@@ -1825,6 +1851,7 @@ Status DuckDBAdapter::ApplyBulkDeletes(ApplyTxn &txn, TableId table,
   const std::vector<std::string> &delta_columns =
       use_pk ? pk_columns : columns;
 
+  const auto stage_start = std::chrono::steady_clock::now();
   st = EnsureDeltaTableWithColumns(*txn.conn, table, delta_columns);
   if (!st.ok()) return st;
 
@@ -1878,7 +1905,11 @@ Status DuckDBAdapter::ApplyBulkDeletes(ApplyTxn &txn, TableId table,
     }
     st = FlushAppenderForTable(txn, delta);
     if (!st.ok()) return st;
+    if (metrics) {
+      metrics->stage_ms += ElapsedMillis(stage_start);
+    }
 
+    const auto merge_start = std::chrono::steady_clock::now();
     const std::string target = QualifiedName(table);
     const std::string delta_quoted = QualifiedName(delta);
 
@@ -1912,6 +1943,9 @@ Status DuckDBAdapter::ApplyBulkDeletes(ApplyTxn &txn, TableId table,
     const std::string cleanup_sql = "DELETE FROM " + delta_quoted;
     st = ExecuteDDLOn(*txn.conn, cleanup_sql);
     if (!st.ok()) return st;
+    if (metrics) {
+      metrics->merge_delete_ms += ElapsedMillis(merge_start);
+    }
   } catch (const std::exception &ex) {
     return Status::Error(StatusCode::kDuckDBError, ex.what());
   }

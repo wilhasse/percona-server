@@ -147,6 +147,11 @@ struct DeleteBatch {
   std::vector<std::string> statements;
 };
 
+struct ApplyOperationMetrics {
+  uint64_t stage_ms{0};
+  uint64_t merge_delete_ms{0};
+};
+
 struct ApplyTxn {
   Gtid gtid;
   bool active{false};
@@ -181,11 +186,14 @@ class DuckDBAdapter {
   enum class InsertDeltaMode { kInsert, kUpsert };
   Status AppendRows(ApplyTxn &txn, TableId table, RowBatch batch);
   Status ApplyInsertDelta(ApplyTxn &txn, TableId table, RowBatch batch,
-                          InsertDeltaMode mode = InsertDeltaMode::kInsert);
+                          InsertDeltaMode mode = InsertDeltaMode::kInsert,
+                          ApplyOperationMetrics *metrics = nullptr);
   Status ApplyUpdates(ApplyTxn &txn, TableId table, UpdateBatch batch);
   Status ApplyDeletes(ApplyTxn &txn, TableId table, DeleteBatch batch);
-  Status ApplyBulkUpdates(ApplyTxn &txn, TableId table, BulkUpdateBatch batch);
-  Status ApplyBulkDeletes(ApplyTxn &txn, TableId table, BulkDeleteBatch batch);
+  Status ApplyBulkUpdates(ApplyTxn &txn, TableId table, BulkUpdateBatch batch,
+                          ApplyOperationMetrics *metrics = nullptr);
+  Status ApplyBulkDeletes(ApplyTxn &txn, TableId table, BulkDeleteBatch batch,
+                          ApplyOperationMetrics *metrics = nullptr);
   Status CloseAppenders(ApplyTxn &txn);
   Status CleanupInsertDeltaTables(const std::vector<TableId> &tables);
   Status CleanupDeltaTables(const std::vector<TableId> &tables);

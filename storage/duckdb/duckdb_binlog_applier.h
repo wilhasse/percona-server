@@ -61,9 +61,13 @@ struct BinlogApplyMetrics {
   uint64_t applied_transactions{0};
   uint64_t applied_rows{0};
   uint64_t applied_bytes{0};
+  uint64_t last_batch_size{0};
   uint64_t last_flush_rows{0};
   uint64_t last_flush_bytes{0};
   uint64_t last_flush_ms{0};
+  uint64_t last_stage_ms{0};
+  uint64_t last_merge_delete_ms{0};
+  uint64_t last_apply_total_ms{0};
   uint64_t last_throttle_ms{0};
   uint64_t total_throttle_ms{0};
   uint64_t last_commit_epoch_ms{0};
@@ -102,8 +106,10 @@ class DuckDBBinlogApplier {
   Status ApplyDDL(DDLChange change);
   void SetBinlogPosition(const std::string &file, uint64_t pos);
   Status CommitTransaction();
+  Status CommitPendingBatch();
   Status RollbackTransaction();
   bool ApplyTxnActive() const;
+  bool HasPendingBatchWork() const;
 
  private:
   struct TableKey {
@@ -136,7 +142,8 @@ class DuckDBBinlogApplier {
   bool ShouldFlush() const;
   void WaitIfPaused() const;
   void UpdateMetrics(size_t rows, size_t bytes,
-                     std::chrono::milliseconds apply_ms);
+                     std::chrono::milliseconds apply_ms,
+                     const ApplyOperationMetrics &metrics);
   void MaybeThrottle(size_t rows, size_t bytes,
                      std::chrono::milliseconds apply_ms);
   void ResetBuffers();
@@ -144,6 +151,7 @@ class DuckDBBinlogApplier {
   bool BatchingEnabled() const;
   bool ShouldCommitBatch(bool force_commit) const;
   void ResetBatchState();
+  Status CommitApplyBatch(const std::string &last_gtid, bool should_pause);
   std::string EscapeLiteral(const std::string &value) const;
 
   DuckDBAdapter *adapter_{nullptr};

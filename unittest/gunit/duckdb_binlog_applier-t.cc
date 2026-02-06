@@ -310,6 +310,33 @@ bool QueryFails(DuckDBAdapter &adapter, const std::string &sql) {
   return !result.ok;
 }
 
+void SeedAppliedGtidSet(DuckDBAdapter &adapter,
+                        const std::vector<std::string> &gtids) {
+  std::string set;
+  std::string error;
+  ASSERT_TRUE(BuildGtidSetFromList(gtids, &set, &error)) << error;
+
+  const std::string create_sql =
+      "CREATE TABLE IF NOT EXISTS __repl_state ("
+      "channel VARCHAR PRIMARY KEY, "
+      "snapshot_gtid_set VARCHAR, "
+      "applied_gtid_set VARCHAR, "
+      "last_commit_ts TIMESTAMP)";
+  auto create = adapter.ExecuteQuery(create_sql, {});
+  ASSERT_TRUE(create.ok) << create.error;
+
+  auto erase =
+      adapter.ExecuteQuery("DELETE FROM __repl_state WHERE channel='default'", {});
+  ASSERT_TRUE(erase.ok) << erase.error;
+
+  const std::string insert_sql =
+      "INSERT INTO __repl_state (channel, snapshot_gtid_set, applied_gtid_set, "
+      "last_commit_ts) VALUES ('default', NULL, '" +
+      set + "', '2026-01-01 00:00:00')";
+  auto insert = adapter.ExecuteQuery(insert_sql, {});
+  ASSERT_TRUE(insert.ok) << insert.error;
+}
+
 int64_t GetSchemaVersion(DuckDBAdapter &adapter) {
   int64_t version = 0;
   bool found = false;
@@ -452,6 +479,131 @@ TEST(DuckDBBinlogApplierTest, IdempotentReplaySkipsAppliedGtid) {
   Gtid latest;
   ExpectOk(adapter.GetLatestWatermark(&latest));
   EXPECT_EQ(MakeGtid(10), latest.value);
+
+  adapter.Shutdown();
+  CleanupDuckdbFiles(path);
+}
+
+TEST(DuckDBBinlogApplierTest, BatchingCommitsOnBatchMaxGtids) {
+  const std::string path = MakeTempPath("duckdb_batch_gtids");
+  CleanupDuckdbFiles(path);
+
+  DuckDBAdapter adapter;
+  DuckDBConfig cfg;
+  cfg.read_only = false;
+  ExpectOk(adapter.Init(path, cfg));
+  ExpectOk(adapter.CreateTable(MakeSimpleTable()));
+
+  BinlogApplierOptions options = MakeTestOptions();
+  options.batch_max_gtids = 3;
+  options.batch_max_rows = 0;
+  options.batch_max_bytes = 0;
+  options.batch_max_delay = std::chrono::hours(1);
+  DuckDBBinlogApplier applier(&adapter, options);
+
+  for (int i = 1; i <= 2; ++i) {
+    ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(i)}));
+    ExpectOk(applier.AppendInsert(TableId{"", "t"},
+                                  MakeRow(std::to_string(i), "v" + std::to_string(i))));
+    ExpectOk(applier.CommitTransaction());
+    EXPECT_EQ(0, QueryCount(adapter, "SELECT COUNT(*) FROM t"));
+  }
+
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(3)}));
+  ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("3", "v3")));
+  ExpectOk(applier.CommitTransaction());
+  EXPECT_EQ(3, QueryCount(adapter, "SELECT COUNT(*) FROM t"));
+
+  Gtid latest;
+  ExpectOk(adapter.GetLatestWatermark(&latest));
+  bool contains = false;
+  std::string error;
+  EXPECT_TRUE(GtidSetContains(latest.value, MakeGtid(3), &contains, &error))
+      << error;
+  EXPECT_TRUE(contains);
+
+  adapter.Shutdown();
+  CleanupDuckdbFiles(path);
+}
+
+TEST(DuckDBBinlogApplierTest, SkippedTransactionKeepsPendingBufferedRows) {
+  const std::string path = MakeTempPath("duckdb_skip_preserve");
+  CleanupDuckdbFiles(path);
+
+  DuckDBAdapter adapter;
+  DuckDBConfig cfg;
+  cfg.read_only = false;
+  ExpectOk(adapter.Init(path, cfg));
+  ExpectOk(adapter.CreateTable(MakeSimpleTable()));
+  SeedAppliedGtidSet(adapter, {MakeGtid(90)});
+
+  BinlogApplierOptions options = MakeTestOptions();
+  options.batch_max_gtids = 10;
+  options.batch_max_rows = 0;
+  options.batch_max_bytes = 0;
+  options.batch_max_delay = std::chrono::hours(1);
+  DuckDBBinlogApplier applier(&adapter, options);
+
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(1)}));
+  ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
+  ExpectOk(applier.CommitTransaction());
+  EXPECT_EQ(0, QueryCount(adapter, "SELECT COUNT(*) FROM t"));
+
+  // GTID 90 is pre-applied and should be skipped without clearing pending rows.
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(90)}));
+  ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("2", "skip")));
+  ExpectOk(applier.CommitTransaction());
+  EXPECT_EQ(0, QueryCount(adapter, "SELECT COUNT(*) FROM t"));
+
+  ExpectOk(applier.CommitPendingBatch());
+  EXPECT_EQ(1, QueryCount(adapter, "SELECT COUNT(*) FROM t"));
+  EXPECT_EQ(1, QueryCount(adapter,
+                          "SELECT COUNT(*) FROM t WHERE id = 1 AND val = 'alpha'"));
+
+  adapter.Shutdown();
+  CleanupDuckdbFiles(path);
+}
+
+TEST(DuckDBBinlogApplierTest, CommitPendingBatchFlushesBufferedRows) {
+  const std::string path = MakeTempPath("duckdb_pending_batch");
+  CleanupDuckdbFiles(path);
+
+  DuckDBAdapter adapter;
+  DuckDBConfig cfg;
+  cfg.read_only = false;
+  ExpectOk(adapter.Init(path, cfg));
+  ExpectOk(adapter.CreateTable(MakeSimpleTable()));
+
+  BinlogApplierOptions options = MakeTestOptions();
+  options.batch_max_gtids = 10;
+  options.batch_max_rows = 0;
+  options.batch_max_bytes = 0;
+  options.batch_max_delay = std::chrono::hours(1);
+  DuckDBBinlogApplier applier(&adapter, options);
+
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(1)}));
+  ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("1", "alpha")));
+  ExpectOk(applier.CommitTransaction());
+
+  ExpectOk(applier.BeginTransaction(Gtid{MakeGtid(2)}));
+  ExpectOk(applier.AppendInsert(TableId{"", "t"}, MakeRow("2", "beta")));
+  ExpectOk(applier.CommitTransaction());
+
+  EXPECT_EQ(0, QueryCount(adapter, "SELECT COUNT(*) FROM t"));
+  ExpectOk(applier.CommitPendingBatch());
+  EXPECT_EQ(2, QueryCount(adapter, "SELECT COUNT(*) FROM t"));
+
+  Gtid latest;
+  ExpectOk(adapter.GetLatestWatermark(&latest));
+  bool contains = false;
+  std::string error;
+  EXPECT_TRUE(GtidSetContains(latest.value, MakeGtid(2), &contains, &error))
+      << error;
+  EXPECT_TRUE(contains);
+
+  // No-op when there is no pending batch.
+  ExpectOk(applier.CommitPendingBatch());
+  EXPECT_EQ(2, QueryCount(adapter, "SELECT COUNT(*) FROM t"));
 
   adapter.Shutdown();
   CleanupDuckdbFiles(path);
@@ -777,6 +929,10 @@ TEST(DuckDBBinlogApplierTest, LagMetricsUpdateOnCommit) {
   const auto metrics = GetBinlogApplyMetrics();
   EXPECT_GT(metrics.last_commit_epoch_ms, 0u);
   EXPECT_GE(metrics.lag_ms, 0u);
+  EXPECT_EQ(metrics.last_batch_size, metrics.last_flush_rows);
+  EXPECT_EQ(metrics.last_apply_total_ms, metrics.last_flush_ms);
+  EXPECT_GE(metrics.last_apply_total_ms, metrics.last_stage_ms);
+  EXPECT_GE(metrics.last_apply_total_ms, metrics.last_merge_delete_ms);
 
   adapter.Shutdown();
   CleanupDuckdbFiles(path);

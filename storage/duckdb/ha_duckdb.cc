@@ -2418,6 +2418,41 @@ static int show_duckdb_binlog_last_flush_ms(MYSQL_THD, SHOW_VAR *var, char *) {
   return 0;
 }
 
+static int show_duckdb_binlog_last_batch_size(MYSQL_THD, SHOW_VAR *var,
+                                              char *) {
+  static ulonglong value;
+  value = duckdb_se::GetBinlogApplyMetrics().last_batch_size;
+  var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
+static int show_duckdb_binlog_last_stage_ms(MYSQL_THD, SHOW_VAR *var, char *) {
+  static ulonglong value;
+  value = duckdb_se::GetBinlogApplyMetrics().last_stage_ms;
+  var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
+static int show_duckdb_binlog_last_merge_delete_ms(MYSQL_THD, SHOW_VAR *var,
+                                                   char *) {
+  static ulonglong value;
+  value = duckdb_se::GetBinlogApplyMetrics().last_merge_delete_ms;
+  var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
+static int show_duckdb_binlog_last_apply_total_ms(MYSQL_THD, SHOW_VAR *var,
+                                                  char *) {
+  static ulonglong value;
+  value = duckdb_se::GetBinlogApplyMetrics().last_apply_total_ms;
+  var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
 static int show_duckdb_binlog_last_throttle_ms(MYSQL_THD, SHOW_VAR *var,
                                                char *) {
   static ulonglong value;
@@ -2537,6 +2572,17 @@ static SHOW_VAR duckdb_status_variables[] = {
      SHOW_SCOPE_GLOBAL},
     {"duckdb_binlog_last_flush_ms", (char *)show_duckdb_binlog_last_flush_ms,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_binlog_last_batch_size",
+     (char *)show_duckdb_binlog_last_batch_size, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"duckdb_binlog_last_stage_ms",
+     (char *)show_duckdb_binlog_last_stage_ms, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_binlog_last_merge_delete_ms",
+     (char *)show_duckdb_binlog_last_merge_delete_ms, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"duckdb_binlog_last_apply_total_ms",
+     (char *)show_duckdb_binlog_last_apply_total_ms, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
     {"duckdb_binlog_last_throttle_ms",
      (char *)show_duckdb_binlog_last_throttle_ms, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},

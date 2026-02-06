@@ -1337,6 +1337,22 @@ Status CommitActiveTransactions(
   return Status::Ok();
 }
 
+Status DrainPendingBatches(std::map<std::string, SchemaApplierState> *states,
+                           const std::string &log_file, uint64_t log_pos) {
+  if (!states) return Status::Ok();
+  for (auto &entry : *states) {
+    auto &state = entry.second;
+    if (state.txn_active || !state.applier) continue;
+    if (!state.applier->HasPendingBatchWork()) continue;
+    if (!log_file.empty() && log_pos > 0) {
+      state.applier->SetBinlogPosition(log_file, log_pos);
+    }
+    Status st = state.applier->CommitPendingBatch();
+    if (!st.ok()) return st;
+  }
+  return Status::Ok();
+}
+
 void RollbackActiveTransactions(
     std::map<std::string, SchemaApplierState> *states) {
   if (!states) return;
@@ -1763,8 +1779,16 @@ Status RunApplyLoop(const BinlogApplyThreadOptions &options,
   if (had_error) {
     RollbackActiveTransactions(&schema_states);
   } else {
-    (void)CommitActiveTransactions(&schema_states, current_log_file,
-                                   current_log_pos);
+    Status final_st =
+        CommitActiveTransactions(&schema_states, current_log_file, current_log_pos);
+    if (final_st.ok()) {
+      final_st =
+          DrainPendingBatches(&schema_states, current_log_file, current_log_pos);
+    }
+    if (!final_st.ok()) {
+      loop_status = final_st;
+      RollbackActiveTransactions(&schema_states);
+    }
   }
   queue.Close();
   if (reader.joinable()) reader.join();
