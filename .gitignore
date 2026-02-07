@@ -31,6 +31,10 @@ heatwaveml.*
 automl.egg-info/
 _userconf.sh
 scalability_jobs_*
+# In-source CMake artifacts
+/CMakeCache.txt
+/CMakeFiles/
+/VERSION.dep
 # Configuration files for Eclipse
 .cproject
 .project
