@@ -198,6 +198,14 @@ std::string value_to_sql(const duckdb::Value &val);
 std::string build_where_clause(const std::vector<Field *> &fields,
                                const std::vector<duckdb::Value> &values);
 void store_duckdb_value(Field *field, const duckdb::Value &value);
+int copy_chunk_row_to_table(TABLE *table, const duckdb::DataChunk &chunk,
+                            duckdb::idx_t row_idx,
+                            const std::vector<Field *> &projected_fields,
+                            duckdb::idx_t col_offset);
+
+static std::atomic<ulonglong> duckdb_conversion_rows{0};
+static std::atomic<ulonglong> duckdb_conversion_values{0};
+static std::atomic<ulonglong> duckdb_conversion_ns{0};
 
 bool DuckdbTableExistsInFile(const std::string &path,
                              const std::string &schema,
@@ -795,31 +803,7 @@ int copy_chunk_row_to_table(TABLE *table, const duckdb::DataChunk &chunk,
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), "DuckDB column count mismatch");
     return HA_ERR_GENERIC;
   }
-
-  // Temporarily allow writes to all columns so that Field::store() doesn't
-  // trip the DBUG assertion checking write_set bits for projected columns.
-  my_bitmap_map *old_map = dbug_tmp_use_all_columns(table, table->write_set);
-
-  for (duckdb::idx_t col_idx = 0; col_idx < chunk.ColumnCount(); ++col_idx) {
-    Field *field = projected_fields[col_idx];
-    if (field == nullptr) continue;
-    const duckdb::Value value = chunk.GetValue(col_idx, row_idx);
-    if (value.IsNull()) {
-      field->set_null();
-      continue;
-    }
-    field->set_notnull();
-    const auto physical = value.type().InternalType();
-    if (physical == duckdb::PhysicalType::VARCHAR) {
-      const std::string &str = duckdb::StringValue::Get(value);
-      field->store(str.data(), str.size(), field->charset());
-    } else {
-      const std::string str = value.ToString();
-      field->store(str.data(), str.size(), field->charset());
-    }
-  }
-  dbug_tmp_restore_column_map(table->write_set, old_map);
-  return 0;
+  return copy_chunk_row_to_table(table, chunk, row_idx, projected_fields, 0);
 }
 
 int copy_chunk_row_to_table(TABLE *table, const duckdb::DataChunk &chunk,
@@ -833,14 +817,25 @@ int copy_chunk_row_to_table(TABLE *table, const duckdb::DataChunk &chunk,
   }
 
   my_bitmap_map *old_map = dbug_tmp_use_all_columns(table, table->write_set);
+  const auto conversion_start = std::chrono::steady_clock::now();
+  ulonglong converted_values = 0;
 
   for (duckdb::idx_t col_idx = 0; col_idx < projected_fields.size(); ++col_idx) {
     Field *field = projected_fields[col_idx];
     if (field == nullptr) continue;
     const duckdb::Value value = chunk.GetValue(col_idx + col_offset, row_idx);
     store_duckdb_value(field, value);
+    ++converted_values;
   }
 
+  const auto elapsed_ns = static_cast<ulonglong>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - conversion_start)
+          .count());
+  duckdb_conversion_rows.fetch_add(1, std::memory_order_relaxed);
+  duckdb_conversion_values.fetch_add(converted_values,
+                                     std::memory_order_relaxed);
+  duckdb_conversion_ns.fetch_add(elapsed_ns, std::memory_order_relaxed);
   dbug_tmp_restore_column_map(table->write_set, old_map);
   return 0;
 }
@@ -3932,6 +3927,30 @@ static int show_duckdb_execution_mode(MYSQL_THD, SHOW_VAR *var, char *buf) {
   return 0;
 }
 
+static int show_duckdb_conversion_rows(MYSQL_THD, SHOW_VAR *var, char *) {
+  static ulonglong value;
+  value = duckdb_conversion_rows.load(std::memory_order_relaxed);
+  var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
+static int show_duckdb_conversion_values(MYSQL_THD, SHOW_VAR *var, char *) {
+  static ulonglong value;
+  value = duckdb_conversion_values.load(std::memory_order_relaxed);
+  var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
+static int show_duckdb_conversion_ns(MYSQL_THD, SHOW_VAR *var, char *) {
+  static ulonglong value;
+  value = duckdb_conversion_ns.load(std::memory_order_relaxed);
+  var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
 static int show_duckdb_binlog_apply_paused(MYSQL_THD, SHOW_VAR *var, char *) {
   static bool value;
   value = duckdb_se::GetBinlogApplyControls().paused;
@@ -4130,6 +4149,12 @@ static int show_duckdb_binlog_source_gtid(MYSQL_THD, SHOW_VAR *var, char *buf) {
 static SHOW_VAR duckdb_status_variables[] = {
     {"duckdb_execution_mode_state", (char *)show_duckdb_execution_mode,
      SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"duckdb_conversion_rows", (char *)show_duckdb_conversion_rows, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"duckdb_conversion_values", (char *)show_duckdb_conversion_values,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_conversion_ns", (char *)show_duckdb_conversion_ns, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
     {"duckdb_binlog_apply_paused_state",
      (char *)show_duckdb_binlog_apply_paused, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
