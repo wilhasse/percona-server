@@ -714,6 +714,8 @@ int copy_chunk_row_to_table(TABLE *table, const duckdb::DataChunk &chunk,
     return HA_ERR_GENERIC;
   }
 
+  my_bitmap_map *old_map = dbug_tmp_use_all_columns(table, table->write_set);
+
   for (duckdb::idx_t col_idx = 0; col_idx < chunk.ColumnCount(); ++col_idx) {
     Field *field = projected_fields[col_idx];
     if (field == nullptr) continue;
@@ -732,6 +734,8 @@ int copy_chunk_row_to_table(TABLE *table, const duckdb::DataChunk &chunk,
       field->store(str.data(), str.size(), field->charset());
     }
   }
+
+  dbug_tmp_restore_column_map(table->write_set, old_map);
   return 0;
 }
 
@@ -1326,7 +1330,7 @@ static bool DuckdbExecuteQuery(JOIN *join, Query_result *query_result) {
 }
 
 static bool OptimizeSecondaryEngine(THD *thd, LEX *lex) {
-  auto *ctx = down_cast<Duckdb_execution_context *>(
+  auto *ctx = dynamic_cast<Duckdb_execution_context *>(
       lex->secondary_engine_execution_context());
   if (ctx == nullptr) {
     thd->get_stmt_da()->set_error_status(thd, ER_PREPARE_FOR_PRIMARY_ENGINE);
@@ -1405,7 +1409,7 @@ static const char *DuckdbGetOffloadFailReason(THD *thd) {
     return tls_fail_reason.c_str();
   }
   // Fall back to context-based reason
-  auto *ctx = down_cast<Duckdb_execution_context *>(
+  auto *ctx = dynamic_cast<Duckdb_execution_context *>(
       thd->lex->secondary_engine_execution_context());
   if (ctx == nullptr || ctx->fail_reason.empty()) {
     return "DuckDB secondary engine could not execute query";
@@ -1420,14 +1424,21 @@ static void DuckdbSetOffloadFailReason(THD *thd, const char *reason) {
   if (thd == nullptr || thd->lex == nullptr) {
     return;
   }
-  auto *ctx = down_cast<Duckdb_execution_context *>(
-      thd->lex->secondary_engine_execution_context());
-  if (ctx == nullptr) {
-    ctx = new (thd->mem_root) Duckdb_execution_context;
+  auto *raw_ctx = thd->lex->secondary_engine_execution_context();
+  if (raw_ctx == nullptr) {
+    // No context yet — create and attach a DuckDB-specific one
+    auto *ctx = new (thd->mem_root) Duckdb_execution_context;
     if (ctx == nullptr) return;
+    ctx->fail_reason = tls_fail_reason;
     thd->lex->set_secondary_engine_execution_context(ctx);
+    return;
   }
-  ctx->fail_reason = tls_fail_reason;
+  auto *ctx = dynamic_cast<Duckdb_execution_context *>(raw_ctx);
+  if (ctx != nullptr) {
+    ctx->fail_reason = tls_fail_reason;
+  }
+  // If context belongs to another engine, leave it alone — tls_fail_reason
+  // is already set for DuckdbGetOffloadFailReason() to pick up.
 }
 
 }  // namespace
