@@ -66,6 +66,17 @@ class ha_duckdb : public handler {
 
   int rnd_next(uchar *buf) override;
 
+  int index_init(uint idx, bool sorted) override;
+  int index_end() override;
+  int index_read_map(uchar *buf, const uchar *key, key_part_map keypart_map,
+                     enum ha_rkey_function find_flag) override;
+  int index_read_last_map(uchar *buf, const uchar *key,
+                          key_part_map keypart_map) override;
+  int index_next(uchar *buf) override;
+  int index_prev(uchar *buf) override;
+  int index_first(uchar *buf) override;
+  int index_last(uchar *buf) override;
+
   int write_row(uchar *buf) override;
 
   int update_row(const uchar *old_data, uchar *new_data) override;
@@ -106,6 +117,10 @@ class ha_duckdb : public handler {
   int unload_table(const char *db_name, const char *table_name,
                    bool error_if_not_loaded) override;
 
+  int execute_index_scan(const std::string &where_sql, bool descending,
+                         uchar *buf);
+  int fetch_index_scan_row(uchar *buf);
+
   THR_LOCK_DATA m_lock;
   std::string m_table_path;
   std::string m_schema_name;
@@ -115,6 +130,10 @@ class ha_duckdb : public handler {
   std::unique_ptr<duckdb::QueryResult> m_result;
   std::unique_ptr<duckdb::DataChunk> m_chunk;
   uint64_t m_chunk_row{0};
+  std::unique_ptr<duckdb::QueryResult> m_index_result;
+  std::unique_ptr<duckdb::DataChunk> m_index_chunk;
+  uint64_t m_index_chunk_row{0};
+  bool m_index_descending{false};
 };
 
 }  // namespace duckdb_se

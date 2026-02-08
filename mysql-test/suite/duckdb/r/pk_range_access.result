@@ -1,0 +1,31 @@
+CREATE DATABASE duckdb_pk_range;
+USE duckdb_pk_range;
+CREATE TABLE t (
+id INT PRIMARY KEY,
+payload VARCHAR(32),
+metric INT NOT NULL
+) ENGINE=DUCKDB;
+INSERT INTO t VALUES
+(1,'alpha',10),(2,'beta',20),(3,'gamma',30),
+(4,'delta',40),(5,'epsilon',50),(6,'zeta',60);
+EXPLAIN SELECT payload FROM t FORCE INDEX (PRIMARY) WHERE id = 3;
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+#	SIMPLE	t	NULL	const	PRIMARY	PRIMARY	4	#	#	100.00	NULL
+Warnings:
+#	1003	/* select#1 */ select 'gamma' AS `payload` from `duckdb_pk_range`.`t` FORCE INDEX (PRIMARY) where true
+EXPLAIN SELECT id FROM t FORCE INDEX (PRIMARY) WHERE id BETWEEN 2 AND 5 ORDER BY id;
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+#	SIMPLE	t	NULL	range	PRIMARY	PRIMARY	4	#	#	100.00	Using where; Using filesort
+Warnings:
+#	1003	/* select#1 */ select `duckdb_pk_range`.`t`.`id` AS `id` from `duckdb_pk_range`.`t` FORCE INDEX (PRIMARY) where (`duckdb_pk_range`.`t`.`id` between 2 and 5) order by `duckdb_pk_range`.`t`.`id`
+SELECT id, payload FROM t FORCE INDEX (PRIMARY) WHERE id BETWEEN 2 AND 5 ORDER BY id;
+id	payload
+2	beta
+3	gamma
+4	delta
+5	epsilon
+SELECT id FROM t FORCE INDEX (PRIMARY) WHERE id < 5 ORDER BY id DESC LIMIT 2;
+id
+4
+3
+DROP DATABASE duckdb_pk_range;

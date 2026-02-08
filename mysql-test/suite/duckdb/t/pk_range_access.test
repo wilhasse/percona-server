@@ -1,0 +1,47 @@
+--source include/have_duckdb_plugin.inc
+
+--disable_query_log
+CALL mtr.add_suppression("DuckDB analytics node should run with read_only=ON");
+CALL mtr.add_suppression("Got timeout reading communication packets");
+CALL mtr.add_suppression("A message intended for a client cannot be sent");
+--let $duckdb_installed=0
+--let $duckdb_plugin_present=`SELECT COUNT(*) FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_NAME='DUCKDB'`
+--if ($duckdb_plugin_present == 0) {
+  --eval INSTALL PLUGIN duckdb SONAME '$DUCKDB_PLUGIN';
+  --let $duckdb_installed=1
+}
+
+SET @save_duckdb_execution_mode = @@GLOBAL.duckdb_execution_mode;
+SET @@GLOBAL.duckdb_execution_mode = 'PRIMARY';
+--enable_query_log
+
+CREATE DATABASE duckdb_pk_range;
+USE duckdb_pk_range;
+
+CREATE TABLE t (
+  id INT PRIMARY KEY,
+  payload VARCHAR(32),
+  metric INT NOT NULL
+) ENGINE=DUCKDB;
+
+INSERT INTO t VALUES
+  (1,'alpha',10),(2,'beta',20),(3,'gamma',30),
+  (4,'delta',40),(5,'epsilon',50),(6,'zeta',60);
+
+--replace_column 1 # 9 # 10 #
+EXPLAIN SELECT payload FROM t FORCE INDEX (PRIMARY) WHERE id = 3;
+
+--replace_column 1 # 9 # 10 #
+EXPLAIN SELECT id FROM t FORCE INDEX (PRIMARY) WHERE id BETWEEN 2 AND 5 ORDER BY id;
+
+SELECT id, payload FROM t FORCE INDEX (PRIMARY) WHERE id BETWEEN 2 AND 5 ORDER BY id;
+SELECT id FROM t FORCE INDEX (PRIMARY) WHERE id < 5 ORDER BY id DESC LIMIT 2;
+
+DROP DATABASE duckdb_pk_range;
+
+--disable_query_log
+SET @@GLOBAL.duckdb_execution_mode = @save_duckdb_execution_mode;
+--if ($duckdb_installed == 1) {
+  UNINSTALL PLUGIN duckdb;
+}
+--enable_query_log

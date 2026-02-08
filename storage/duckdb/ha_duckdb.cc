@@ -191,6 +191,8 @@ std::string qualified_table_name(const std::string &schema,
 }
 
 std::string value_to_sql(const duckdb::Value &val);
+std::string build_where_clause(const std::vector<Field *> &fields,
+                               const std::vector<duckdb::Value> &values);
 
 bool DuckdbTableExistsInFile(const std::string &path,
                              const std::string &schema,
@@ -625,6 +627,67 @@ std::vector<Field *> collect_primary_key_fields(TABLE *table,
     fields.push_back(field);
   }
   return fields;
+}
+
+std::vector<Field *> collect_key_prefix_fields(const KEY *key_info,
+                                               uint key_parts) {
+  std::vector<Field *> fields;
+  if (key_info == nullptr || key_parts == 0) return fields;
+  fields.reserve(key_parts);
+  for (uint i = 0; i < key_parts; ++i) {
+    Field *field = key_info->key_part[i].field;
+    if (field == nullptr) continue;
+    if (std::find(fields.begin(), fields.end(), field) != fields.end()) continue;
+    fields.push_back(field);
+  }
+  return fields;
+}
+
+std::string build_primary_key_order_by(const KEY *primary_key, bool descending) {
+  if (primary_key == nullptr || primary_key->user_defined_key_parts == 0) {
+    return std::string();
+  }
+  std::string sql = " ORDER BY ";
+  bool first = true;
+  for (uint i = 0; i < primary_key->user_defined_key_parts; ++i) {
+    const Field *field = primary_key->key_part[i].field;
+    if (field == nullptr) continue;
+    if (!first) sql.append(", ");
+    sql.append(quote_ident(field->field_name, std::strlen(field->field_name)));
+    sql.append(descending ? " DESC" : " ASC");
+    first = false;
+  }
+  return sql;
+}
+
+std::string build_lexicographic_predicate(const std::vector<Field *> &fields,
+                                          const std::vector<duckdb::Value> &values,
+                                          bool greater_than, bool inclusive) {
+  if (fields.empty() || fields.size() != values.size()) return std::string();
+
+  const std::string equal_sql = build_where_clause(fields, values);
+  std::ostringstream strict;
+  for (size_t i = 0; i < fields.size(); ++i) {
+    if (i > 0) strict << " OR ";
+    strict << "(";
+    for (size_t j = 0; j < i; ++j) {
+      if (j > 0) strict << " AND ";
+      strict << quote_ident(fields[j]->field_name, std::strlen(fields[j]->field_name))
+             << " IS NOT DISTINCT FROM " << value_to_sql(values[j]);
+    }
+    if (i > 0) strict << " AND ";
+    strict << quote_ident(fields[i]->field_name, std::strlen(fields[i]->field_name))
+           << (greater_than ? " > " : " < ") << value_to_sql(values[i]) << ")";
+  }
+
+  if (!inclusive) return strict.str();
+
+  std::string sql("(");
+  sql += equal_sql;
+  sql += ") OR (";
+  sql += strict.str();
+  sql += ")";
+  return sql;
 }
 
 int copy_chunk_row_to_table(TABLE *table, const duckdb::DataChunk &chunk,
@@ -1578,6 +1641,8 @@ int ha_duckdb::open(const char *, int, unsigned int, const dd::Table *) {
 int ha_duckdb::close() {
   m_result.reset();
   m_chunk.reset();
+  m_index_result.reset();
+  m_index_chunk.reset();
   m_conn.reset();
   m_db.reset();
   return 0;
@@ -1613,6 +1678,9 @@ int ha_duckdb::rnd_end() {
   m_result.reset();
   m_chunk.reset();
   m_chunk_row = 0;
+  m_index_result.reset();
+  m_index_chunk.reset();
+  m_index_chunk_row = 0;
   return 0;
 }
 
@@ -1640,6 +1708,200 @@ int ha_duckdb::rnd_next(uchar *) {
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), ex.what());
     return HA_ERR_GENERIC;
   }
+}
+
+int ha_duckdb::index_init(uint idx, bool) {
+  const KEY *primary_key = duckdb_primary_key_info(table, table_share);
+  if (primary_key == nullptr || idx != table_share->primary_key) {
+    return HA_ERR_WRONG_INDEX;
+  }
+  active_index = idx;
+  m_index_result.reset();
+  m_index_chunk.reset();
+  m_index_chunk_row = 0;
+  m_index_descending = false;
+  return 0;
+}
+
+int ha_duckdb::index_end() {
+  m_index_result.reset();
+  m_index_chunk.reset();
+  m_index_chunk_row = 0;
+  m_index_descending = false;
+  active_index = MAX_KEY;
+  return 0;
+}
+
+int ha_duckdb::fetch_index_scan_row(uchar *buf) {
+  if (!m_index_result || buf == nullptr) return HA_ERR_END_OF_FILE;
+
+  try {
+    while (true) {
+      if (!m_index_chunk || m_index_chunk_row >= m_index_chunk->size()) {
+        m_index_chunk = m_index_result->Fetch();
+        m_index_chunk_row = 0;
+        if (!m_index_chunk || m_index_chunk->size() == 0) {
+          return HA_ERR_END_OF_FILE;
+        }
+      }
+
+      FieldOffsetGuard guard(table, buf);
+      if (copy_chunk_row_to_table(table, *m_index_chunk, m_index_chunk_row) != 0) {
+        return HA_ERR_GENERIC;
+      }
+
+      m_index_chunk_row++;
+      return 0;
+    }
+  } catch (const std::exception &ex) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), ex.what());
+    return HA_ERR_GENERIC;
+  }
+}
+
+int ha_duckdb::execute_index_scan(const std::string &where_sql, bool descending,
+                                  uchar *buf) {
+  if (!m_conn || table == nullptr || active_index == MAX_KEY) {
+    return HA_ERR_WRONG_INDEX;
+  }
+  const KEY *primary_key = duckdb_primary_key_info(table, table_share);
+  if (primary_key == nullptr || active_index != table_share->primary_key) {
+    return HA_ERR_WRONG_INDEX;
+  }
+
+  std::string sql = "SELECT * FROM ";
+  sql += qualified_table_name(m_schema_name, m_table_name);
+  if (!where_sql.empty()) {
+    sql += " WHERE ";
+    sql += where_sql;
+  }
+  sql += build_primary_key_order_by(primary_key, descending);
+
+  try {
+    m_index_result = m_conn->Query(sql);
+    if (!m_index_result || m_index_result->HasError()) {
+      const std::string err =
+          m_index_result ? m_index_result->GetError() : "DuckDB query failed";
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), err.c_str());
+      return HA_ERR_GENERIC;
+    }
+    m_index_chunk.reset();
+    m_index_chunk_row = 0;
+    m_index_descending = descending;
+    return fetch_index_scan_row(buf);
+  } catch (const std::exception &ex) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), ex.what());
+    return HA_ERR_GENERIC;
+  }
+}
+
+int ha_duckdb::index_read_map(uchar *buf, const uchar *key,
+                              key_part_map keypart_map,
+                              enum ha_rkey_function find_flag) {
+  DBUG_TRACE;
+  ha_statistic_increment(&System_status_var::ha_read_key_count);
+
+  if (active_index == MAX_KEY || active_index != table_share->primary_key) {
+    return HA_ERR_WRONG_INDEX;
+  }
+  const KEY *primary_key = duckdb_primary_key_info(table, table_share);
+  if (primary_key == nullptr) return HA_ERR_WRONG_INDEX;
+
+  std::string where_sql;
+  bool descending = false;
+
+  if (key != nullptr && keypart_map != 0) {
+    uint key_parts = 0;
+    const uint key_len =
+        calculate_key_len(table, active_index, keypart_map, &key_parts);
+    if (key_len > 0 && key_parts > 0) {
+      key_restore(table->record[0], key, primary_key, key_len);
+      const std::vector<Field *> key_fields =
+          collect_key_prefix_fields(primary_key, key_parts);
+      const std::vector<duckdb::Value> key_values =
+          collect_values(table, table->record[0], key_fields);
+
+      switch (find_flag) {
+        case HA_READ_KEY_EXACT:
+          where_sql = build_where_clause(key_fields, key_values);
+          break;
+        case HA_READ_KEY_OR_NEXT:
+          where_sql =
+              build_lexicographic_predicate(key_fields, key_values, true, true);
+          break;
+        case HA_READ_KEY_OR_PREV:
+          where_sql =
+              build_lexicographic_predicate(key_fields, key_values, false, true);
+          descending = true;
+          break;
+        case HA_READ_AFTER_KEY:
+          where_sql =
+              build_lexicographic_predicate(key_fields, key_values, true, false);
+          break;
+        case HA_READ_BEFORE_KEY:
+          where_sql =
+              build_lexicographic_predicate(key_fields, key_values, false, false);
+          descending = true;
+          break;
+        case HA_READ_PREFIX:
+          where_sql = build_where_clause(key_fields, key_values);
+          break;
+        case HA_READ_PREFIX_LAST:
+          where_sql = build_where_clause(key_fields, key_values);
+          descending = true;
+          break;
+        case HA_READ_PREFIX_LAST_OR_PREV:
+          where_sql =
+              build_lexicographic_predicate(key_fields, key_values, false, true);
+          descending = true;
+          break;
+        default:
+          return HA_ERR_WRONG_COMMAND;
+      }
+    }
+  } else {
+    switch (find_flag) {
+      case HA_READ_KEY_EXACT:
+      case HA_READ_KEY_OR_NEXT:
+      case HA_READ_AFTER_KEY:
+      case HA_READ_PREFIX:
+        descending = false;
+        break;
+      case HA_READ_KEY_OR_PREV:
+      case HA_READ_BEFORE_KEY:
+      case HA_READ_PREFIX_LAST:
+      case HA_READ_PREFIX_LAST_OR_PREV:
+        descending = true;
+        break;
+      default:
+        return HA_ERR_WRONG_COMMAND;
+    }
+  }
+
+  return execute_index_scan(where_sql, descending, buf);
+}
+
+int ha_duckdb::index_read_last_map(uchar *buf, const uchar *key,
+                                   key_part_map keypart_map) {
+  return index_read_map(buf, key, keypart_map, HA_READ_PREFIX_LAST);
+}
+
+int ha_duckdb::index_next(uchar *buf) {
+  if (m_index_descending) return HA_ERR_WRONG_COMMAND;
+  return fetch_index_scan_row(buf);
+}
+
+int ha_duckdb::index_prev(uchar *buf) {
+  if (!m_index_descending) return HA_ERR_WRONG_COMMAND;
+  return fetch_index_scan_row(buf);
+}
+
+int ha_duckdb::index_first(uchar *buf) {
+  return execute_index_scan(std::string(), false, buf);
+}
+
+int ha_duckdb::index_last(uchar *buf) {
+  return execute_index_scan(std::string(), true, buf);
 }
 
 int ha_duckdb::write_row(uchar *buf) {
@@ -1851,20 +2113,27 @@ int ha_duckdb::info(unsigned int flags) {
 }
 
 handler::Table_flags ha_duckdb::table_flags() const {
-  return HA_NO_INDEX_ACCESS;
+  return 0;
 }
 
 unsigned long ha_duckdb::index_flags(unsigned int idx, unsigned int part,
                                      bool all_parts) const {
-  const handler *primary = ha_get_primary_handler();
-  const unsigned long primary_flags =
-      primary == nullptr ? 0 : primary->index_flags(idx, part, all_parts);
-  return ((HA_READ_RANGE | HA_KEY_SCAN_NOT_ROR) & primary_flags);
+  (void)part;
+  (void)all_parts;
+  const KEY *primary_key = duckdb_primary_key_info(table, table_share);
+  if (primary_key == nullptr || idx != table_share->primary_key) return 0;
+  constexpr unsigned long kSupportedFlags =
+      HA_READ_NEXT | HA_READ_PREV | HA_READ_ORDER | HA_READ_RANGE |
+      HA_KEYREAD_ONLY | HA_KEY_SCAN_NOT_ROR;
+  return kSupportedFlags;
 }
 
 ha_rows ha_duckdb::records_in_range(unsigned int index, key_range *min_key,
                                     key_range *max_key) {
-  return ha_get_primary_handler()->records_in_range(index, min_key, max_key);
+  if (index != table_share->primary_key) return HA_POS_ERROR;
+  handler *primary = ha_get_primary_handler();
+  if (primary != nullptr) return primary->records_in_range(index, min_key, max_key);
+  return stats.records == 0 ? 10 : stats.records;
 }
 
 int ha_duckdb::external_lock(THD *, int lock_type) {
@@ -1873,6 +2142,10 @@ int ha_duckdb::external_lock(THD *, int lock_type) {
     m_result.reset();
     m_chunk.reset();
     m_chunk_row = 0;
+    m_index_result.reset();
+    m_index_chunk.reset();
+    m_index_chunk_row = 0;
+    m_index_descending = false;
   }
   return 0;
 }
