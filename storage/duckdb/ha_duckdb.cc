@@ -51,11 +51,13 @@
 #include "sql/sql_error.h"
 #include "sql/field.h"
 #include "sql/item.h"
+#include "sql/item_cmpfunc.h"
 #include "mysql/plugin.h"
 #include "sql/my_decimal.h"
 #include "sql/mysqld.h"
 #include "sql/key.h"
 #include "sql/psi_memory_key.h"
+#include "sql/sql_const.h"
 #include "sql/query_result.h"
 #include "sql/sql_class.h"
 #include "sql/sql_lex.h"
@@ -595,6 +597,28 @@ std::vector<Field *> collect_fields(TABLE *table, const MY_BITMAP *bitmap) {
   return fields;
 }
 
+bool should_use_projection_pushdown(TABLE *table) {
+  if (table == nullptr) return false;
+  THD *thd = current_thd;
+  if (thd == nullptr || thd->lex == nullptr) return true;
+  switch (thd->lex->sql_command) {
+    case SQLCOM_DELETE:
+    case SQLCOM_DELETE_MULTI:
+    case SQLCOM_UPDATE:
+    case SQLCOM_UPDATE_MULTI:
+      return false;
+    default:
+      return true;
+  }
+}
+
+std::vector<Field *> collect_projection_fields(TABLE *table) {
+  if (!should_use_projection_pushdown(table)) {
+    return collect_fields(table, nullptr);
+  }
+  return collect_fields(table, table->read_set);
+}
+
 std::string build_select_list(const std::vector<Field *> &fields) {
   if (fields.empty()) return "*";
 
@@ -763,6 +787,359 @@ std::string build_where_clause(const std::vector<Field *> &fields,
     sql.append(value_to_sql(values[i]));
   }
   return sql;
+}
+
+bool is_string_like_mysql_type(enum_field_types type) {
+  switch (type) {
+    case MYSQL_TYPE_STRING:
+    case MYSQL_TYPE_VAR_STRING:
+    case MYSQL_TYPE_VARCHAR:
+    case MYSQL_TYPE_TINY_BLOB:
+    case MYSQL_TYPE_BLOB:
+    case MYSQL_TYPE_MEDIUM_BLOB:
+    case MYSQL_TYPE_LONG_BLOB:
+    case MYSQL_TYPE_JSON:
+    case MYSQL_TYPE_ENUM:
+    case MYSQL_TYPE_SET:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool is_temporal_mysql_type(enum_field_types type) {
+  switch (type) {
+    case MYSQL_TYPE_DATE:
+    case MYSQL_TYPE_DATETIME:
+    case MYSQL_TYPE_DATETIME2:
+    case MYSQL_TYPE_TIME:
+    case MYSQL_TYPE_TIME2:
+    case MYSQL_TYPE_TIMESTAMP:
+    case MYSQL_TYPE_TIMESTAMP2:
+    case MYSQL_TYPE_NEWDATE:
+      return true;
+    default:
+      return false;
+  }
+}
+
+struct DuckdbScalarExpression {
+  std::string sql;
+  bool references_target_table{false};
+  bool string_like{false};
+  bool null_literal{false};
+};
+
+std::string combine_predicates(const std::string &left,
+                               const std::string &right) {
+  if (left.empty()) return right;
+  if (right.empty()) return left;
+  return "(" + left + ") AND (" + right + ")";
+}
+
+bool build_pushdown_scalar_expr(const Item *item, TABLE *table,
+                                DuckdbScalarExpression *out);
+
+bool build_constant_sql(const Item *item, DuckdbScalarExpression *out) {
+  if (item == nullptr || out == nullptr) return false;
+  if (!item->const_item() || item->is_non_deterministic()) return false;
+
+  const Item *real = item->real_item();
+  if (real == nullptr) return false;
+
+  if (real->type() == Item::NULL_ITEM) {
+    out->sql = "NULL";
+    out->null_literal = true;
+    out->references_target_table = false;
+    out->string_like = false;
+    return true;
+  }
+
+  String tmp;
+  Item *mutable_item = const_cast<Item *>(real);
+  String *value = mutable_item->val_str(&tmp);
+  if (mutable_item->null_value || value == nullptr) {
+    out->sql = "NULL";
+    out->null_literal = true;
+    out->references_target_table = false;
+    out->string_like = false;
+    return true;
+  }
+
+  const Item_result result = real->result_type();
+  const enum_field_types data_type = real->data_type();
+  const std::string literal(value->ptr(), value->length());
+
+  if (result == STRING_RESULT) {
+    out->string_like = !is_temporal_mysql_type(data_type);
+    out->sql = value_to_sql(duckdb::Value(literal));
+  } else if (result == INT_RESULT || result == REAL_RESULT ||
+             result == DECIMAL_RESULT) {
+    out->string_like = false;
+    out->sql = literal;
+  } else {
+    return false;
+  }
+
+  out->references_target_table = false;
+  out->null_literal = false;
+  return true;
+}
+
+bool build_pushdown_field_expr(const Item *item, TABLE *table,
+                               DuckdbScalarExpression *out) {
+  if (item == nullptr || table == nullptr || out == nullptr) return false;
+  if (item->type() != Item::FIELD_ITEM) return false;
+
+  const Item_field *field_item = down_cast<const Item_field *>(item);
+  Field *field = field_item->field;
+  if (field == nullptr || field->table != table) return false;
+  if (field->type() == MYSQL_TYPE_GEOMETRY) return false;
+
+  out->sql = quote_ident(field->field_name, std::strlen(field->field_name));
+  out->references_target_table = true;
+  out->string_like = is_string_like_mysql_type(field->type());
+  out->null_literal = false;
+  return true;
+}
+
+bool build_pushdown_numeric_function(const Item_func *func, TABLE *table,
+                                     const char *op,
+                                     DuckdbScalarExpression *out) {
+  if (func == nullptr || out == nullptr || func->arg_count != 2) return false;
+  Item **args = func->arguments();
+  if (args == nullptr) return false;
+
+  DuckdbScalarExpression left;
+  DuckdbScalarExpression right;
+  if (!build_pushdown_scalar_expr(args[0], table, &left) ||
+      !build_pushdown_scalar_expr(args[1], table, &right)) {
+    return false;
+  }
+
+  if (left.string_like || right.string_like) return false;
+  if (left.null_literal || right.null_literal) return false;
+
+  out->sql = "(" + left.sql + " " + op + " " + right.sql + ")";
+  out->references_target_table =
+      left.references_target_table || right.references_target_table;
+  out->string_like = false;
+  out->null_literal = false;
+  return true;
+}
+
+bool build_pushdown_scalar_expr(const Item *item, TABLE *table,
+                                DuckdbScalarExpression *out) {
+  if (item == nullptr || table == nullptr || out == nullptr) return false;
+
+  const Item *real = item->real_item();
+  if (real == nullptr) return false;
+
+  if (build_pushdown_field_expr(real, table, out)) return true;
+  if (build_constant_sql(real, out)) return true;
+
+  if (real->type() != Item::FUNC_ITEM) return false;
+  const Item_func *func = down_cast<const Item_func *>(real);
+
+  switch (func->functype()) {
+    case Item_func::PLUS_FUNC:
+      return build_pushdown_numeric_function(func, table, "+", out);
+    case Item_func::MINUS_FUNC:
+      return build_pushdown_numeric_function(func, table, "-", out);
+    case Item_func::MUL_FUNC:
+      return build_pushdown_numeric_function(func, table, "*", out);
+    case Item_func::MOD_FUNC:
+      return build_pushdown_numeric_function(func, table, "%", out);
+    case Item_func::NEG_FUNC: {
+      if (func->arg_count != 1) return false;
+      Item **args = func->arguments();
+      if (args == nullptr) return false;
+      DuckdbScalarExpression arg;
+      if (!build_pushdown_scalar_expr(args[0], table, &arg)) return false;
+      if (arg.string_like || arg.null_literal) return false;
+      out->sql = "(-" + arg.sql + ")";
+      out->references_target_table = arg.references_target_table;
+      out->string_like = false;
+      out->null_literal = false;
+      return true;
+    }
+    case Item_func::ABS_FUNC: {
+      if (func->arg_count != 1) return false;
+      Item **args = func->arguments();
+      if (args == nullptr) return false;
+      DuckdbScalarExpression arg;
+      if (!build_pushdown_scalar_expr(args[0], table, &arg)) return false;
+      if (arg.string_like || arg.null_literal) return false;
+      out->sql = "ABS(" + arg.sql + ")";
+      out->references_target_table = arg.references_target_table;
+      out->string_like = false;
+      out->null_literal = false;
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+bool build_pushdown_predicate(const Item *cond, TABLE *table, std::string *out);
+
+bool build_binary_comparison_predicate(const Item_func *func, TABLE *table,
+                                       const char *op, std::string *out) {
+  if (func == nullptr || out == nullptr || func->arg_count != 2) return false;
+  Item **args = func->arguments();
+  if (args == nullptr) return false;
+
+  DuckdbScalarExpression left;
+  DuckdbScalarExpression right;
+  if (!build_pushdown_scalar_expr(args[0], table, &left) ||
+      !build_pushdown_scalar_expr(args[1], table, &right)) {
+    return false;
+  }
+  if (!(left.references_target_table || right.references_target_table)) {
+    return false;
+  }
+  if (left.string_like || right.string_like) return false;
+
+  if (left.null_literal || right.null_literal) {
+    if (func->functype() == Item_func::EQUAL_FUNC) {
+      return false;
+    }
+    if (func->functype() == Item_func::EQ_FUNC && left.references_target_table &&
+        right.null_literal) {
+      *out = "(" + left.sql + " IS NULL)";
+      return true;
+    }
+    if (func->functype() == Item_func::EQ_FUNC && right.references_target_table &&
+        left.null_literal) {
+      *out = "(" + right.sql + " IS NULL)";
+      return true;
+    }
+    if (func->functype() == Item_func::NE_FUNC && left.references_target_table &&
+        right.null_literal) {
+      *out = "(" + left.sql + " IS NOT NULL)";
+      return true;
+    }
+    if (func->functype() == Item_func::NE_FUNC && right.references_target_table &&
+        left.null_literal) {
+      *out = "(" + right.sql + " IS NOT NULL)";
+      return true;
+    }
+    return false;
+  }
+
+  if (func->functype() == Item_func::EQUAL_FUNC) {
+    *out = "(" + left.sql + " IS NOT DISTINCT FROM " + right.sql + ")";
+  } else {
+    *out = "(" + left.sql + " " + std::string(op) + " " + right.sql + ")";
+  }
+  return true;
+}
+
+bool build_in_predicate(const Item_func *func, TABLE *table, std::string *out) {
+  if (func == nullptr || out == nullptr || func->arg_count < 2) return false;
+  Item **args = func->arguments();
+  if (args == nullptr) return false;
+
+  DuckdbScalarExpression lhs;
+  if (!build_pushdown_scalar_expr(args[0], table, &lhs)) return false;
+  if (!lhs.references_target_table || lhs.string_like) return false;
+
+  std::string list_sql;
+  for (uint i = 1; i < func->arg_count; ++i) {
+    DuckdbScalarExpression rhs;
+    if (!build_pushdown_scalar_expr(args[i], table, &rhs)) return false;
+    if (rhs.references_target_table || rhs.string_like) return false;
+    if (i > 1) list_sql.append(", ");
+    list_sql.append(rhs.sql);
+  }
+  if (list_sql.empty()) return false;
+
+  *out = "(" + lhs.sql + " IN (" + list_sql + "))";
+  return true;
+}
+
+bool build_pushdown_predicate(const Item *cond, TABLE *table, std::string *out) {
+  if (cond == nullptr || table == nullptr || out == nullptr) return false;
+
+  const Item *real = cond->real_item();
+  if (real == nullptr) return false;
+
+  if (table->pos_in_table_list != nullptr) {
+    const table_map allowed_tables =
+        table->pos_in_table_list->map() | PSEUDO_TABLE_BITS;
+    if ((real->used_tables() & ~allowed_tables) != 0) return false;
+  }
+
+  if (real->type() == Item::COND_ITEM) {
+    const Item_cond *cond_item = down_cast<const Item_cond *>(real);
+    const Item_func::Functype type = cond_item->functype();
+    if (type != Item_func::COND_AND_FUNC && type != Item_func::COND_OR_FUNC) {
+      return false;
+    }
+
+    std::string joined;
+    bool first = true;
+    for (const Item &arg : *cond_item->argument_list()) {
+      std::string part;
+      if (!build_pushdown_predicate(&arg, table, &part)) return false;
+      if (!first) {
+        joined.append(type == Item_func::COND_AND_FUNC ? " AND " : " OR ");
+      }
+      joined.append(part);
+      first = false;
+    }
+    if (joined.empty()) return false;
+    *out = "(" + joined + ")";
+    return true;
+  }
+
+  if (real->type() != Item::FUNC_ITEM) return false;
+  const Item_func *func = down_cast<const Item_func *>(real);
+
+  switch (func->functype()) {
+    case Item_func::NOT_FUNC: {
+      if (func->arg_count != 1) return false;
+      Item **args = func->arguments();
+      if (args == nullptr) return false;
+      std::string part;
+      if (!build_pushdown_predicate(args[0], table, &part)) return false;
+      *out = "(NOT " + part + ")";
+      return true;
+    }
+    case Item_func::EQ_FUNC:
+      return build_binary_comparison_predicate(func, table, "=", out);
+    case Item_func::EQUAL_FUNC:
+      return build_binary_comparison_predicate(func, table, "=", out);
+    case Item_func::NE_FUNC:
+      return build_binary_comparison_predicate(func, table, "<>", out);
+    case Item_func::LT_FUNC:
+      return build_binary_comparison_predicate(func, table, "<", out);
+    case Item_func::LE_FUNC:
+      return build_binary_comparison_predicate(func, table, "<=", out);
+    case Item_func::GT_FUNC:
+      return build_binary_comparison_predicate(func, table, ">", out);
+    case Item_func::GE_FUNC:
+      return build_binary_comparison_predicate(func, table, ">=", out);
+    case Item_func::ISNULL_FUNC:
+    case Item_func::ISNOTNULL_FUNC: {
+      if (func->arg_count != 1) return false;
+      Item **args = func->arguments();
+      if (args == nullptr) return false;
+      DuckdbScalarExpression arg;
+      if (!build_pushdown_scalar_expr(args[0], table, &arg)) return false;
+      if (!arg.references_target_table) return false;
+      if (func->functype() == Item_func::ISNULL_FUNC) {
+        *out = "(" + arg.sql + " IS NULL)";
+      } else {
+        *out = "(" + arg.sql + " IS NOT NULL)";
+      }
+      return true;
+    }
+    case Item_func::IN_FUNC:
+      return build_in_predicate(func, table, out);
+    default:
+      return false;
+  }
 }
 
 std::string default_duckdb_path(const TABLE_SHARE *share) {
@@ -1669,6 +2046,8 @@ int ha_duckdb::close() {
   m_index_result.reset();
   m_index_chunk.reset();
   m_index_fields.clear();
+  m_pushed_cond_sql.clear();
+  m_pushed_idx_cond_sql.clear();
   m_conn.reset();
   m_db.reset();
   return 0;
@@ -1679,7 +2058,7 @@ int ha_duckdb::rnd_init(bool) {
   m_chunk.reset();
   m_result.reset();
   m_chunk_row = 0;
-  m_scan_fields = collect_fields(table, table->read_set);
+  m_scan_fields = collect_projection_fields(table);
 
   if (!m_conn) return HA_ERR_GENERIC;
 
@@ -1688,6 +2067,10 @@ int ha_duckdb::rnd_init(bool) {
     query += build_select_list(m_scan_fields);
     query += " FROM ";
     query += qualified_table_name(m_schema_name, m_table_name);
+    if (!m_pushed_cond_sql.empty()) {
+      query += " WHERE ";
+      query += m_pushed_cond_sql;
+    }
     m_result = m_conn->Query(query);
     if (!m_result || m_result->HasError()) {
       const std::string err = m_result ? m_result->GetError() :
@@ -1804,15 +2187,19 @@ int ha_duckdb::execute_index_scan(const std::string &where_sql, bool descending,
     return HA_ERR_WRONG_INDEX;
   }
 
-  m_index_fields = collect_fields(table, table->read_set);
+  m_index_fields = collect_projection_fields(table);
+
+  std::string effective_where = where_sql;
+  effective_where = combine_predicates(effective_where, m_pushed_cond_sql);
+  effective_where = combine_predicates(effective_where, m_pushed_idx_cond_sql);
 
   std::string sql = "SELECT ";
   sql += build_select_list(m_index_fields);
   sql += " FROM ";
   sql += qualified_table_name(m_schema_name, m_table_name);
-  if (!where_sql.empty()) {
+  if (!effective_where.empty()) {
     sql += " WHERE ";
-    sql += where_sql;
+    sql += effective_where;
   }
   sql += build_primary_key_order_by(primary_key, descending);
 
@@ -1941,6 +2328,44 @@ int ha_duckdb::index_first(uchar *buf) {
 
 int ha_duckdb::index_last(uchar *buf) {
   return execute_index_scan(std::string(), true, buf);
+}
+
+const Item *ha_duckdb::cond_push(const Item *cond) {
+  pushed_cond = nullptr;
+  m_pushed_cond_sql.clear();
+
+  if (cond == nullptr || table == nullptr) return cond;
+
+  std::string predicate_sql;
+  if (!build_pushdown_predicate(cond, table, &predicate_sql)) return cond;
+
+  pushed_cond = cond;
+  m_pushed_cond_sql = predicate_sql;
+  return nullptr;
+}
+
+Item *ha_duckdb::idx_cond_push(uint keyno, Item *idx_cond) {
+  cancel_pushed_idx_cond();
+
+  if (idx_cond == nullptr || table == nullptr) return idx_cond;
+  if (table_share == nullptr || keyno != table_share->primary_key) {
+    return idx_cond;
+  }
+
+  std::string predicate_sql;
+  if (!build_pushdown_predicate(idx_cond, table, &predicate_sql)) {
+    return idx_cond;
+  }
+
+  pushed_idx_cond = idx_cond;
+  pushed_idx_cond_keyno = keyno;
+  m_pushed_idx_cond_sql = predicate_sql;
+  return nullptr;
+}
+
+void ha_duckdb::cancel_pushed_idx_cond() {
+  handler::cancel_pushed_idx_cond();
+  m_pushed_idx_cond_sql.clear();
 }
 
 int ha_duckdb::write_row(uchar *buf) {
@@ -2113,8 +2538,7 @@ int ha_duckdb::rnd_pos(uchar *buf, uchar *pos) {
   key_restore(table->record[0], pos, primary_key, ref_length);
   std::vector<duckdb::Value> where_values =
       collect_values(table, table->record[0], where_fields);
-  const std::vector<Field *> projection_fields =
-      collect_fields(table, table->read_set);
+  const std::vector<Field *> projection_fields = collect_projection_fields(table);
 
   std::string sql = "SELECT ";
   sql += build_select_list(projection_fields);
@@ -2169,7 +2593,7 @@ unsigned long ha_duckdb::index_flags(unsigned int idx, unsigned int part,
   if (primary_key == nullptr || idx != table_share->primary_key) return 0;
   constexpr unsigned long kSupportedFlags =
       HA_READ_NEXT | HA_READ_PREV | HA_READ_ORDER | HA_READ_RANGE |
-      HA_KEYREAD_ONLY | HA_KEY_SCAN_NOT_ROR;
+      HA_KEYREAD_ONLY | HA_KEY_SCAN_NOT_ROR | HA_DO_INDEX_COND_PUSHDOWN;
   return kSupportedFlags;
 }
 
@@ -2194,6 +2618,12 @@ int ha_duckdb::external_lock(THD *, int lock_type) {
     m_index_chunk_row = 0;
     m_index_descending = false;
   }
+  return 0;
+}
+
+int ha_duckdb::reset() {
+  m_pushed_cond_sql.clear();
+  m_pushed_idx_cond_sql.clear();
   return 0;
 }
 

@@ -77,6 +77,9 @@ class ha_duckdb : public handler {
   int index_prev(uchar *buf) override;
   int index_first(uchar *buf) override;
   int index_last(uchar *buf) override;
+  const Item *cond_push(const Item *cond) override;
+  Item *idx_cond_push(uint keyno, Item *idx_cond) override;
+  void cancel_pushed_idx_cond() override;
 
   int write_row(uchar *buf) override;
 
@@ -89,6 +92,7 @@ class ha_duckdb : public handler {
   void position(const uchar *record) override;
 
   int external_lock(THD *thd, int lock_type) override;
+  int reset() override;
 
   int info(unsigned int) override;
 
@@ -137,6 +141,8 @@ class ha_duckdb : public handler {
   uint64_t m_index_chunk_row{0};
   std::vector<Field *> m_index_fields;
   bool m_index_descending{false};
+  std::string m_pushed_cond_sql;
+  std::string m_pushed_idx_cond_sql;
 };
 
 }  // namespace duckdb_se
