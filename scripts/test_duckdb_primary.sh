@@ -289,11 +289,10 @@ TABLES_LOADED=0
 for t in "${TABLES[@]}"; do
     DUMP_FILE="$DUMP_DIR/${t}.sql"
 
-    # Dump data from system MySQL (InnoDB) - no CREATE, complete inserts
+    # Dump data from system MySQL (InnoDB) - no CREATE, extended (batched) inserts
     mysqldump \
         -u "$SYS_USER" \
         --no-create-info \
-        --complete-insert \
         --skip-triggers \
         --skip-lock-tables \
         --set-gtid-purged=OFF \
@@ -333,9 +332,14 @@ step "Verify row counts match"
 
 MISMATCHES=0
 MISMATCH_DETAILS=""
+TOTAL_DUCKDB=0
 for t in "${TABLES[@]}"; do
     INNODB_CNT=$(sys_mysql -N -e "SELECT COUNT(*) FROM $DB_NAME.$t" 2>/dev/null || echo "-1")
     DUCKDB_CNT=$(duckdb_mysql -N -e "SELECT COUNT(*) FROM $DB_NAME.$t" 2>/dev/null || echo "-1")
+
+    if [ "$DUCKDB_CNT" -gt 0 ] 2>/dev/null; then
+        TOTAL_DUCKDB=$((TOTAL_DUCKDB + DUCKDB_CNT))
+    fi
 
     if [ "$INNODB_CNT" != "$DUCKDB_CNT" ]; then
         MISMATCHES=$((MISMATCHES + 1))
@@ -349,7 +353,7 @@ if [ "$MISMATCHES" -gt 0 ]; then
     FAILURES=$((FAILURES + 1))
     # Don't exit - continue to DML tests
 else
-    ok "all match"
+    ok "all match, $TOTAL_DUCKDB total rows"
 fi
 
 # Step 8: Direct DML validation
