@@ -2013,20 +2013,14 @@ static void DuckdbSetOffloadFailReason(THD *thd, const char *reason) {
     return;
   }
   auto *raw_ctx = thd->lex->secondary_engine_execution_context();
-  if (raw_ctx == nullptr) {
-    // No context yet — create and attach a DuckDB-specific one
-    auto *ctx = new (thd->mem_root) Duckdb_execution_context;
-    if (ctx == nullptr) return;
-    ctx->fail_reason = tls_fail_reason;
-    thd->lex->set_secondary_engine_execution_context(ctx);
-    return;
-  }
+  if (raw_ctx == nullptr) return;
+
   auto *ctx = dynamic_cast<Duckdb_execution_context *>(raw_ctx);
   if (ctx != nullptr) {
     ctx->fail_reason = tls_fail_reason;
   }
-  // If context belongs to another engine, leave it alone — tls_fail_reason
-  // is already set for DuckdbGetOffloadFailReason() to pick up.
+  // If context belongs to another engine, leave it untouched.
+  // tls_fail_reason is used by DuckdbGetOffloadFailReason().
 }
 
 }  // namespace

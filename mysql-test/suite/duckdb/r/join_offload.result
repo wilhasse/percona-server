@@ -14,11 +14,8 @@ name	c	total
 Alpha	2	30
 Beta	1	5
 Gamma	2	16
-SELECT d.label, COUNT(*) AS c
+SELECT /*+ SET_VAR(use_secondary_engine=FORCED) */ d.label, COUNT(*) AS c
 FROM fact f JOIN dim_unloaded d ON f.dim_id = d.id
 GROUP BY d.label
 ORDER BY d.label;
-label	c
-A	2
-B	1
-C	2
+ERROR HY000: Secondary engine operation failed. DuckDB secondary table not loaded: duckdb_join.dim_unloaded. Run ALTER TABLE ... SECONDARY_LOAD.

@@ -69,7 +69,8 @@ SELECT /*+ SET_VAR(use_secondary_engine=OFF) */ d.name, COUNT(*) AS c, SUM(f.amo
   GROUP BY d.name
   ORDER BY d.name;
 
-SELECT d.label, COUNT(*) AS c
+--error ER_SECONDARY_ENGINE
+SELECT /*+ SET_VAR(use_secondary_engine=FORCED) */ d.label, COUNT(*) AS c
   FROM fact f JOIN dim_unloaded d ON f.dim_id = d.id
   GROUP BY d.label
   ORDER BY d.label;
