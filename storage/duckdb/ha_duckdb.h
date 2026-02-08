@@ -107,6 +107,9 @@ class ha_duckdb : public handler {
   int reset() override;
 
   int info(unsigned int) override;
+  double scan_time() override;
+  double read_time(uint index, uint ranges, ha_rows rows) override;
+  double index_only_read_time(uint keynr, double records) override;
 
   ha_rows records_in_range(unsigned int index, key_range *min_key,
                            key_range *max_key) override;
@@ -139,6 +142,12 @@ class ha_duckdb : public handler {
   int fetch_index_scan_row(uchar *buf);
   bool can_use_native_mrr(uint keyno, uint flags) const;
   void reset_native_mrr_state();
+  void invalidate_stats_cache();
+  bool ensure_stats_cache();
+  bool can_estimate_numeric_pk_range(const key_range *min_key,
+                                     const key_range *max_key);
+  ha_rows estimate_numeric_pk_range_rows(const key_range *min_key,
+                                         const key_range *max_key);
   bool native_mrr_range_supported(const KEY *primary_key,
                                   const KEY_MULTI_RANGE &range) const;
   int start_next_native_mrr_batch();
@@ -178,6 +187,13 @@ class ha_duckdb : public handler {
   std::unique_ptr<duckdb::QueryResult> m_native_mrr_result;
   std::unique_ptr<duckdb::DataChunk> m_native_mrr_chunk;
   uint64_t m_native_mrr_chunk_row{0};
+  longlong m_stats_cached_query_id{-1};
+  bool m_stats_cache_valid{false};
+  ha_rows m_stats_cached_rows{0};
+  bool m_stats_cached_pk_domain_valid{false};
+  bool m_stats_cached_pk_integer{false};
+  long double m_stats_cached_pk_min{0.0L};
+  long double m_stats_cached_pk_max{0.0L};
 };
 
 }  // namespace duckdb_se

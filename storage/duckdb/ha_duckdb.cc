@@ -29,6 +29,7 @@
 #include <cctype>
 #include <cfloat>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <cstdio>
@@ -196,6 +197,7 @@ std::string qualified_table_name(const std::string &schema,
 std::string value_to_sql(const duckdb::Value &val);
 std::string build_where_clause(const std::vector<Field *> &fields,
                                const std::vector<duckdb::Value> &values);
+void store_duckdb_value(Field *field, const duckdb::Value &value);
 
 bool DuckdbTableExistsInFile(const std::string &path,
                              const std::string &schema,
@@ -280,6 +282,60 @@ bool is_binary_field(const Field *field) {
       break;
   }
   return field->binary();
+}
+
+bool is_integer_field_type(enum_field_types type) {
+  switch (type) {
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+    case MYSQL_TYPE_LONGLONG:
+    case MYSQL_TYPE_YEAR:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool is_numeric_field_type(enum_field_types type) {
+  switch (type) {
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+    case MYSQL_TYPE_LONGLONG:
+    case MYSQL_TYPE_YEAR:
+    case MYSQL_TYPE_FLOAT:
+    case MYSQL_TYPE_DOUBLE:
+    case MYSQL_TYPE_DECIMAL:
+    case MYSQL_TYPE_NEWDECIMAL:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool duckdb_value_to_ha_rows(const duckdb::Value &value, ha_rows *out) {
+  if (out == nullptr || value.IsNull()) return false;
+  const std::string text = value.ToString();
+  if (text.empty()) return false;
+  char *end = nullptr;
+  const unsigned long long parsed = std::strtoull(text.c_str(), &end, 10);
+  if (end == nullptr || *end != '\0') return false;
+  *out = static_cast<ha_rows>(parsed);
+  return true;
+}
+
+bool duckdb_value_to_long_double(const duckdb::Value &value, long double *out) {
+  if (out == nullptr || value.IsNull()) return false;
+  const std::string text = value.ToString();
+  if (text.empty()) return false;
+  char *end = nullptr;
+  const long double parsed = std::strtold(text.c_str(), &end);
+  if (end == nullptr || *end != '\0' || !std::isfinite(parsed)) return false;
+  *out = parsed;
+  return true;
 }
 
 enum class MappingSeverity {
@@ -498,6 +554,57 @@ duckdb::Value field_value(Field *field) {
   String tmp;
   field->val_str(&tmp);
   return duckdb::Value(std::string(tmp.ptr(), tmp.length()));
+}
+
+void store_duckdb_value(Field *field, const duckdb::Value &value) {
+  if (value.IsNull()) {
+    field->set_null();
+    return;
+  }
+  field->set_notnull();
+
+  if (is_binary_field(field)) {
+    const auto &str = duckdb::StringValue::Get(value);
+    field->store(str.data(), str.size(), field->charset());
+    return;
+  }
+
+  const bool unsigned_flag = field->is_unsigned();
+  switch (field->type()) {
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+    case MYSQL_TYPE_LONGLONG:
+    case MYSQL_TYPE_YEAR: {
+      if (unsigned_flag) {
+        const uint64_t v = duckdb::UBigIntValue::Get(value);
+        field->store(static_cast<longlong>(v), true);
+      } else {
+        const int64_t v = duckdb::BigIntValue::Get(value);
+        field->store(static_cast<longlong>(v), false);
+      }
+      return;
+    }
+    case MYSQL_TYPE_FLOAT:
+    case MYSQL_TYPE_DOUBLE: {
+      const double v = duckdb::DoubleValue::Get(value);
+      field->store(v);
+      return;
+    }
+    default:
+      break;
+  }
+
+  std::string text;
+  const auto type_id = value.type().id();
+  if (type_id == duckdb::LogicalTypeId::VARCHAR ||
+      type_id == duckdb::LogicalTypeId::BLOB) {
+    text = duckdb::StringValue::Get(value);
+  } else {
+    text = value.ToString();
+  }
+  field->store(text.data(), text.size(), field->charset());
 }
 
 std::string value_to_sql(const duckdb::Value &val) {
@@ -1932,6 +2039,7 @@ int ha_duckdb::create(const char *, TABLE *table_arg, HA_CREATE_INFO *,
 }
 
 int ha_duckdb::open(const char *, int, unsigned int, const dd::Table *) {
+  invalidate_stats_cache();
   DuckdbTableState *share =
       loaded_tables->get(table_share->db.str, table_share->table_name.str);
   if (share == nullptr && table_share->is_secondary_engine()) {
@@ -2022,6 +2130,7 @@ int ha_duckdb::open(const char *, int, unsigned int, const dd::Table *) {
 
 int ha_duckdb::close() {
   reset_native_mrr_state();
+  invalidate_stats_cache();
   m_result.reset();
   m_chunk.reset();
   m_scan_fields.clear();
@@ -2070,6 +2179,7 @@ int ha_duckdb::rnd_init(bool) {
 
 int ha_duckdb::rnd_end() {
   reset_native_mrr_state();
+  invalidate_stats_cache();
   m_result.reset();
   m_chunk.reset();
   m_scan_fields.clear();
@@ -2124,6 +2234,7 @@ int ha_duckdb::index_init(uint idx, bool) {
 
 int ha_duckdb::index_end() {
   reset_native_mrr_state();
+  invalidate_stats_cache();
   m_index_result.reset();
   m_index_chunk.reset();
   m_index_fields.clear();
@@ -2702,6 +2813,7 @@ int ha_duckdb::write_row(uchar *buf) {
     return HA_ERR_GENERIC;
   }
 
+  invalidate_stats_cache();
   stats.records++;
   return 0;
 }
@@ -2747,6 +2859,7 @@ int ha_duckdb::update_row(const uchar *old_data, uchar *new_data) {
     return HA_ERR_GENERIC;
   }
 
+  invalidate_stats_cache();
   return 0;
 }
 
@@ -2782,6 +2895,7 @@ int ha_duckdb::delete_row(const uchar *buf) {
     return HA_ERR_GENERIC;
   }
 
+  invalidate_stats_cache();
   stats.records = stats.records > 0 ? stats.records - 1 : 0;
   return 0;
 }
@@ -2845,18 +2959,245 @@ int ha_duckdb::rnd_pos(uchar *buf, uchar *pos) {
   }
 }
 
+void ha_duckdb::invalidate_stats_cache() {
+  m_stats_cached_query_id = -1;
+  m_stats_cache_valid = false;
+  m_stats_cached_rows = 0;
+  m_stats_cached_pk_domain_valid = false;
+  m_stats_cached_pk_integer = false;
+  m_stats_cached_pk_min = 0.0L;
+  m_stats_cached_pk_max = 0.0L;
+}
+
+bool ha_duckdb::ensure_stats_cache() {
+  THD *thd = current_thd;
+  const longlong query_id =
+      thd != nullptr ? static_cast<longlong>(thd->query_id) : -1;
+  if (m_stats_cache_valid && query_id != -1 &&
+      m_stats_cached_query_id == query_id) {
+    return true;
+  }
+
+  invalidate_stats_cache();
+  m_stats_cached_query_id = query_id;
+
+  handler *primary = ha_get_primary_handler();
+  if (primary != nullptr) {
+    if (primary->info(HA_STATUS_VARIABLE | HA_STATUS_CONST) == 0) {
+      m_stats_cached_rows = primary->stats.records;
+      m_stats_cache_valid = true;
+    }
+  } else if (m_conn != nullptr && table != nullptr && table_share != nullptr) {
+    const KEY *primary_key = duckdb_primary_key_info(table, table_share);
+    Field *primary_key_field = nullptr;
+    bool include_pk_domain = false;
+    if (primary_key != nullptr && primary_key->user_defined_key_parts == 1 &&
+        primary_key->key_part[0].field != nullptr &&
+        is_numeric_field_type(primary_key->key_part[0].field->type())) {
+      include_pk_domain = true;
+      primary_key_field = primary_key->key_part[0].field;
+    }
+
+    std::string sql = "SELECT COUNT(*)";
+    if (include_pk_domain) {
+      sql += ", MIN(";
+      sql += quote_ident(primary_key_field->field_name,
+                         std::strlen(primary_key_field->field_name));
+      sql += "), MAX(";
+      sql += quote_ident(primary_key_field->field_name,
+                         std::strlen(primary_key_field->field_name));
+      sql += ")";
+    }
+    sql += " FROM ";
+    sql += qualified_table_name(m_schema_name, m_table_name);
+
+    try {
+      auto result = m_conn->Query(sql);
+      if (result && !result->HasError()) {
+        auto chunk = result->Fetch();
+        if (chunk && chunk->size() > 0) {
+          ha_rows rows = 0;
+          if (duckdb_value_to_ha_rows(chunk->GetValue(0, 0), &rows)) {
+            m_stats_cached_rows = rows;
+            m_stats_cache_valid = true;
+            if (include_pk_domain && chunk->ColumnCount() >= 3 &&
+                !chunk->GetValue(1, 0).IsNull() && !chunk->GetValue(2, 0).IsNull()) {
+              long double min_value = 0.0L;
+              long double max_value = 0.0L;
+              if (duckdb_value_to_long_double(chunk->GetValue(1, 0), &min_value) &&
+                  duckdb_value_to_long_double(chunk->GetValue(2, 0), &max_value) &&
+                  max_value >= min_value) {
+                m_stats_cached_pk_domain_valid = true;
+                m_stats_cached_pk_integer =
+                    is_integer_field_type(primary_key_field->type());
+                m_stats_cached_pk_min = min_value;
+                m_stats_cached_pk_max = max_value;
+              }
+            }
+          }
+        }
+      }
+    } catch (const std::exception &) {
+      // Ignore stats refresh errors and keep fallback estimates.
+    }
+  }
+
+  if (!m_stats_cache_valid) return false;
+
+  stats.records = m_stats_cached_rows;
+  stats.mean_rec_length = table_share->reclength;
+  const ulonglong rec_len = std::max<ulonglong>(1, table_share->reclength);
+  stats.data_file_length = m_stats_cached_rows * rec_len;
+  if (const KEY *pk = duckdb_primary_key_info(table, table_share); pk != nullptr) {
+    stats.index_file_length =
+        m_stats_cached_rows * std::max<ulonglong>(1, pk->key_length);
+  } else {
+    stats.index_file_length = stats.data_file_length;
+  }
+  stats.block_size = IO_SIZE;
+  return true;
+}
+
+bool ha_duckdb::can_estimate_numeric_pk_range(const key_range *min_key,
+                                              const key_range *max_key) {
+  if (!m_stats_cache_valid || !m_stats_cached_pk_domain_valid ||
+      m_stats_cached_rows == 0) {
+    return false;
+  }
+  const KEY *primary_key = duckdb_primary_key_info(table, table_share);
+  if (primary_key == nullptr || primary_key->user_defined_key_parts != 1 ||
+      primary_key->key_part[0].field == nullptr) {
+    return false;
+  }
+  if (!is_numeric_field_type(primary_key->key_part[0].field->type())) {
+    return false;
+  }
+  if (min_key == nullptr && max_key == nullptr) return false;
+  if (min_key != nullptr &&
+      (min_key->key == nullptr || min_key->length != primary_key->key_length)) {
+    return false;
+  }
+  if (max_key != nullptr &&
+      (max_key->key == nullptr || max_key->length != primary_key->key_length)) {
+    return false;
+  }
+  return true;
+}
+
+ha_rows ha_duckdb::estimate_numeric_pk_range_rows(const key_range *min_key,
+                                                  const key_range *max_key) {
+  const KEY *primary_key = duckdb_primary_key_info(table, table_share);
+  if (primary_key == nullptr || primary_key->user_defined_key_parts != 1 ||
+      primary_key->key_part[0].field == nullptr || m_stats_cached_rows == 0) {
+    return 0;
+  }
+  Field *primary_key_field = primary_key->key_part[0].field;
+  auto decode_key_bound = [&](const key_range *bound, long double *value,
+                              bool *inclusive) -> bool {
+    if (bound == nullptr || bound->key == nullptr || value == nullptr ||
+        inclusive == nullptr || bound->length != primary_key->key_length) {
+      return false;
+    }
+    key_restore(table->record[0], pointer_cast<const uchar *>(bound->key),
+                primary_key, primary_key->key_length);
+    *value = static_cast<long double>(primary_key_field->val_real());
+    *inclusive =
+        !(bound->flag == HA_READ_AFTER_KEY || bound->flag == HA_READ_BEFORE_KEY);
+    return std::isfinite(*value);
+  };
+
+  long double low = m_stats_cached_pk_min;
+  long double high = m_stats_cached_pk_max;
+  bool low_inclusive = true;
+  bool high_inclusive = true;
+  long double bound_value = 0.0L;
+  if (decode_key_bound(min_key, &bound_value, &low_inclusive)) low = bound_value;
+  if (decode_key_bound(max_key, &bound_value, &high_inclusive)) high = bound_value;
+
+  low = std::max(low, m_stats_cached_pk_min);
+  high = std::min(high, m_stats_cached_pk_max);
+
+  if (m_stats_cached_pk_integer) {
+    if (min_key != nullptr && !low_inclusive) low += 1.0L;
+    if (max_key != nullptr && !high_inclusive) high -= 1.0L;
+  }
+
+  if (high < low) return 0;
+
+  long double domain_span = m_stats_cached_pk_max - m_stats_cached_pk_min;
+  long double range_span = high - low;
+  if (m_stats_cached_pk_integer) {
+    domain_span += 1.0L;
+    range_span += 1.0L;
+  }
+  if (domain_span <= 0.0L || range_span <= 0.0L) return 0;
+
+  long double fraction = range_span / domain_span;
+  fraction = std::max(0.0L, std::min(1.0L, fraction));
+  long double estimate = fraction * static_cast<long double>(m_stats_cached_rows);
+
+  if (estimate > 0.0L && estimate < 1.0L) estimate = 1.0L;
+  if (estimate > static_cast<long double>(m_stats_cached_rows))
+    estimate = static_cast<long double>(m_stats_cached_rows);
+  return static_cast<ha_rows>(estimate + 0.5L);
+}
+
 int ha_duckdb::info(unsigned int flags) {
   handler *primary = ha_get_primary_handler();
-  if (primary == nullptr) return 0;
-  int ret = primary->info(flags);
-  if (ret == 0) {
-    stats.records = primary->stats.records;
+  if (primary != nullptr) {
+    int ret = primary->info(flags);
+    if (ret == 0) {
+      stats.records = primary->stats.records;
+      m_stats_cached_rows = primary->stats.records;
+      m_stats_cache_valid = true;
+      THD *thd = current_thd;
+      m_stats_cached_query_id =
+          thd != nullptr ? static_cast<longlong>(thd->query_id) : -1;
+    }
+    return ret;
   }
-  return ret;
+
+  if (ensure_stats_cache()) return 0;
+  if (stats.records == 0) stats.records = 10;
+  return 0;
 }
 
 handler::Table_flags ha_duckdb::table_flags() const {
   return 0;
+}
+
+double ha_duckdb::scan_time() {
+  if (!ensure_stats_cache()) return handler::scan_time();
+  if (m_stats_cached_rows == 0) return 1.0;
+  return std::max(1.0, rows2double(m_stats_cached_rows) / 4096.0) + 1.0;
+}
+
+double ha_duckdb::read_time(uint index, uint ranges, ha_rows rows) {
+  if (table_share == nullptr || index != table_share->primary_key) {
+    return handler::read_time(index, ranges, rows);
+  }
+  if (!ensure_stats_cache()) return handler::read_time(index, ranges, rows);
+
+  const double total_rows = std::max(1.0, rows2double(m_stats_cached_rows));
+  const double selected_rows = std::max(0.0, rows2double(rows));
+  const double selectivity =
+      std::max(0.0, std::min(1.0, selected_rows / total_rows));
+  const double range_term = std::max(1.0, static_cast<double>(ranges)) * 0.1;
+  const double row_term = selected_rows * (0.02 + 0.10 * selectivity);
+  return range_term + row_term + 0.5;
+}
+
+double ha_duckdb::index_only_read_time(uint keynr, double records) {
+  if (table_share == nullptr || keynr != table_share->primary_key) {
+    return handler::index_only_read_time(keynr, records);
+  }
+  if (!ensure_stats_cache()) return handler::index_only_read_time(keynr, records);
+
+  const double total_rows = std::max(1.0, rows2double(m_stats_cached_rows));
+  const double selected_rows = std::max(0.0, records);
+  const double selectivity =
+      std::max(0.0, std::min(1.0, selected_rows / total_rows));
+  return selected_rows * (0.01 + 0.05 * selectivity) + 0.25;
 }
 
 unsigned long ha_duckdb::index_flags(unsigned int idx, unsigned int part,
@@ -2875,14 +3216,40 @@ ha_rows ha_duckdb::records_in_range(unsigned int index, key_range *min_key,
                                     key_range *max_key) {
   if (index != table_share->primary_key) return HA_POS_ERROR;
   handler *primary = ha_get_primary_handler();
-  if (primary != nullptr) return primary->records_in_range(index, min_key, max_key);
-  return stats.records == 0 ? 10 : stats.records;
+  if (primary != nullptr)
+    return primary->records_in_range(index, min_key, max_key);
+
+  if (!ensure_stats_cache()) return stats.records == 0 ? 10 : stats.records;
+  if (m_stats_cached_rows == 0) return 0;
+
+  const KEY *primary_key = duckdb_primary_key_info(table, table_share);
+  if (primary_key != nullptr && min_key != nullptr && max_key != nullptr &&
+      min_key->key != nullptr && max_key->key != nullptr &&
+      min_key->length == primary_key->key_length &&
+      max_key->length == primary_key->key_length &&
+      min_key->flag == HA_READ_KEY_EXACT && max_key->flag == HA_READ_AFTER_KEY &&
+      std::memcmp(min_key->key, max_key->key, primary_key->key_length) == 0) {
+    return 1;
+  }
+
+  if (can_estimate_numeric_pk_range(min_key, max_key)) {
+    return estimate_numeric_pk_range_rows(min_key, max_key);
+  }
+
+  if (min_key != nullptr && max_key != nullptr) {
+    return std::max<ha_rows>(1, m_stats_cached_rows / 8);
+  }
+  if (min_key != nullptr || max_key != nullptr) {
+    return std::max<ha_rows>(1, m_stats_cached_rows / 4);
+  }
+  return m_stats_cached_rows;
 }
 
 int ha_duckdb::external_lock(THD *, int lock_type) {
   DBUG_TRACE;
   if (lock_type == F_UNLCK) {
     reset_native_mrr_state();
+    invalidate_stats_cache();
     m_result.reset();
     m_chunk.reset();
     m_scan_fields.clear();
@@ -2898,6 +3265,7 @@ int ha_duckdb::external_lock(THD *, int lock_type) {
 
 int ha_duckdb::reset() {
   reset_native_mrr_state();
+  invalidate_stats_cache();
   m_pushed_cond_sql.clear();
   m_pushed_idx_cond_sql.clear();
   return 0;
@@ -2921,6 +3289,7 @@ THR_LOCK_DATA **ha_duckdb::store_lock(THD *thd, THR_LOCK_DATA **to,
 }
 
 int ha_duckdb::load_table(const TABLE &table) {
+  invalidate_stats_cache();
   const std::string db_name =
       (table.s->db.str != nullptr && table.s->db.length > 0)
           ? std::string(table.s->db.str, table.s->db.length)
@@ -3103,6 +3472,7 @@ int ha_duckdb::load_table(const TABLE &table) {
 
 int ha_duckdb::unload_table(const char *db_name, const char *table_name,
                             bool error_if_not_loaded) {
+  invalidate_stats_cache();
   if (error_if_not_loaded &&
       loaded_tables->get(db_name, table_name) == nullptr) {
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
