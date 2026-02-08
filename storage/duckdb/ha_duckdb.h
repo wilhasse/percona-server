@@ -25,6 +25,7 @@
 #define PLUGIN_DUCKDB_HA_DUCKDB_H_
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -161,7 +162,8 @@ class ha_duckdb : public handler {
   std::string m_table_path;
   std::string m_schema_name;
   std::string m_table_name;
-  std::unique_ptr<duckdb::DuckDB> m_db;
+  std::shared_ptr<duckdb::DuckDB> m_db;
+  std::shared_ptr<std::timed_mutex> m_writer_mutex;
   std::unique_ptr<duckdb::Connection> m_conn;
   std::unique_ptr<duckdb::QueryResult> m_result;
   std::unique_ptr<duckdb::DataChunk> m_chunk;

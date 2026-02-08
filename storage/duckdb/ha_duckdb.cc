@@ -155,6 +155,56 @@ class LoadedTables {
 
 LoadedTables *loaded_tables{nullptr};
 
+static std::atomic<ulonglong> duckdb_instance_pool_hits{0};
+static std::atomic<ulonglong> duckdb_instance_pool_misses{0};
+static std::atomic<ulonglong> duckdb_writer_lock_acquires{0};
+static std::atomic<ulonglong> duckdb_writer_lock_waits{0};
+static std::atomic<ulonglong> duckdb_writer_lock_wait_ns{0};
+
+class DuckdbInstancePool {
+  struct Entry {
+    std::weak_ptr<duckdb::DuckDB> db;
+    std::shared_ptr<std::timed_mutex> writer_mutex;
+  };
+
+  std::map<std::string, Entry> m_instances;
+  std::mutex m_mutex;
+
+ public:
+  bool acquire(const std::string &path, std::shared_ptr<duckdb::DuckDB> *db,
+               std::shared_ptr<std::timed_mutex> *writer_mutex,
+               std::string *error) {
+    if (db == nullptr || writer_mutex == nullptr) return false;
+
+    std::lock_guard<std::mutex> guard(m_mutex);
+    Entry &entry = m_instances[path];
+    if (!entry.writer_mutex) {
+      entry.writer_mutex = std::make_shared<std::timed_mutex>();
+    }
+
+    std::shared_ptr<duckdb::DuckDB> shared_db = entry.db.lock();
+    if (shared_db) {
+      duckdb_instance_pool_hits.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      try {
+        duckdb::DBConfig config(false);
+        shared_db = std::make_shared<duckdb::DuckDB>(path, &config);
+      } catch (const std::exception &ex) {
+        if (error != nullptr) *error = ex.what();
+        return false;
+      }
+      entry.db = shared_db;
+      duckdb_instance_pool_misses.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    *db = std::move(shared_db);
+    *writer_mutex = entry.writer_mutex;
+    return true;
+  }
+};
+
+DuckdbInstancePool *duckdb_instance_pool{nullptr};
+
 class Duckdb_execution_context : public Secondary_engine_execution_context {
  public:
   std::string db;
@@ -206,6 +256,38 @@ int copy_chunk_row_to_table(TABLE *table, const duckdb::DataChunk &chunk,
 static std::atomic<ulonglong> duckdb_conversion_rows{0};
 static std::atomic<ulonglong> duckdb_conversion_values{0};
 static std::atomic<ulonglong> duckdb_conversion_ns{0};
+
+class DuckdbWriterGuard {
+ public:
+  explicit DuckdbWriterGuard(
+      const std::shared_ptr<std::timed_mutex> &writer_mutex)
+      : m_writer_mutex(writer_mutex) {
+    if (!m_writer_mutex) return;
+    const auto wait_start = std::chrono::steady_clock::now();
+    if (!m_writer_mutex->try_lock()) {
+      duckdb_writer_lock_waits.fetch_add(1, std::memory_order_relaxed);
+      m_writer_mutex->lock();
+      const auto waited_ns = static_cast<ulonglong>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - wait_start)
+              .count());
+      duckdb_writer_lock_wait_ns.fetch_add(waited_ns,
+                                           std::memory_order_relaxed);
+    }
+    duckdb_writer_lock_acquires.fetch_add(1, std::memory_order_relaxed);
+    m_locked = true;
+  }
+
+  ~DuckdbWriterGuard() {
+    if (m_locked && m_writer_mutex) m_writer_mutex->unlock();
+  }
+
+  bool locked() const { return m_locked; }
+
+ private:
+  std::shared_ptr<std::timed_mutex> m_writer_mutex;
+  bool m_locked{false};
+};
 
 bool DuckdbTableExistsInFile(const std::string &path,
                              const std::string &schema,
@@ -1976,9 +2058,28 @@ int ha_duckdb::create(const char *, TABLE *table_arg, HA_CREATE_INFO *,
   }
 
   try {
-    duckdb::DBConfig config(false);
-    duckdb::DuckDB db(path, &config);
-    duckdb::Connection conn(db);
+    if (duckdb_instance_pool == nullptr) {
+      my_error(ER_CANT_CREATE_TABLE, MYF(0), table_arg->s->table_name.str,
+               HA_ERR_GENERIC, "DuckDB instance pool unavailable");
+      return HA_ERR_GENERIC;
+    }
+    std::shared_ptr<duckdb::DuckDB> db;
+    std::shared_ptr<std::timed_mutex> writer_mutex;
+    std::string pool_error;
+    if (!duckdb_instance_pool->acquire(path, &db, &writer_mutex, &pool_error)) {
+      my_error(ER_CANT_CREATE_TABLE, MYF(0), table_arg->s->table_name.str,
+               HA_ERR_GENERIC,
+               pool_error.empty() ? "Failed to acquire DuckDB instance"
+                                  : pool_error.c_str());
+      return HA_ERR_GENERIC;
+    }
+    DuckdbWriterGuard writer_guard(writer_mutex);
+    if (!writer_guard.locked()) {
+      my_error(ER_CANT_CREATE_TABLE, MYF(0), table_arg->s->table_name.str,
+               HA_ERR_GENERIC, "DuckDB writer lock unavailable");
+      return HA_ERR_GENERIC;
+    }
+    duckdb::Connection conn(*db);
     std::string schema_name;
     if (table_arg->s->db.str != nullptr && table_arg->s->db.length > 0) {
       schema_name.assign(table_arg->s->db.str, table_arg->s->db.length);
@@ -2117,8 +2218,19 @@ int ha_duckdb::open(const char *, int, unsigned int, const dd::Table *) {
   }
 
   try {
-    duckdb::DBConfig config(table_share->is_secondary_engine());
-    m_db = std::make_unique<duckdb::DuckDB>(m_table_path, &config);
+    if (duckdb_instance_pool == nullptr) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               "DuckDB instance pool unavailable");
+      return HA_ERR_GENERIC;
+    }
+    std::string pool_error;
+    if (!duckdb_instance_pool->acquire(m_table_path, &m_db, &m_writer_mutex,
+                                       &pool_error)) {
+      const char *msg = pool_error.empty() ? "Failed to acquire DuckDB instance"
+                                           : pool_error.c_str();
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), msg);
+      return HA_ERR_GENERIC;
+    }
     m_conn = std::make_unique<duckdb::Connection>(*m_db);
   } catch (const std::exception &ex) {
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), ex.what());
@@ -2140,6 +2252,7 @@ int ha_duckdb::close() {
   m_pushed_cond_sql.clear();
   m_pushed_idx_cond_sql.clear();
   m_conn.reset();
+  m_writer_mutex.reset();
   m_db.reset();
   return 0;
 }
@@ -2761,6 +2874,12 @@ int ha_duckdb::write_row(uchar *buf) {
   }
   ha_statistic_increment(&System_status_var::ha_write_count);
   if (buf == nullptr || table == nullptr || !m_conn) return HA_ERR_GENERIC;
+  DuckdbWriterGuard writer_guard(m_writer_mutex);
+  if (!writer_guard.locked()) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "DuckDB writer lock unavailable");
+    return HA_ERR_GENERIC;
+  }
 
   try {
     if (m_schema_name.empty()) {
@@ -2829,6 +2948,12 @@ int ha_duckdb::update_row(const uchar *old_data, uchar *new_data) {
       !m_conn) {
     return HA_ERR_GENERIC;
   }
+  DuckdbWriterGuard writer_guard(m_writer_mutex);
+  if (!writer_guard.locked()) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "DuckDB writer lock unavailable");
+    return HA_ERR_GENERIC;
+  }
 
   const std::vector<Field *> set_fields =
       collect_fields(table, table->write_set);
@@ -2871,6 +2996,12 @@ int ha_duckdb::delete_row(const uchar *buf) {
   }
   ha_statistic_increment(&System_status_var::ha_delete_count);
   if (buf == nullptr || table == nullptr || !m_conn) return HA_ERR_GENERIC;
+  DuckdbWriterGuard writer_guard(m_writer_mutex);
+  if (!writer_guard.locked()) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "DuckDB writer lock unavailable");
+    return HA_ERR_GENERIC;
+  }
 
   const std::vector<Field *> where_fields =
       collect_fields(table, table->read_set);
@@ -3315,8 +3446,27 @@ int ha_duckdb::load_table(const TABLE &table) {
   }
 
   try {
-    duckdb::DuckDB db(path);
-    duckdb::Connection con(db);
+    if (duckdb_instance_pool == nullptr) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               "DuckDB instance pool unavailable");
+      return HA_ERR_GENERIC;
+    }
+    std::shared_ptr<duckdb::DuckDB> db;
+    std::shared_ptr<std::timed_mutex> writer_mutex;
+    std::string pool_error;
+    if (!duckdb_instance_pool->acquire(path, &db, &writer_mutex, &pool_error)) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               pool_error.empty() ? "Failed to acquire DuckDB instance"
+                                  : pool_error.c_str());
+      return HA_ERR_GENERIC;
+    }
+    DuckdbWriterGuard writer_guard(writer_mutex);
+    if (!writer_guard.locked()) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               "DuckDB writer lock unavailable");
+      return HA_ERR_GENERIC;
+    }
+    duckdb::Connection con(*db);
     const std::string table_name(table.s->table_name.str,
                                  table.s->table_name.length);
     const std::string temp_table =
@@ -3927,6 +4077,46 @@ static int show_duckdb_execution_mode(MYSQL_THD, SHOW_VAR *var, char *buf) {
   return 0;
 }
 
+static int show_duckdb_instance_pool_hits(MYSQL_THD, SHOW_VAR *var, char *) {
+  static ulonglong value;
+  value = duckdb_instance_pool_hits.load(std::memory_order_relaxed);
+  var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
+static int show_duckdb_instance_pool_misses(MYSQL_THD, SHOW_VAR *var, char *) {
+  static ulonglong value;
+  value = duckdb_instance_pool_misses.load(std::memory_order_relaxed);
+  var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
+static int show_duckdb_writer_lock_acquires(MYSQL_THD, SHOW_VAR *var, char *) {
+  static ulonglong value;
+  value = duckdb_writer_lock_acquires.load(std::memory_order_relaxed);
+  var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
+static int show_duckdb_writer_lock_waits(MYSQL_THD, SHOW_VAR *var, char *) {
+  static ulonglong value;
+  value = duckdb_writer_lock_waits.load(std::memory_order_relaxed);
+  var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
+static int show_duckdb_writer_lock_wait_ns(MYSQL_THD, SHOW_VAR *var, char *) {
+  static ulonglong value;
+  value = duckdb_writer_lock_wait_ns.load(std::memory_order_relaxed);
+  var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
 static int show_duckdb_conversion_rows(MYSQL_THD, SHOW_VAR *var, char *) {
   static ulonglong value;
   value = duckdb_conversion_rows.load(std::memory_order_relaxed);
@@ -4150,6 +4340,16 @@ static SHOW_VAR duckdb_status_variables[] = {
     {"duckdb_execution_mode_state", (char *)show_duckdb_execution_mode,
      SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
+    {"duckdb_instance_pool_hits", (char *)show_duckdb_instance_pool_hits,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_instance_pool_misses", (char *)show_duckdb_instance_pool_misses,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_writer_lock_acquires", (char *)show_duckdb_writer_lock_acquires,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_writer_lock_waits", (char *)show_duckdb_writer_lock_waits,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_writer_lock_wait_ns", (char *)show_duckdb_writer_lock_wait_ns,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"duckdb_conversion_rows", (char *)show_duckdb_conversion_rows, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
     {"duckdb_conversion_values", (char *)show_duckdb_conversion_values,
@@ -4254,6 +4454,7 @@ static int duckdb_init_func(void *p) {
   DBUG_TRACE;
 
   loaded_tables = new LoadedTables();
+  duckdb_instance_pool = new DuckdbInstancePool();
   duckdb_se::SetDuckdbPluginPtr(p);
   duckdb_se::SetBinlogApplyPaused(duckdb_binlog_apply_paused);
   duckdb_se::SetBinlogApplyThrottleRowsPerSec(
@@ -4277,6 +4478,8 @@ static int duckdb_deinit_func(void *) {
 
   duckdb_se::StopBinlogApplyThread();
   duckdb_se::SetDuckdbPluginPtr(nullptr);
+  delete duckdb_instance_pool;
+  duckdb_instance_pool = nullptr;
   delete loaded_tables;
   loaded_tables = nullptr;
   return 0;
