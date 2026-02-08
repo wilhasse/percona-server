@@ -577,18 +577,23 @@ void store_duckdb_value(Field *field, const duckdb::Value &value) {
     case MYSQL_TYPE_LONG:
     case MYSQL_TYPE_LONGLONG:
     case MYSQL_TYPE_YEAR: {
+      // Use DefaultCastAs to handle all DuckDB integer widths (INT32,
+      // INT64, etc.) instead of assuming BIGINT.
       if (unsigned_flag) {
-        const uint64_t v = duckdb::UBigIntValue::Get(value);
+        auto casted = value.DefaultCastAs(duckdb::LogicalType::UBIGINT);
+        const uint64_t v = duckdb::UBigIntValue::Get(casted);
         field->store(static_cast<longlong>(v), true);
       } else {
-        const int64_t v = duckdb::BigIntValue::Get(value);
+        auto casted = value.DefaultCastAs(duckdb::LogicalType::BIGINT);
+        const int64_t v = duckdb::BigIntValue::Get(casted);
         field->store(static_cast<longlong>(v), false);
       }
       return;
     }
     case MYSQL_TYPE_FLOAT:
     case MYSQL_TYPE_DOUBLE: {
-      const double v = duckdb::DoubleValue::Get(value);
+      auto casted = value.DefaultCastAs(duckdb::LogicalType::DOUBLE);
+      const double v = duckdb::DoubleValue::Get(casted);
       field->store(v);
       return;
     }

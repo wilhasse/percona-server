@@ -30,11 +30,7 @@ ORDER BY p.id;
 label	payload
 one	alpha
 three	gamma
-SELECT (SELECT VARIABLE_VALUE
-FROM INFORMATION_SCHEMA.SESSION_STATUS
-WHERE VARIABLE_NAME='Handler_mrr_init') + 0 > 0 AS bka_mrr_used;
-bka_mrr_used
-1
+include/assert.inc [BKA should use Handler_mrr_init]
 SET @@SESSION.optimizer_switch = @save_optimizer_switch;
 UPDATE t_pk SET payload='beta2' WHERE id=2;
 DELETE FROM t_pk WHERE id=1;

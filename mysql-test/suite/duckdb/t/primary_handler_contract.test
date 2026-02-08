@@ -47,9 +47,10 @@ SELECT /*+ BKA(d) */ p.label, d.payload
   STRAIGHT_JOIN t_pk AS d ON d.id = p.id
   ORDER BY p.id;
 
-SELECT (SELECT VARIABLE_VALUE
-          FROM INFORMATION_SCHEMA.SESSION_STATUS
-         WHERE VARIABLE_NAME='Handler_mrr_init') + 0 > 0 AS bka_mrr_used;
+--let $mrr_init = query_get_value(SHOW STATUS LIKE 'Handler_mrr_init', Value, 1)
+--let $assert_cond = $mrr_init > 0
+--let $assert_text = BKA should use Handler_mrr_init
+--source include/assert.inc
 
 SET @@SESSION.optimizer_switch = @save_optimizer_switch;
 
