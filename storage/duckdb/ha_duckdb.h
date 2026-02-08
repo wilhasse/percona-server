@@ -42,6 +42,7 @@ class Table;
 }
 
 namespace duckdb {
+class Appender;
 class Connection;
 class DataChunk;
 class DuckDB;
@@ -100,6 +101,8 @@ class ha_duckdb : public handler {
   void cancel_pushed_idx_cond() override;
 
   int write_row(uchar *buf) override;
+  void start_bulk_insert(ha_rows rows) override;
+  int end_bulk_insert() override;
 
   int update_row(const uchar *old_data, uchar *new_data) override;
 
@@ -157,6 +160,7 @@ class ha_duckdb : public handler {
   bool native_mrr_range_supported(const KEY *primary_key,
                                   const KEY_MULTI_RANGE &range) const;
   int start_next_native_mrr_batch();
+  void append_row_to_appender(duckdb::Appender &appender, const uchar *buf);
 
   struct NativeMrrProbe {
     std::vector<std::string> key_sql_values;
@@ -201,6 +205,9 @@ class ha_duckdb : public handler {
   bool m_stats_cached_pk_integer{false};
   long double m_stats_cached_pk_min{0.0L};
   long double m_stats_cached_pk_max{0.0L};
+  std::unique_ptr<duckdb::Appender> m_bulk_appender;
+  bool m_in_bulk_insert{false};
+  bool m_bulk_lock_held{false};
 };
 
 }  // namespace duckdb_se

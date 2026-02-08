@@ -254,6 +254,7 @@ int copy_chunk_row_to_table(TABLE *table, const duckdb::DataChunk &chunk,
                             const std::vector<Field *> &projected_fields,
                             duckdb::idx_t col_offset);
 
+static std::atomic<ulonglong> duckdb_bulk_insert_rows{0};
 static std::atomic<ulonglong> duckdb_conversion_rows{0};
 static std::atomic<ulonglong> duckdb_conversion_values{0};
 static std::atomic<ulonglong> duckdb_conversion_ns{0};
@@ -2477,6 +2478,7 @@ int ha_duckdb::open(const char *, int, unsigned int, const dd::Table *) {
 }
 
 int ha_duckdb::close() {
+  if (m_in_bulk_insert) end_bulk_insert();
   reset_native_mrr_state();
   invalidate_stats_cache();
   m_result.reset();
@@ -3102,6 +3104,90 @@ void ha_duckdb::cancel_pushed_idx_cond() {
   m_pushed_idx_cond_sql.clear();
 }
 
+void ha_duckdb::append_row_to_appender(duckdb::Appender &appender,
+                                       const uchar *buf) {
+  FieldOffsetGuard guard(table, buf);
+  const uint field_count = table->s->fields;
+  appender.BeginRow();
+  for (uint i = 0; i < field_count; ++i) {
+    Field *field = table->field[i];
+    if (field->is_null()) {
+      appender.Append(duckdb::Value());
+      continue;
+    }
+    String tmp;
+    field->val_str(&tmp);
+    if (is_binary_field(field)) {
+      appender.Append(
+          duckdb::Value::BLOB_RAW(std::string(tmp.ptr(), tmp.length())));
+    } else {
+      appender.Append(tmp.ptr(), static_cast<uint32_t>(tmp.length()));
+    }
+  }
+  appender.EndRow();
+}
+
+void ha_duckdb::start_bulk_insert(ha_rows) {
+  if (table_share->is_secondary_engine()) return;
+  if (!m_conn || !m_writer_mutex) return;
+
+  try {
+    const auto wait_start = std::chrono::steady_clock::now();
+    if (!m_writer_mutex->try_lock()) {
+      duckdb_writer_lock_waits.fetch_add(1, std::memory_order_relaxed);
+      m_writer_mutex->lock();
+      const auto waited_ns = static_cast<ulonglong>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - wait_start)
+              .count());
+      duckdb_writer_lock_wait_ns.fetch_add(waited_ns,
+                                           std::memory_order_relaxed);
+    }
+    duckdb_writer_lock_acquires.fetch_add(1, std::memory_order_relaxed);
+    m_bulk_lock_held = true;
+
+    if (m_schema_name.empty()) {
+      m_bulk_appender = std::make_unique<duckdb::Appender>(*m_conn,
+                                                           m_table_name);
+    } else {
+      m_bulk_appender = std::make_unique<duckdb::Appender>(*m_conn, "main",
+                                                           m_table_name);
+    }
+    m_in_bulk_insert = true;
+  } catch (const std::exception &) {
+    m_bulk_appender.reset();
+    if (m_bulk_lock_held) {
+      m_writer_mutex->unlock();
+      m_bulk_lock_held = false;
+    }
+    m_in_bulk_insert = false;
+    // Fall back to per-row mode silently.
+  }
+}
+
+int ha_duckdb::end_bulk_insert() {
+  if (!m_in_bulk_insert) return 0;
+
+  int ret = 0;
+  try {
+    if (m_bulk_appender) {
+      m_bulk_appender->Close();
+    }
+  } catch (const std::exception &ex) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), ex.what());
+    ret = HA_ERR_GENERIC;
+  }
+
+  m_bulk_appender.reset();
+  if (m_bulk_lock_held && m_writer_mutex) {
+    m_writer_mutex->unlock();
+    m_bulk_lock_held = false;
+  }
+  m_in_bulk_insert = false;
+  invalidate_stats_cache();
+  return ret;
+}
+
 int ha_duckdb::write_row(uchar *buf) {
   if (table_share->is_secondary_engine()) {
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
@@ -3110,6 +3196,21 @@ int ha_duckdb::write_row(uchar *buf) {
   }
   ha_statistic_increment(&System_status_var::ha_write_count);
   if (buf == nullptr || table == nullptr || !m_conn) return HA_ERR_GENERIC;
+
+  // Bulk insert fast-path: lock and Appender already held.
+  if (m_in_bulk_insert && m_bulk_appender) {
+    try {
+      append_row_to_appender(*m_bulk_appender, buf);
+    } catch (const std::exception &ex) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), ex.what());
+      return HA_ERR_GENERIC;
+    }
+    duckdb_bulk_insert_rows.fetch_add(1, std::memory_order_relaxed);
+    stats.records++;
+    return 0;
+  }
+
+  // Per-row path (single-row INSERT, or bulk setup failed).
   DuckdbWriterGuard writer_guard(m_writer_mutex);
   if (!writer_guard.locked()) {
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
@@ -3120,47 +3221,11 @@ int ha_duckdb::write_row(uchar *buf) {
   try {
     if (m_schema_name.empty()) {
       duckdb::Appender appender(*m_conn, m_table_name);
-      FieldOffsetGuard guard(table, buf);
-      const uint field_count = table->s->fields;
-      appender.BeginRow();
-      for (uint i = 0; i < field_count; ++i) {
-        Field *field = table->field[i];
-        if (field->is_null()) {
-          appender.Append(duckdb::Value());
-          continue;
-        }
-        String tmp;
-        field->val_str(&tmp);
-        if (is_binary_field(field)) {
-          appender.Append(duckdb::Value::BLOB_RAW(
-              std::string(tmp.ptr(), tmp.length())));
-        } else {
-          appender.Append(tmp.ptr(), static_cast<uint32_t>(tmp.length()));
-        }
-      }
-      appender.EndRow();
+      append_row_to_appender(appender, buf);
       appender.Close();
     } else {
       duckdb::Appender appender(*m_conn, "main", m_table_name);
-      FieldOffsetGuard guard(table, buf);
-      const uint field_count = table->s->fields;
-      appender.BeginRow();
-      for (uint i = 0; i < field_count; ++i) {
-        Field *field = table->field[i];
-        if (field->is_null()) {
-          appender.Append(duckdb::Value());
-          continue;
-        }
-        String tmp;
-        field->val_str(&tmp);
-        if (is_binary_field(field)) {
-          appender.Append(duckdb::Value::BLOB_RAW(
-              std::string(tmp.ptr(), tmp.length())));
-        } else {
-          appender.Append(tmp.ptr(), static_cast<uint32_t>(tmp.length()));
-        }
-      }
-      appender.EndRow();
+      append_row_to_appender(appender, buf);
       appender.Close();
     }
   } catch (const std::exception &ex) {
@@ -3631,6 +3696,7 @@ int ha_duckdb::external_lock(THD *, int lock_type) {
 }
 
 int ha_duckdb::reset() {
+  if (m_in_bulk_insert) end_bulk_insert();
   reset_native_mrr_state();
   invalidate_stats_cache();
   m_pushed_cond_sql.clear();
@@ -4353,6 +4419,14 @@ static int show_duckdb_writer_lock_wait_ns(MYSQL_THD, SHOW_VAR *var, char *) {
   return 0;
 }
 
+static int show_duckdb_bulk_insert_rows(MYSQL_THD, SHOW_VAR *var, char *) {
+  static ulonglong value;
+  value = duckdb_bulk_insert_rows.load(std::memory_order_relaxed);
+  var->type = SHOW_LONGLONG;
+  var->value = reinterpret_cast<char *>(&value);
+  return 0;
+}
+
 static int show_duckdb_conversion_rows(MYSQL_THD, SHOW_VAR *var, char *) {
   static ulonglong value;
   value = duckdb_conversion_rows.load(std::memory_order_relaxed);
@@ -4585,6 +4659,8 @@ static SHOW_VAR duckdb_status_variables[] = {
     {"duckdb_writer_lock_waits", (char *)show_duckdb_writer_lock_waits,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"duckdb_writer_lock_wait_ns", (char *)show_duckdb_writer_lock_wait_ns,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"duckdb_bulk_insert_rows", (char *)show_duckdb_bulk_insert_rows,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"duckdb_conversion_rows", (char *)show_duckdb_conversion_rows, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},

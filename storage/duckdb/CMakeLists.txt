@@ -57,11 +57,17 @@ if(NOT WITHOUT_DUCKDB_SE_STORAGE_ENGINE)
       set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${DUCKDB_TLS_MODEL_FLAG}")
       set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${DUCKDB_TLS_MODEL_FLAG}")
     endif()
-    # Strip -Werror from flags before entering the DuckDB subdirectory.
-    # DuckDB's third-party code triggers warnings that Percona's global -Werror
-    # would turn into build failures (-Wundef, -Wextra-semi, etc.).
+    # Strip -Werror and -Werror=... from flags before entering the DuckDB
+    # subdirectory. DuckDB's third-party code triggers warnings that Percona's
+    # global -Werror would turn into build failures (-Wundef, -Wextra-semi, etc.).
+    # We must use regex to strip -Werror=<flag> variants (e.g.
+    # -Werror=format-security) before the plain -Werror, otherwise a simple
+    # string(REPLACE) turns "-Werror=format-security" into "=format-security"
+    # which gcc interprets as a filename.
     set(_saved_C_FLAGS "${CMAKE_C_FLAGS}")
     set(_saved_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+    string(REGEX REPLACE "-Werror=[^ ]+" "" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
+    string(REGEX REPLACE "-Werror=[^ ]+" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
     string(REPLACE "-Werror" "" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
     string(REPLACE "-Werror" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
     add_subdirectory(${DUCKDB_SOURCE_DIR} ${CMAKE_BINARY_DIR}/duckdb EXCLUDE_FROM_ALL)
