@@ -18,3 +18,7 @@ SELECT d.label, COUNT(*) AS c
 FROM fact f JOIN dim_unloaded d ON f.dim_id = d.id
 GROUP BY d.label
 ORDER BY d.label;
+label	c
+A	2
+B	1
+C	2

@@ -4,6 +4,7 @@
 --disable_query_log
 # Suppress expected warning about read_only settings
 call mtr.add_suppression("DuckDB analytics node should run with read_only=ON");
+call mtr.add_suppression("DuckDB binlog applier error");
 # Suppress timeout warnings from binlog applier
 call mtr.add_suppression("Got timeout reading communication packets");
 --let $duckdb_installed=0

@@ -57,7 +57,16 @@ if(NOT WITHOUT_DUCKDB_SE_STORAGE_ENGINE)
       set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${DUCKDB_TLS_MODEL_FLAG}")
       set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${DUCKDB_TLS_MODEL_FLAG}")
     endif()
+    # Strip -Werror from flags before entering the DuckDB subdirectory.
+    # DuckDB's third-party code triggers warnings that Percona's global -Werror
+    # would turn into build failures (-Wundef, -Wextra-semi, etc.).
+    set(_saved_C_FLAGS "${CMAKE_C_FLAGS}")
+    set(_saved_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+    string(REPLACE "-Werror" "" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
+    string(REPLACE "-Werror" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
     add_subdirectory(${DUCKDB_SOURCE_DIR} ${CMAKE_BINARY_DIR}/duckdb EXCLUDE_FROM_ALL)
+    set(CMAKE_C_FLAGS "${_saved_C_FLAGS}")
+    set(CMAKE_CXX_FLAGS "${_saved_CXX_FLAGS}")
   else()
     message(FATAL_ERROR "DuckDB submodule not found at ${DUCKDB_SOURCE_DIR}")
   endif()
@@ -79,8 +88,11 @@ if(NOT WITHOUT_DUCKDB_SE_STORAGE_ENGINE)
   endif()
 
   if(TARGET duckdb_se)
-    target_include_directories(duckdb_se PRIVATE
+    # Use SYSTEM include to suppress warnings from DuckDB headers that would
+    # otherwise be promoted to errors by Percona's global -Werror.
+    target_include_directories(duckdb_se SYSTEM PRIVATE
       ${DUCKDB_SOURCE_DIR}/src/include
+      ${DUCKDB_SOURCE_DIR}/third_party/fmt/include
       )
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
       # Enforce TLS model on the plugin target, even if the subdir was cached.

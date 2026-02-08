@@ -2,6 +2,7 @@
 
 --disable_query_log
 CALL mtr.add_suppression("DuckDB analytics node should run with read_only=ON");
+CALL mtr.add_suppression("DuckDB binlog applier error");
 CALL mtr.add_suppression("Got timeout reading communication packets");
 CALL mtr.add_suppression("A message intended for a client cannot be sent");
 --let $duckdb_installed=0

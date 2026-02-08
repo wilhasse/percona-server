@@ -407,10 +407,6 @@ DuckDBTypeMapping duckdb_type_mapping_for_field(const Field *field) {
   return mapping;
 }
 
-std::string duckdb_type_for_field(const Field *field) {
-  return duckdb_type_mapping_for_field(field).type;
-}
-
 void EmitTypeMappingWarning(THD *thd, const char *table, const char *column,
                             const DuckDBTypeMapping &mapping) {
   if (thd == nullptr) return;
@@ -502,57 +498,6 @@ duckdb::Value field_value(Field *field) {
   String tmp;
   field->val_str(&tmp);
   return duckdb::Value(std::string(tmp.ptr(), tmp.length()));
-}
-
-void store_duckdb_value(Field *field, const duckdb::Value &value) {
-  if (value.IsNull()) {
-    field->set_null();
-    return;
-  }
-  field->set_notnull();
-
-  if (is_binary_field(field)) {
-    const auto &str = duckdb::StringValue::Get(value);
-    field->store(str.data(), str.size(), field->charset());
-    return;
-  }
-
-  const bool unsigned_flag = field->is_unsigned();
-  switch (field->type()) {
-    case MYSQL_TYPE_TINY:
-    case MYSQL_TYPE_SHORT:
-    case MYSQL_TYPE_INT24:
-    case MYSQL_TYPE_LONG:
-    case MYSQL_TYPE_LONGLONG:
-    case MYSQL_TYPE_YEAR: {
-      if (unsigned_flag) {
-        const uint64_t v = duckdb::UBigIntValue::Get(value);
-        field->store(static_cast<longlong>(v), true);
-      } else {
-        const int64_t v = duckdb::BigIntValue::Get(value);
-        field->store(static_cast<longlong>(v), false);
-      }
-      return;
-    }
-    case MYSQL_TYPE_FLOAT:
-    case MYSQL_TYPE_DOUBLE: {
-      const double v = duckdb::DoubleValue::Get(value);
-      field->store(v);
-      return;
-    }
-    default:
-      break;
-  }
-
-  std::string text;
-  const auto type_id = value.type().id();
-  if (type_id == duckdb::LogicalTypeId::VARCHAR ||
-      type_id == duckdb::LogicalTypeId::BLOB) {
-    text = duckdb::StringValue::Get(value);
-  } else {
-    text = value.ToString();
-  }
-  field->store(text.data(), text.size(), field->charset());
 }
 
 std::string value_to_sql(const duckdb::Value &val) {
@@ -739,6 +684,8 @@ int copy_chunk_row_to_table(TABLE *table, const duckdb::DataChunk &chunk,
     return HA_ERR_GENERIC;
   }
 
+  // Temporarily allow writes to all columns so that Field::store() doesn't
+  // trip the DBUG assertion checking write_set bits for projected columns.
   my_bitmap_map *old_map = dbug_tmp_use_all_columns(table, table->write_set);
 
   for (duckdb::idx_t col_idx = 0; col_idx < chunk.ColumnCount(); ++col_idx) {
@@ -759,7 +706,6 @@ int copy_chunk_row_to_table(TABLE *table, const duckdb::DataChunk &chunk,
       field->store(str.data(), str.size(), field->charset());
     }
   }
-
   dbug_tmp_restore_column_map(table->write_set, old_map);
   return 0;
 }

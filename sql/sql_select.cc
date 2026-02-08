@@ -747,10 +747,17 @@ bool Sql_cmd_dml::execute(THD *thd) {
     // external table
     external_engine_fail_reason(lex);
 
-    // reset error message
-    set_external_engine_fail_reason(lex, nullptr);
-    external_table_not_offloaded = true;
-    goto err;  // NOLINT
+    // Only block execution if an external-engine handler actually raised an
+    // error.  DuckDB secondary tables set has_external_tables() but their
+    // primary handler (InnoDB) lacks HTON_SUPPORTS_EXTERNAL_SOURCE, so
+    // external_engine_fail_reason() is a no-op for them.  In that case let
+    // the query proceed on the primary engine instead of failing.
+    if (thd->is_error()) {
+      // reset error message
+      set_external_engine_fail_reason(lex, nullptr);
+      external_table_not_offloaded = true;
+      goto err;  // NOLINT
+    }
   }
 
   if (validate_use_secondary_engine(lex)) goto err;

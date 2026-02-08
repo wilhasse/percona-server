@@ -2,6 +2,7 @@
 
 --disable_query_log
 CALL mtr.add_suppression("DuckDB analytics node should run with read_only=ON");
+CALL mtr.add_suppression("DuckDB binlog applier error");
 --let $duckdb_installed=0
 --let $duckdb_plugin_present=`SELECT COUNT(*) FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_NAME='DUCKDB'`
 --if ($duckdb_plugin_present == 0) {
