@@ -1,0 +1,56 @@
+--source include/have_duckdb_plugin.inc
+
+--disable_query_log
+CALL mtr.add_suppression("DuckDB analytics node should run with read_only=ON");
+CALL mtr.add_suppression("Got timeout reading communication packets");
+CALL mtr.add_suppression("A message intended for a client cannot be sent");
+--let $duckdb_installed=0
+--let $duckdb_plugin_present=`SELECT COUNT(*) FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_NAME='DUCKDB'`
+--if ($duckdb_plugin_present == 0) {
+  --eval INSTALL PLUGIN duckdb SONAME '$DUCKDB_PLUGIN';
+  --let $duckdb_installed=1
+}
+
+SET @save_duckdb_execution_mode = @@GLOBAL.duckdb_execution_mode;
+SET @@GLOBAL.duckdb_execution_mode = 'PRIMARY';
+--enable_query_log
+
+CREATE DATABASE duckdb_primary_contract;
+USE duckdb_primary_contract;
+
+CREATE TABLE t_pk (
+  id INT PRIMARY KEY,
+  grp_id INT NOT NULL,
+  payload VARCHAR(2000)
+) ENGINE=DUCKDB;
+
+INSERT INTO t_pk VALUES (1,10,'alpha'),(2,10,'beta'),(3,20,'gamma');
+
+SELECT id FROM t_pk ORDER BY payload;
+
+SELECT t.id, t.payload FROM t_pk AS t WHERE t.id IN (1,3) ORDER BY t.id;
+
+CREATE TABLE t_probe (
+  id INT PRIMARY KEY,
+  label VARCHAR(20)
+) ENGINE=InnoDB;
+
+INSERT INTO t_probe VALUES (1,'one'),(3,'three');
+
+SELECT p.label, d.payload
+  FROM t_probe AS p
+  STRAIGHT_JOIN t_pk AS d ON d.id = p.id
+  ORDER BY p.id;
+
+UPDATE t_pk SET payload='beta2' WHERE id=2;
+DELETE FROM t_pk WHERE id=1;
+SELECT id, payload FROM t_pk ORDER BY id;
+
+DROP DATABASE duckdb_primary_contract;
+
+--disable_query_log
+SET @@GLOBAL.duckdb_execution_mode = @save_duckdb_execution_mode;
+--if ($duckdb_installed == 1) {
+  UNINSTALL PLUGIN duckdb;
+}
+--enable_query_log

@@ -74,7 +74,9 @@ class ha_duckdb : public handler {
 
   int rnd_pos(uchar *buf, uchar *pos) override;
 
-  void position(const uchar *record) override {}
+  void position(const uchar *record) override;
+
+  int external_lock(THD *thd, int lock_type) override;
 
   int info(unsigned int) override;
 
@@ -87,6 +89,15 @@ class ha_duckdb : public handler {
                              thr_lock_type lock_type) override;
 
   Table_flags table_flags() const override;
+
+  uint max_supported_keys() const override { return MAX_KEY; }
+
+  uint max_supported_key_length() const override { return MAX_KEY_LENGTH; }
+
+  uint max_supported_key_part_length(HA_CREATE_INFO *create_info
+                                     [[maybe_unused]]) const override {
+    return MAX_KEY_LENGTH;
+  }
 
   const char *table_type() const override { return "DUCKDB"; }
 

@@ -23,6 +23,7 @@
 
 #include "storage/duckdb/ha_duckdb.h"
 
+#include <fcntl.h>
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -53,6 +54,7 @@
 #include "mysql/plugin.h"
 #include "sql/my_decimal.h"
 #include "sql/mysqld.h"
+#include "sql/key.h"
 #include "sql/psi_memory_key.h"
 #include "sql/query_result.h"
 #include "sql/sql_class.h"
@@ -600,6 +602,61 @@ std::vector<duckdb::Value> collect_values(TABLE *table, const uchar *record,
     values.push_back(field_value(field));
   }
   return values;
+}
+
+const KEY *duckdb_primary_key_info(const TABLE *table,
+                                   const TABLE_SHARE *table_share) {
+  if (table == nullptr || table_share == nullptr) return nullptr;
+  if (table_share->primary_key == MAX_KEY) return nullptr;
+  if (table->key_info == nullptr) return nullptr;
+  return table->key_info + table_share->primary_key;
+}
+
+std::vector<Field *> collect_primary_key_fields(TABLE *table,
+                                                const TABLE_SHARE *table_share) {
+  std::vector<Field *> fields;
+  const KEY *primary_key = duckdb_primary_key_info(table, table_share);
+  if (primary_key == nullptr) return fields;
+  fields.reserve(primary_key->user_defined_key_parts);
+  for (uint i = 0; i < primary_key->user_defined_key_parts; ++i) {
+    Field *field = primary_key->key_part[i].field;
+    if (field == nullptr) continue;
+    if (std::find(fields.begin(), fields.end(), field) != fields.end()) continue;
+    fields.push_back(field);
+  }
+  return fields;
+}
+
+int copy_chunk_row_to_table(TABLE *table, const duckdb::DataChunk &chunk,
+                            duckdb::idx_t row_idx) {
+  if (table == nullptr || table->s == nullptr) return HA_ERR_GENERIC;
+  const uint field_count = table->s->fields;
+  if (chunk.ColumnCount() != field_count) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), "DuckDB column count mismatch");
+    return HA_ERR_GENERIC;
+  }
+
+  for (uint i = 0; i < field_count; ++i) {
+    Field *field = table->field[i];
+    if (table->read_set && !bitmap_is_set(table->read_set, field->field_index())) {
+      continue;
+    }
+    const duckdb::Value value = chunk.GetValue(i, row_idx);
+    if (value.IsNull()) {
+      field->set_null();
+      continue;
+    }
+    field->set_notnull();
+    const auto physical = value.type().InternalType();
+    if (physical == duckdb::PhysicalType::VARCHAR) {
+      const std::string &str = duckdb::StringValue::Get(value);
+      field->store(str.data(), str.size(), field->charset());
+    } else {
+      const std::string str = value.ToString();
+      field->store(str.data(), str.size(), field->charset());
+    }
+  }
+  return 0;
 }
 
 std::string build_set_clause(const std::vector<Field *> &fields,
@@ -1391,6 +1448,20 @@ int ha_duckdb::create(const char *, TABLE *table_arg, HA_CREATE_INFO *,
       if (!field->is_nullable()) create_sql += " NOT NULL";
       if (i + 1 < table_arg->s->fields) create_sql += ", ";
     }
+    if (table_arg->s->primary_key != MAX_KEY && table_arg->key_info != nullptr) {
+      const KEY *primary_key = table_arg->key_info + table_arg->s->primary_key;
+      if (primary_key->user_defined_key_parts > 0) {
+        create_sql += ", PRIMARY KEY (";
+        for (uint i = 0; i < primary_key->user_defined_key_parts; ++i) {
+          const Field *key_field = primary_key->key_part[i].field;
+          if (key_field == nullptr) continue;
+          create_sql +=
+              quote_ident(key_field->field_name, std::strlen(key_field->field_name));
+          if (i + 1 < primary_key->user_defined_key_parts) create_sql += ", ";
+        }
+        create_sql += ")";
+      }
+    }
     create_sql += ")";
 
     auto result = conn.Query(create_sql);
@@ -1486,6 +1557,11 @@ int ha_duckdb::open(const char *, int, unsigned int, const dd::Table *) {
   }
   m_table_name = std::string(table_share->table_name.str,
                              table_share->table_name.length);
+  ref_length = 0;
+  if (const KEY *primary_key = duckdb_primary_key_info(table, table_share);
+      primary_key != nullptr) {
+    ref_length = primary_key->key_length;
+  }
 
   try {
     duckdb::DBConfig config(table_share->is_secondary_engine());
@@ -1518,7 +1594,7 @@ int ha_duckdb::rnd_init(bool) {
   try {
     const std::string query =
         "SELECT * FROM " + qualified_table_name(m_schema_name, m_table_name);
-    m_result = m_conn->SendQuery(query);
+    m_result = m_conn->Query(query);
     if (!m_result || m_result->HasError()) {
       const std::string err = m_result ? m_result->GetError() :
                                         "DuckDB query failed";
@@ -1553,33 +1629,8 @@ int ha_duckdb::rnd_next(uchar *) {
         if (!m_chunk || m_chunk->size() == 0) return HA_ERR_END_OF_FILE;
       }
 
-      const uint field_count = table->s->fields;
-      if (m_chunk->ColumnCount() != field_count) {
-        my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-                 "DuckDB column count mismatch");
+      if (copy_chunk_row_to_table(table, *m_chunk, m_chunk_row) != 0) {
         return HA_ERR_GENERIC;
-      }
-
-      for (uint i = 0; i < field_count; ++i) {
-        Field *field = table->field[i];
-        if (table->read_set &&
-            !bitmap_is_set(table->read_set, field->field_index())) {
-          continue;
-        }
-        const duckdb::Value value = m_chunk->GetValue(i, m_chunk_row);
-        if (value.IsNull()) {
-          field->set_null();
-          continue;
-        }
-        field->set_notnull();
-        const auto physical = value.type().InternalType();
-        if (physical == duckdb::PhysicalType::VARCHAR) {
-          const std::string &str = duckdb::StringValue::Get(value);
-          field->store(str.data(), str.size(), field->charset());
-        } else {
-          const std::string str = value.ToString();
-          field->store(str.data(), str.size(), field->charset());
-        }
       }
 
       m_chunk_row++;
@@ -1592,11 +1643,9 @@ int ha_duckdb::rnd_next(uchar *) {
 }
 
 int ha_duckdb::write_row(uchar *buf) {
-  if (table_share->is_secondary_engine()) return HA_ERR_WRONG_COMMAND;
-  THD *thd = ha_thd();
-  if (thd == nullptr || !thd_slave_thread(thd)) {
+  if (table_share->is_secondary_engine()) {
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-             "DuckDB DML is restricted to replication applier threads");
+             "DuckDB secondary tables are read-only");
     return HA_ERR_WRONG_COMMAND;
   }
   ha_statistic_increment(&System_status_var::ha_write_count);
@@ -1658,11 +1707,9 @@ int ha_duckdb::write_row(uchar *buf) {
 }
 
 int ha_duckdb::update_row(const uchar *old_data, uchar *new_data) {
-  if (table_share->is_secondary_engine()) return HA_ERR_WRONG_COMMAND;
-  THD *thd = ha_thd();
-  if (thd == nullptr || !thd_slave_thread(thd)) {
+  if (table_share->is_secondary_engine()) {
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-             "DuckDB DML is restricted to replication applier threads");
+             "DuckDB secondary tables are read-only");
     return HA_ERR_WRONG_COMMAND;
   }
   ha_statistic_increment(&System_status_var::ha_update_count);
@@ -1704,11 +1751,9 @@ int ha_duckdb::update_row(const uchar *old_data, uchar *new_data) {
 }
 
 int ha_duckdb::delete_row(const uchar *buf) {
-  if (table_share->is_secondary_engine()) return HA_ERR_WRONG_COMMAND;
-  THD *thd = ha_thd();
-  if (thd == nullptr || !thd_slave_thread(thd)) {
+  if (table_share->is_secondary_engine()) {
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
-             "DuckDB DML is restricted to replication applier threads");
+             "DuckDB secondary tables are read-only");
     return HA_ERR_WRONG_COMMAND;
   }
   ha_statistic_increment(&System_status_var::ha_delete_count);
@@ -1741,9 +1786,58 @@ int ha_duckdb::delete_row(const uchar *buf) {
   return 0;
 }
 
-int ha_duckdb::rnd_pos(uchar *, uchar *) {
+void ha_duckdb::position(const uchar *record) {
   DBUG_TRACE;
-  return HA_ERR_WRONG_COMMAND;
+  if (record == nullptr || ref_length == 0) return;
+  const KEY *primary_key = duckdb_primary_key_info(table, table_share);
+  if (primary_key == nullptr || primary_key->key_length != ref_length) return;
+  key_copy(ref, record, primary_key, primary_key->key_length);
+}
+
+int ha_duckdb::rnd_pos(uchar *buf, uchar *pos) {
+  DBUG_TRACE;
+  ha_statistic_increment(&System_status_var::ha_read_rnd_count);
+
+  if (buf == nullptr || pos == nullptr || table == nullptr || !m_conn) {
+    return HA_ERR_KEY_NOT_FOUND;
+  }
+
+  const KEY *primary_key = duckdb_primary_key_info(table, table_share);
+  if (primary_key == nullptr || ref_length == 0) return HA_ERR_KEY_NOT_FOUND;
+
+  std::vector<Field *> where_fields =
+      collect_primary_key_fields(table, table_share);
+  if (where_fields.empty()) return HA_ERR_KEY_NOT_FOUND;
+
+  key_restore(table->record[0], pos, primary_key, ref_length);
+  std::vector<duckdb::Value> where_values =
+      collect_values(table, table->record[0], where_fields);
+
+  std::string sql = "SELECT * FROM ";
+  sql += qualified_table_name(m_schema_name, m_table_name);
+  sql += " WHERE ";
+  sql += build_where_clause(where_fields, where_values);
+  sql += " LIMIT 1";
+
+  try {
+    auto result = m_conn->Query(sql);
+    if (!result || result->HasError()) {
+      const std::string err =
+          result ? result->GetError() : "DuckDB query failed";
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), err.c_str());
+      return HA_ERR_GENERIC;
+    }
+
+    auto chunk = result->Fetch();
+    if (!chunk || chunk->size() == 0) return HA_ERR_RECORD_DELETED;
+
+    FieldOffsetGuard guard(table, buf);
+    if (copy_chunk_row_to_table(table, *chunk, 0) != 0) return HA_ERR_GENERIC;
+    return 0;
+  } catch (const std::exception &ex) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), ex.what());
+    return HA_ERR_GENERIC;
+  }
 }
 
 int ha_duckdb::info(unsigned int flags) {
@@ -1773,9 +1867,29 @@ ha_rows ha_duckdb::records_in_range(unsigned int index, key_range *min_key,
   return ha_get_primary_handler()->records_in_range(index, min_key, max_key);
 }
 
-THR_LOCK_DATA **ha_duckdb::store_lock(THD *, THR_LOCK_DATA **to,
+int ha_duckdb::external_lock(THD *, int lock_type) {
+  DBUG_TRACE;
+  if (lock_type == F_UNLCK) {
+    m_result.reset();
+    m_chunk.reset();
+    m_chunk_row = 0;
+  }
+  return 0;
+}
+
+THR_LOCK_DATA **ha_duckdb::store_lock(THD *thd, THR_LOCK_DATA **to,
                                       thr_lock_type lock_type) {
-  if (lock_type != TL_IGNORE && m_lock.type == TL_UNLOCK) m_lock.type = lock_type;
+  if (lock_type != TL_IGNORE && m_lock.type == TL_UNLOCK) {
+    const bool in_lock_tables = thd != nullptr && thd_in_lock_tables(thd);
+    if ((lock_type >= TL_WRITE_CONCURRENT_INSERT && lock_type <= TL_WRITE) &&
+        !in_lock_tables) {
+      lock_type = TL_WRITE_ALLOW_WRITE;
+    }
+    if (lock_type == TL_READ_NO_INSERT && !in_lock_tables) {
+      lock_type = TL_READ;
+    }
+    m_lock.type = lock_type;
+  }
   *to++ = &m_lock;
   return to;
 }

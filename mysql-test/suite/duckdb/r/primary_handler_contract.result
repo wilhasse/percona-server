@@ -1,0 +1,36 @@
+CREATE DATABASE duckdb_primary_contract;
+USE duckdb_primary_contract;
+CREATE TABLE t_pk (
+id INT PRIMARY KEY,
+grp_id INT NOT NULL,
+payload VARCHAR(2000)
+) ENGINE=DUCKDB;
+INSERT INTO t_pk VALUES (1,10,'alpha'),(2,10,'beta'),(3,20,'gamma');
+SELECT id FROM t_pk ORDER BY payload;
+id
+1
+2
+3
+SELECT t.id, t.payload FROM t_pk AS t WHERE t.id IN (1,3) ORDER BY t.id;
+id	payload
+1	alpha
+3	gamma
+CREATE TABLE t_probe (
+id INT PRIMARY KEY,
+label VARCHAR(20)
+) ENGINE=InnoDB;
+INSERT INTO t_probe VALUES (1,'one'),(3,'three');
+SELECT p.label, d.payload
+FROM t_probe AS p
+STRAIGHT_JOIN t_pk AS d ON d.id = p.id
+ORDER BY p.id;
+label	payload
+one	alpha
+three	gamma
+UPDATE t_pk SET payload='beta2' WHERE id=2;
+DELETE FROM t_pk WHERE id=1;
+SELECT id, payload FROM t_pk ORDER BY id;
+id	payload
+2	beta2
+3	gamma
+DROP DATABASE duckdb_primary_contract;
