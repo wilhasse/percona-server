@@ -55,6 +55,7 @@
 #include "sql/item.h"
 #include "sql/item_cmpfunc.h"
 #include "mysql/plugin.h"
+#include "sql/dd/types/table.h"
 #include "sql/my_decimal.h"
 #include "sql/mysqld.h"
 #include "sql/key.h"
@@ -1312,17 +1313,38 @@ bool build_pushdown_predicate(const Item *cond, TABLE *table, std::string *out) 
   }
 }
 
-std::string default_duckdb_path(const TABLE_SHARE *share) {
+bool parse_table_path(const char *path, std::string *schema_name,
+                      std::string *table_name) {
+  if (path == nullptr || schema_name == nullptr || table_name == nullptr) {
+    return false;
+  }
+  const std::string path_str(path);
+  const size_t table_sep = path_str.find_last_of(FN_LIBCHAR);
+  if (table_sep == std::string::npos || table_sep + 1 >= path_str.size()) {
+    return false;
+  }
+  const size_t schema_sep = path_str.find_last_of(FN_LIBCHAR, table_sep - 1);
+  if (schema_sep == std::string::npos || schema_sep + 1 >= table_sep) {
+    return false;
+  }
+  *schema_name = path_str.substr(schema_sep + 1, table_sep - schema_sep - 1);
+  *table_name = path_str.substr(table_sep + 1);
+  return !schema_name->empty() && !table_name->empty();
+}
+
+std::string default_duckdb_path_for_schema(const std::string &schema_name) {
   const char *base_dir =
       (duckdb_db_dir != nullptr && duckdb_db_dir[0] != '\0')
           ? duckdb_db_dir
           : mysql_real_data_home;
   std::string dir = base_dir ? base_dir : "";
   if (!dir.empty() && dir.back() != FN_LIBCHAR) dir.push_back(FN_LIBCHAR);
-  std::string file;
-  file.append(share->db.str, share->db.length);
-  file.append(".duckdb");
-  return dir + file;
+  return dir + schema_name + ".duckdb";
+}
+
+std::string default_duckdb_path(const TABLE_SHARE *share) {
+  return default_duckdb_path_for_schema(
+      std::string(share->db.str, share->db.length));
 }
 
 std::string resolve_duckdb_path(const TABLE_SHARE *share) {
@@ -1340,6 +1362,25 @@ std::string resolve_duckdb_path(const TABLE_SHARE *share) {
     return attr + file;
   }
   return default_duckdb_path(share);
+}
+
+std::string resolve_duckdb_path(const std::string &schema_name,
+                                const dd::Table *table_def) {
+  if (table_def != nullptr) {
+    const LEX_CSTRING attr = table_def->secondary_engine_attribute();
+    if (attr.length > 0) {
+      std::string attribute(attr.str, attr.length);
+      if (attribute.size() >= 7 &&
+          attribute.compare(attribute.size() - 7, 7, ".duckdb") == 0) {
+        return attribute;
+      }
+      if (!attribute.empty() && attribute.back() != FN_LIBCHAR) {
+        attribute.push_back(FN_LIBCHAR);
+      }
+      return attribute + schema_name + ".duckdb";
+    }
+  }
+  return default_duckdb_path_for_schema(schema_name);
 }
 
 std::string make_loading_table_name(const std::string &base, THD *thd) {
@@ -2136,6 +2177,192 @@ int ha_duckdb::create(const char *, TABLE *table_arg, HA_CREATE_INFO *,
   }
 
   loaded_tables->add(table_arg->s->db.str, table_arg->s->table_name.str, path);
+  return 0;
+}
+
+int ha_duckdb::rename_table(const char *from, const char *to,
+                            const dd::Table *from_table_def,
+                            dd::Table *to_table_def) {
+  if (from == nullptr || to == nullptr) return HA_ERR_GENERIC;
+
+  std::string from_schema;
+  std::string from_table_name;
+  std::string to_schema;
+  std::string to_table_name;
+  if (!parse_table_path(from, &from_schema, &from_table_name) ||
+      !parse_table_path(to, &to_schema, &to_table_name)) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "Failed to parse table path for DuckDB rename");
+    return HA_ERR_GENERIC;
+  }
+  if (from_schema != to_schema) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "DuckDB rename across schemas is not supported");
+    return HA_ERR_WRONG_COMMAND;
+  }
+
+  const std::string from_path = resolve_duckdb_path(from_schema, from_table_def);
+  const std::string to_path = resolve_duckdb_path(to_schema, to_table_def);
+  if (from_path != to_path) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "DuckDB rename across files is not supported");
+    return HA_ERR_WRONG_COMMAND;
+  }
+  if (from_table_name == to_table_name) return 0;
+
+  if (duckdb_instance_pool == nullptr) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "DuckDB instance pool unavailable");
+    return HA_ERR_GENERIC;
+  }
+
+  try {
+    std::shared_ptr<duckdb::DuckDB> db;
+    std::shared_ptr<std::timed_mutex> writer_mutex;
+    std::string pool_error;
+    if (!duckdb_instance_pool->acquire(from_path, &db, &writer_mutex,
+                                       &pool_error)) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               pool_error.empty() ? "Failed to acquire DuckDB instance"
+                                  : pool_error.c_str());
+      return HA_ERR_GENERIC;
+    }
+    DuckdbWriterGuard writer_guard(writer_mutex);
+    if (!writer_guard.locked()) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               "DuckDB writer lock unavailable");
+      return HA_ERR_GENERIC;
+    }
+
+    duckdb::Connection conn(*db);
+    std::string sql = "ALTER TABLE ";
+    sql += qualified_table_name(from_schema, from_table_name);
+    sql += " RENAME TO ";
+    sql += quote_ident(to_table_name.c_str(), to_table_name.size());
+    auto result = conn.Query(sql);
+    if (!result || result->HasError()) {
+      const std::string err =
+          result ? result->GetError() : "DuckDB rename query failed";
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), err.c_str());
+      return HA_ERR_GENERIC;
+    }
+  } catch (const std::exception &ex) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), ex.what());
+    return HA_ERR_GENERIC;
+  }
+
+  const bool replicated =
+      loaded_tables != nullptr &&
+      loaded_tables->is_replicated(from_schema, from_table_name);
+  if (loaded_tables != nullptr) {
+    loaded_tables->erase(from_schema, from_table_name);
+    loaded_tables->add(to_schema, to_table_name, to_path, replicated);
+  }
+  return 0;
+}
+
+int ha_duckdb::delete_table(const char *name, const dd::Table *table_def) {
+  if (name == nullptr) return HA_ERR_GENERIC;
+
+  std::string schema_name;
+  std::string table_name;
+  if (!parse_table_path(name, &schema_name, &table_name)) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "Failed to parse table path for DuckDB drop");
+    return HA_ERR_GENERIC;
+  }
+
+  const std::string path = resolve_duckdb_path(schema_name, table_def);
+  MY_STAT stat_buf;
+  if (my_stat(path.c_str(), &stat_buf, MYF(0)) == nullptr) {
+    if (loaded_tables != nullptr) loaded_tables->erase(schema_name, table_name);
+    return 0;
+  }
+
+  if (duckdb_instance_pool == nullptr) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "DuckDB instance pool unavailable");
+    return HA_ERR_GENERIC;
+  }
+
+  try {
+    std::shared_ptr<duckdb::DuckDB> db;
+    std::shared_ptr<std::timed_mutex> writer_mutex;
+    std::string pool_error;
+    if (!duckdb_instance_pool->acquire(path, &db, &writer_mutex, &pool_error)) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               pool_error.empty() ? "Failed to acquire DuckDB instance"
+                                  : pool_error.c_str());
+      return HA_ERR_GENERIC;
+    }
+    DuckdbWriterGuard writer_guard(writer_mutex);
+    if (!writer_guard.locked()) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               "DuckDB writer lock unavailable");
+      return HA_ERR_GENERIC;
+    }
+
+    duckdb::Connection conn(*db);
+    std::string sql = "DROP TABLE IF EXISTS ";
+    sql += qualified_table_name(schema_name, table_name);
+    auto result = conn.Query(sql);
+    if (!result || result->HasError()) {
+      const std::string err =
+          result ? result->GetError() : "DuckDB drop query failed";
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), err.c_str());
+      return HA_ERR_GENERIC;
+    }
+  } catch (const std::exception &ex) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), ex.what());
+    return HA_ERR_GENERIC;
+  }
+
+  if (loaded_tables != nullptr) loaded_tables->erase(schema_name, table_name);
+  return 0;
+}
+
+int ha_duckdb::truncate(dd::Table *) {
+  if (table_share != nullptr && table_share->is_secondary_engine()) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "DuckDB secondary tables are read-only");
+    return HA_ERR_WRONG_COMMAND;
+  }
+  if (!m_conn || table == nullptr) return HA_ERR_GENERIC;
+
+  DuckdbWriterGuard writer_guard(m_writer_mutex);
+  if (!writer_guard.locked()) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "DuckDB writer lock unavailable");
+    return HA_ERR_GENERIC;
+  }
+
+  try {
+    std::string sql = "TRUNCATE TABLE ";
+    sql += qualified_table_name(m_schema_name, m_table_name);
+    auto result = m_conn->Query(sql);
+    if (!result || result->HasError()) {
+      const std::string err =
+          result ? result->GetError() : "DuckDB truncate query failed";
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), err.c_str());
+      return HA_ERR_GENERIC;
+    }
+  } catch (const std::exception &ex) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), ex.what());
+    return HA_ERR_GENERIC;
+  }
+
+  reset_native_mrr_state();
+  invalidate_stats_cache();
+  m_result.reset();
+  m_chunk.reset();
+  m_scan_fields.clear();
+  m_chunk_row = 0;
+  m_index_result.reset();
+  m_index_chunk.reset();
+  m_index_fields.clear();
+  m_index_chunk_row = 0;
+  m_index_descending = false;
+  stats.records = 0;
   return 0;
 }
 

@@ -47,10 +47,25 @@ Legend: SUPPORTED, PARTIAL (differences), NOT SUPPORTED
 ### Type Casting
 - NOT SUPPORTED: Not rewritten yet (use `CAST(.. AS type)` with DuckDB types).
 
+## Mixed InnoDB + DuckDB Matrix (Dual Mode)
+Legend: OFFLOAD = DuckDB external executor, FALLBACK = MySQL/InnoDB path,
+ERROR = statement fails because fallback is disabled.
+
+| Query / DML shape | `use_secondary_engine=ON` | `use_secondary_engine=FORCED` | Notes |
+| --- | --- | --- | --- |
+| JOIN where every table is loaded in DuckDB and mapped to same `.duckdb` file | OFFLOAD | OFFLOAD | Works for eligible INNER/LEFT join plans. |
+| JOIN with at least one table not loaded in DuckDB | FALLBACK | ERROR | Mixed engine execution remains available via MySQL fallback. |
+| JOIN with tables mapped to different DuckDB files | FALLBACK | ERROR | Offload requires a single DuckDB file per query. |
+| INSERT/UPDATE/DELETE on primary-mode DuckDB tables | N/A (primary path) | N/A (primary path) | Executed by DuckDB handler directly. |
+| INSERT/UPDATE/DELETE on secondary-mode tables | ERROR | ERROR | Secondary-mode tables remain read-only. |
+| Unsupported rewrite / unsupported SELECT shape | FALLBACK | ERROR | Deterministic guardrail behavior. |
+
 ## Notes
 - Offload currently requires a simple single-table `SELECT` (no subqueries or
-  UNIONs). The SELECT list may include expressions, functions, and aggregates
-  that DuckDB can execute; unsupported expressions fall back.
+  UNIONs) unless the query matches supported join offload patterns in
+  `Docs/duckdb_mixed_engine_joins.md`. The SELECT list may include
+  expressions, functions, and aggregates that DuckDB can execute; unsupported
+  expressions fall back.
 - Unsupported rewrites fall back to the primary engine when
   `use_secondary_engine=ON`, or raise an error if `FORCED`.
 - See `Docs/duckdb_compatibility_gaps.md` for current gaps and next steps.

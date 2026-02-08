@@ -1,5 +1,22 @@
 # DuckDB Replication Operations
 
+## Mode Selection and Fallback
+- Secondary mode (default): queries may offload to DuckDB based on eligibility
+  and cost.
+  - `SET SESSION use_secondary_engine=ON;`
+  - `SET SESSION secondary_engine_cost_threshold=0;` (aggressive offload for QA)
+- Forced mode: only for validation; unsupported/offload-ineligible statements
+  fail instead of falling back.
+  - `SET SESSION use_secondary_engine=FORCED;`
+- Primary mode: DuckDB handler serves table I/O directly (no secondary offload
+  decision path for those tables).
+
+Fallback behavior:
+- In `ON`, unsupported rewrites or missing DuckDB table mappings fall back to
+  MySQL execution.
+- In `FORCED`, the same conditions return an error and surface the offload
+  failure reason.
+
 ## Pause/Resume and Throttle
 - Pause apply: `SET GLOBAL duckdb_binlog_apply_paused = 1;`
 - Resume apply: `SET GLOBAL duckdb_binlog_apply_paused = 0;`
@@ -55,6 +72,15 @@ SET GLOBAL duckdb_binlog_apply_enabled = ON;
 ## DuckDB File Location
 - Default per-schema files live under `@@datadir`.
 - Override the base directory at startup with `duckdb_db_dir=/path`.
+
+## Known Limitations
+- Offload requires all referenced tables to resolve to the same DuckDB file.
+- Secondary-mode tables are read-only from SQL DML; changes arrive via
+  `SECONDARY_LOAD` + binlog apply.
+- Some MySQL function/format-token rewrites remain partial; see
+  `Docs/duckdb_compatibility.md` and `Docs/duckdb_compatibility_gaps.md`.
+- Cross-schema DuckDB table rename in primary mode is not supported by the
+  current handler path.
 
 ## Resume After Stop-at-GTID
 - Clear the GTID stop and resume:

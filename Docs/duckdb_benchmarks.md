@@ -53,6 +53,22 @@ Environment overrides:
 - `DUCKDB_QUERY_DUCKDB_MODE` (default: `FORCED`)
 - `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_SOCKET`, `MYSQL_USER`, `MYSQL_PASSWORD`
 
+## Go/No-Go Thresholds (Dual-Mode Rollout)
+Use the query suite and compare DuckDB mode against the InnoDB baseline on the
+same dataset.
+
+- Pass gate A (correctness): every query result hash must match baseline.
+- Pass gate B (performance): median DuckDB latency must be <= baseline for at
+  least 70% of benchmarked analytical queries.
+- Pass gate C (regression guard): no single analytical query may regress by
+  more than 20% vs baseline unless explicitly waived in the ticket notes.
+- Pass gate D (stability): 3 consecutive runs must satisfy A/B/C.
+
+Suggested workflow:
+1. Run baseline + DuckDB suite 3 times.
+2. Publish `results.csv` and `results.md` as ticket artifacts.
+3. Record pass/fail for gates A/B/C/D before enabling `FORCED` in staging.
+
 ## Benchmarks Included
 - `sql_insert`: baseline INSERT statements (per-batch multi-values).
 - `appender`: bulk ingestion via `DuckDBAdapter::AppendRows`.

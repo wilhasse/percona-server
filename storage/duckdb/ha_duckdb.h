@@ -57,6 +57,11 @@ class ha_duckdb : public handler {
  private:
   int create(const char *name, TABLE *table, HA_CREATE_INFO *info,
              dd::Table *table_def) override;
+  int rename_table(const char *from, const char *to,
+                   const dd::Table *from_table_def,
+                   dd::Table *to_table_def) override;
+  int delete_table(const char *name, const dd::Table *table_def) override;
+  int truncate(dd::Table *table_def) override;
 
   int open(const char *name, int mode, unsigned int test_if_locked,
            const dd::Table *table_def) override;

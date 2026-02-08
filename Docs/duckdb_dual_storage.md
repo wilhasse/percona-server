@@ -41,7 +41,10 @@ duckdb_hton->optimize_secondary_engine = OptimizeSecondaryEngine;
 Client -> MySQL -> InnoDB only
          (DuckDB not called for user DML)
 ```
-DuckDB is updated via the binlog applier, not direct SQL DML.
+The flow above applies to secondary mode. In primary mode, DuckDB handler DML
+paths are used directly for DuckDB tables.
+In secondary mode, DuckDB is updated via the binlog applier, not direct SQL
+DML.
 
 ### Read Path (SELECT)
 ```
