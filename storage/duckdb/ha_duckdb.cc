@@ -2086,6 +2086,37 @@ static void duckdb_binlog_apply_verbose_update(
   duckdb_se::SetDuckdbBinlogApplyVerbose(value);
 }
 
+enum DuckdbExecutionMode : ulong {
+  DUCKDB_EXECUTION_MODE_SECONDARY = 0,
+  DUCKDB_EXECUTION_MODE_PRIMARY = 1,
+  DUCKDB_EXECUTION_MODE_DUAL = 2,
+};
+
+static const char *duckdb_execution_mode_names[] = {"SECONDARY", "PRIMARY",
+                                                     "DUAL", NullS};
+static TYPELIB duckdb_execution_mode_typelib = {
+    array_elements(duckdb_execution_mode_names) - 1,
+    "duckdb_execution_mode_typelib", duckdb_execution_mode_names, nullptr};
+
+static ulong duckdb_execution_mode = DUCKDB_EXECUTION_MODE_SECONDARY;
+
+static bool DuckdbSecondaryModeEnabled() {
+  return duckdb_execution_mode != DUCKDB_EXECUTION_MODE_PRIMARY;
+}
+
+static const char *DuckdbExecutionModeToString() {
+  switch (duckdb_execution_mode) {
+    case DUCKDB_EXECUTION_MODE_PRIMARY:
+      return "PRIMARY";
+    case DUCKDB_EXECUTION_MODE_DUAL:
+      return "DUAL";
+    default:
+      return "SECONDARY";
+  }
+}
+
+static void ConfigureDuckdbHandlerton(handlerton *duckdb_hton);
+
 static const char *duckdb_offload_mode_names[] = {"OFF", "ON", "FORCED",
                                                   NullS};
 static TYPELIB duckdb_offload_mode_typelib = {
@@ -2112,6 +2143,7 @@ static const char *DuckdbOffloadModeToString(ulong mode) {
 }
 
 static std::string DuckdbBuildInitConnectSnippet() {
+  if (!DuckdbSecondaryModeEnabled()) return "";
   if (duckdb_offload_default_mode == 0) return "";
   std::ostringstream oss;
   oss << kDuckdbInitConnectStart << " SET SESSION use_secondary_engine="
@@ -2185,6 +2217,15 @@ static void duckdb_offload_cost_threshold_update(
     MYSQL_THD, SYS_VAR *, void *var_ptr, const void *save) {
   auto value = *static_cast<const double *>(save);
   *static_cast<double *>(var_ptr) = value;
+  DuckdbUpdateInitConnect();
+}
+
+static void duckdb_execution_mode_update(
+    MYSQL_THD, SYS_VAR *, void *var_ptr, const void *save) {
+  auto value = *static_cast<const ulong *>(save);
+  *static_cast<ulong *>(var_ptr) = value;
+  ConfigureDuckdbHandlerton(static_cast<handlerton *>(
+      duckdb_se::GetDuckdbPluginPtr()));
   DuckdbUpdateInitConnect();
 }
 
@@ -2331,8 +2372,17 @@ static MYSQL_SYSVAR_DOUBLE(
     "Secondary engine cost threshold to apply via init_connect (0 for tests).",
     nullptr, duckdb_offload_cost_threshold_update, 0.0, 0.0, DBL_MAX, 0);
 
+static MYSQL_SYSVAR_ENUM(
+    execution_mode, duckdb_execution_mode, PLUGIN_VAR_RQCMDARG,
+    "DuckDB execution mode (SECONDARY/PRIMARY/DUAL). "
+    "SECONDARY keeps current offload behavior, PRIMARY disables offload "
+    "callbacks, DUAL enables both in one build.",
+    nullptr, duckdb_execution_mode_update, DUCKDB_EXECUTION_MODE_SECONDARY,
+    &duckdb_execution_mode_typelib);
+
 static SYS_VAR *duckdb_system_variables[] = {
     MYSQL_SYSVAR(db_dir),
+    MYSQL_SYSVAR(execution_mode),
     MYSQL_SYSVAR(offload_default_mode),
     MYSQL_SYSVAR(offload_cost_threshold),
     MYSQL_SYSVAR(binlog_apply_enabled),
@@ -2358,6 +2408,14 @@ static SYS_VAR *duckdb_system_variables[] = {
     MYSQL_SYSVAR(binlog_apply_batch_delay_ms),
     MYSQL_SYSVAR(binlog_apply_parallel_workers),
     nullptr};
+
+static int show_duckdb_execution_mode(MYSQL_THD, SHOW_VAR *var, char *buf) {
+  var->type = SHOW_CHAR;
+  var->value = buf;
+  std::snprintf(buf, SHOW_VAR_FUNC_BUFF_SIZE, "%s",
+                DuckdbExecutionModeToString());
+  return 0;
+}
 
 static int show_duckdb_binlog_apply_paused(MYSQL_THD, SHOW_VAR *var, char *) {
   static bool value;
@@ -2555,6 +2613,9 @@ static int show_duckdb_binlog_source_gtid(MYSQL_THD, SHOW_VAR *var, char *buf) {
 }
 
 static SHOW_VAR duckdb_status_variables[] = {
+    {"duckdb_execution_mode_state", (char *)show_duckdb_execution_mode,
+     SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
     {"duckdb_binlog_apply_paused_state",
      (char *)show_duckdb_binlog_apply_paused, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"duckdb_binlog_applied_transactions",
@@ -2615,6 +2676,40 @@ static handler *duckdb_create_handler(handlerton *hton, TABLE_SHARE *table,
   return new (mem_root) duckdb_se::ha_duckdb(hton, table);
 }
 
+static void ConfigureDuckdbHandlerton(handlerton *duckdb_hton) {
+  if (duckdb_hton == nullptr) return;
+  // Routing policy:
+  // PRIMARY -> disable secondary/offload callbacks.
+  // SECONDARY/DUAL -> keep existing offload callbacks enabled.
+  duckdb_hton->create = duckdb_create_handler;
+  duckdb_hton->state = SHOW_OPTION_YES;
+  duckdb_hton->db_type = DB_TYPE_UNKNOWN;
+  duckdb_hton->prepare_secondary_engine = nullptr;
+  duckdb_hton->optimize_secondary_engine = nullptr;
+  duckdb_hton->get_secondary_engine_offload_or_exec_fail_reason = nullptr;
+  duckdb_hton->set_secondary_engine_offload_fail_reason = nullptr;
+  duckdb_hton->secondary_engine_flags = {};
+  duckdb_hton->flags = HTON_NO_PARTITION;
+
+  if (!DuckdbSecondaryModeEnabled()) {
+    return;
+  }
+
+  duckdb_hton->flags = HTON_IS_SECONDARY_ENGINE;
+  duckdb_hton->prepare_secondary_engine = PrepareSecondaryEngine;
+  duckdb_hton->optimize_secondary_engine = OptimizeSecondaryEngine;
+  duckdb_hton->get_secondary_engine_offload_or_exec_fail_reason =
+      DuckdbGetOffloadFailReason;
+  duckdb_hton->set_secondary_engine_offload_fail_reason =
+      DuckdbSetOffloadFailReason;
+  // Use the external executor path so join queries can run inside DuckDB.
+  duckdb_hton->secondary_engine_flags = MakeSecondaryEngineFlags(
+      SecondaryEngineFlag::SUPPORTS_HASH_JOIN,
+      SecondaryEngineFlag::SUPPORTS_NESTED_LOOP_JOIN,
+      SecondaryEngineFlag::AGGREGATION_IS_UNORDERED,
+      SecondaryEngineFlag::USE_EXTERNAL_EXECUTOR);
+}
+
 static int duckdb_init_func(void *p) {
   DBUG_TRACE;
 
@@ -2633,24 +2728,7 @@ static int duckdb_init_func(void *p) {
   DuckdbUpdateInitConnect();
   (void)duckdb_validate_read_only_settings();
   duckdb_se::StartBinlogApplyThread(duckdb_make_binlog_apply_options());
-
-  handlerton *duckdb_hton = static_cast<handlerton *>(p);
-  duckdb_hton->create = duckdb_create_handler;
-  duckdb_hton->state = SHOW_OPTION_YES;
-  duckdb_hton->flags = HTON_IS_SECONDARY_ENGINE;
-  duckdb_hton->db_type = DB_TYPE_UNKNOWN;
-  duckdb_hton->prepare_secondary_engine = PrepareSecondaryEngine;
-  duckdb_hton->optimize_secondary_engine = OptimizeSecondaryEngine;
-  duckdb_hton->get_secondary_engine_offload_or_exec_fail_reason =
-      DuckdbGetOffloadFailReason;
-  duckdb_hton->set_secondary_engine_offload_fail_reason =
-      DuckdbSetOffloadFailReason;
-  // Use the external executor path so join queries can run inside DuckDB.
-  duckdb_hton->secondary_engine_flags = MakeSecondaryEngineFlags(
-      SecondaryEngineFlag::SUPPORTS_HASH_JOIN,
-      SecondaryEngineFlag::SUPPORTS_NESTED_LOOP_JOIN,
-      SecondaryEngineFlag::AGGREGATION_IS_UNORDERED,
-      SecondaryEngineFlag::USE_EXTERNAL_EXECUTOR);
+  ConfigureDuckdbHandlerton(static_cast<handlerton *>(p));
   return 0;
 }
 
@@ -2672,7 +2750,7 @@ mysql_declare_plugin(duckdb_se){
     &duckdb_storage_engine,
     "DUCKDB",
     "Percona Inc.",
-    "DuckDB secondary storage engine (embedded)",
+    "DuckDB storage engine (primary + secondary offload modes)",
     PLUGIN_LICENSE_GPL,
     duckdb_init_func,   /* Plugin Init */
     nullptr,            /* Plugin check uninstall */

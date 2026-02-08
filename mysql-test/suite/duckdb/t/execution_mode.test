@@ -1,0 +1,40 @@
+--source include/have_duckdb_plugin.inc
+
+--disable_query_log
+CALL mtr.add_suppression("DuckDB analytics node should run with read_only=ON");
+--let $duckdb_installed=0
+--let $duckdb_plugin_present=`SELECT COUNT(*) FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_NAME='DUCKDB'`
+--if ($duckdb_plugin_present == 0) {
+  --eval INSTALL PLUGIN duckdb SONAME '$DUCKDB_PLUGIN';
+  --let $duckdb_installed=1
+}
+
+SET @save_duckdb_execution_mode = @@GLOBAL.duckdb_execution_mode;
+SET @save_duckdb_offload_default_mode = @@GLOBAL.duckdb_offload_default_mode;
+
+SET @@GLOBAL.duckdb_offload_default_mode = 'OFF';
+SET @@GLOBAL.duckdb_execution_mode = 'SECONDARY';
+--enable_query_log
+
+SELECT @@GLOBAL.duckdb_execution_mode;
+SELECT @@GLOBAL.init_connect LIKE '%duckdb_offload_default_begin%' AS has_duckdb_snippet;
+
+SET @@GLOBAL.duckdb_offload_default_mode = 'ON';
+SELECT @@GLOBAL.init_connect LIKE '%duckdb_offload_default_begin%' AS has_duckdb_snippet;
+
+SET @@GLOBAL.duckdb_execution_mode = 'PRIMARY';
+SELECT @@GLOBAL.duckdb_execution_mode;
+SELECT @@GLOBAL.init_connect LIKE '%duckdb_offload_default_begin%' AS has_duckdb_snippet;
+
+SET @@GLOBAL.duckdb_execution_mode = 'DUAL';
+SELECT @@GLOBAL.duckdb_execution_mode;
+SELECT @@GLOBAL.init_connect LIKE '%duckdb_offload_default_begin%' AS has_duckdb_snippet;
+
+--disable_query_log
+SET @@GLOBAL.duckdb_execution_mode = @save_duckdb_execution_mode;
+SET @@GLOBAL.duckdb_offload_default_mode = @save_duckdb_offload_default_mode;
+
+--if ($duckdb_installed == 1) {
+  UNINSTALL PLUGIN duckdb;
+}
+--enable_query_log

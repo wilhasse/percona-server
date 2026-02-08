@@ -1,0 +1,24 @@
+SELECT @@GLOBAL.duckdb_execution_mode;
+@@GLOBAL.duckdb_execution_mode
+SECONDARY
+SELECT @@GLOBAL.init_connect LIKE '%duckdb_offload_default_begin%' AS has_duckdb_snippet;
+has_duckdb_snippet
+0
+SET @@GLOBAL.duckdb_offload_default_mode = 'ON';
+SELECT @@GLOBAL.init_connect LIKE '%duckdb_offload_default_begin%' AS has_duckdb_snippet;
+has_duckdb_snippet
+1
+SET @@GLOBAL.duckdb_execution_mode = 'PRIMARY';
+SELECT @@GLOBAL.duckdb_execution_mode;
+@@GLOBAL.duckdb_execution_mode
+PRIMARY
+SELECT @@GLOBAL.init_connect LIKE '%duckdb_offload_default_begin%' AS has_duckdb_snippet;
+has_duckdb_snippet
+0
+SET @@GLOBAL.duckdb_execution_mode = 'DUAL';
+SELECT @@GLOBAL.duckdb_execution_mode;
+@@GLOBAL.duckdb_execution_mode
+DUAL
+SELECT @@GLOBAL.init_connect LIKE '%duckdb_offload_default_begin%' AS has_duckdb_snippet;
+has_duckdb_snippet
+1
