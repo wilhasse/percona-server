@@ -30,6 +30,7 @@
 #include <cfloat>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <iomanip>
@@ -761,6 +762,40 @@ int copy_chunk_row_to_table(TABLE *table, const duckdb::DataChunk &chunk,
 
   dbug_tmp_restore_column_map(table->write_set, old_map);
   return 0;
+}
+
+int copy_chunk_row_to_table(TABLE *table, const duckdb::DataChunk &chunk,
+                            duckdb::idx_t row_idx,
+                            const std::vector<Field *> &projected_fields,
+                            duckdb::idx_t col_offset) {
+  if (table == nullptr || table->s == nullptr) return HA_ERR_GENERIC;
+  if (chunk.ColumnCount() < projected_fields.size() + col_offset) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), "DuckDB column count mismatch");
+    return HA_ERR_GENERIC;
+  }
+
+  my_bitmap_map *old_map = dbug_tmp_use_all_columns(table, table->write_set);
+
+  for (duckdb::idx_t col_idx = 0; col_idx < projected_fields.size(); ++col_idx) {
+    Field *field = projected_fields[col_idx];
+    if (field == nullptr) continue;
+    const duckdb::Value value = chunk.GetValue(col_idx + col_offset, row_idx);
+    store_duckdb_value(field, value);
+  }
+
+  dbug_tmp_restore_column_map(table->write_set, old_map);
+  return 0;
+}
+
+bool parse_probe_index(const duckdb::Value &value, size_t *probe_idx) {
+  if (probe_idx == nullptr || value.IsNull()) return false;
+  const std::string probe_text = duckdb::StringValue::Get(value);
+  if (probe_text.empty()) return false;
+  char *end = nullptr;
+  const unsigned long long parsed = std::strtoull(probe_text.c_str(), &end, 10);
+  if (end == nullptr || *end != '\0') return false;
+  *probe_idx = static_cast<size_t>(parsed);
+  return true;
 }
 
 std::string build_set_clause(const std::vector<Field *> &fields,
@@ -2040,6 +2075,7 @@ int ha_duckdb::open(const char *, int, unsigned int, const dd::Table *) {
 }
 
 int ha_duckdb::close() {
+  reset_native_mrr_state();
   m_result.reset();
   m_chunk.reset();
   m_scan_fields.clear();
@@ -2087,6 +2123,7 @@ int ha_duckdb::rnd_init(bool) {
 }
 
 int ha_duckdb::rnd_end() {
+  reset_native_mrr_state();
   m_result.reset();
   m_chunk.reset();
   m_scan_fields.clear();
@@ -2140,6 +2177,7 @@ int ha_duckdb::index_init(uint idx, bool) {
 }
 
 int ha_duckdb::index_end() {
+  reset_native_mrr_state();
   m_index_result.reset();
   m_index_chunk.reset();
   m_index_fields.clear();
@@ -2328,6 +2366,296 @@ int ha_duckdb::index_first(uchar *buf) {
 
 int ha_duckdb::index_last(uchar *buf) {
   return execute_index_scan(std::string(), true, buf);
+}
+
+bool ha_duckdb::can_use_native_mrr(uint keyno, uint flags) const {
+  if (table == nullptr || table_share == nullptr || m_conn == nullptr) {
+    return false;
+  }
+  if (keyno != table_share->primary_key) return false;
+  if (flags & (HA_MRR_USE_DEFAULT_IMPL | HA_MRR_SORTED | HA_MRR_NO_ASSOCIATION)) {
+    return false;
+  }
+  const KEY *primary_key = duckdb_primary_key_info(table, table_share);
+  if (primary_key == nullptr || primary_key->user_defined_key_parts == 0) {
+    return false;
+  }
+  return true;
+}
+
+ha_rows ha_duckdb::multi_range_read_info_const(
+    uint keyno, RANGE_SEQ_IF *seq, void *seq_init_param, uint n_ranges,
+    uint *bufsz, uint *flags, bool *force_default_mrr, Cost_estimate *cost) {
+  const uint requested_flags = *flags;
+  ha_rows rows = handler::multi_range_read_info_const(
+      keyno, seq, seq_init_param, n_ranges, bufsz, flags, force_default_mrr,
+      cost);
+  if (rows == HA_POS_ERROR) return rows;
+  if (force_default_mrr != nullptr && *force_default_mrr) return rows;
+  if (can_use_native_mrr(keyno, requested_flags)) {
+    *flags &= ~HA_MRR_USE_DEFAULT_IMPL;
+  }
+  return rows;
+}
+
+ha_rows ha_duckdb::multi_range_read_info(uint keyno, uint n_ranges, uint n_rows,
+                                         uint *bufsz, uint *flags,
+                                         Cost_estimate *cost) {
+  const uint requested_flags = *flags;
+  ha_rows rows =
+      handler::multi_range_read_info(keyno, n_ranges, n_rows, bufsz, flags, cost);
+  if (rows == HA_POS_ERROR) return rows;
+  if (can_use_native_mrr(keyno, requested_flags)) {
+    *flags &= ~HA_MRR_USE_DEFAULT_IMPL;
+  }
+  return rows;
+}
+
+bool ha_duckdb::native_mrr_range_supported(const KEY *primary_key,
+                                           const KEY_MULTI_RANGE &range) const {
+  if (primary_key == nullptr) return false;
+  if (!(range.range_flag & EQ_RANGE)) return false;
+  if (range.range_flag & (NULL_RANGE | GEOM_FLAG)) return false;
+  if (range.start_key.key == nullptr || range.end_key.key == nullptr) return false;
+  if (range.start_key.flag != HA_READ_KEY_EXACT ||
+      range.end_key.flag != HA_READ_AFTER_KEY) {
+    return false;
+  }
+  const key_part_map full_keypart_map =
+      make_prev_keypart_map(primary_key->user_defined_key_parts);
+  if (range.start_key.keypart_map != full_keypart_map ||
+      range.end_key.keypart_map != full_keypart_map) {
+    return false;
+  }
+  if (range.start_key.length != primary_key->key_length ||
+      range.end_key.length != primary_key->key_length) {
+    return false;
+  }
+  return true;
+}
+
+void ha_duckdb::reset_native_mrr_state() {
+  m_native_mrr_active = false;
+  m_native_mrr_fallback = true;
+  m_native_mrr_mode = 0;
+  m_native_mrr_iter = nullptr;
+  m_native_mrr_funcs = {};
+  m_native_mrr_batch_size = 0;
+  m_native_mrr_next_probe = 0;
+  m_native_mrr_key_fields.clear();
+  m_native_mrr_fields.clear();
+  m_native_mrr_probes.clear();
+  m_native_mrr_result.reset();
+  m_native_mrr_chunk.reset();
+  m_native_mrr_chunk_row = 0;
+}
+
+int ha_duckdb::start_next_native_mrr_batch() {
+  if (!m_native_mrr_active || m_native_mrr_fallback || !m_conn) {
+    return HA_ERR_GENERIC;
+  }
+  if (m_native_mrr_next_probe >= m_native_mrr_probes.size()) {
+    return HA_ERR_END_OF_FILE;
+  }
+
+  const size_t batch_begin = m_native_mrr_next_probe;
+  const size_t batch_end = std::min(batch_begin + m_native_mrr_batch_size,
+                                    m_native_mrr_probes.size());
+  std::string sql = "SELECT __mrr_probe.";
+  sql += quote_ident("__probe_idx", std::strlen("__probe_idx"));
+  if (!m_native_mrr_fields.empty()) {
+    sql += ", ";
+    sql += build_select_list(m_native_mrr_fields);
+  }
+  sql += " FROM ";
+  sql += qualified_table_name(m_schema_name, m_table_name);
+  sql += " AS __mrr_tbl JOIN (VALUES ";
+
+  for (size_t i = batch_begin; i < batch_end; ++i) {
+    if (i > batch_begin) sql += ", ";
+    sql += "(";
+    for (size_t key_part = 0; key_part < m_native_mrr_key_fields.size();
+         ++key_part) {
+      if (key_part > 0) sql += ", ";
+      sql += m_native_mrr_probes[i].key_sql_values[key_part];
+    }
+    if (!m_native_mrr_key_fields.empty()) sql += ", ";
+    sql += "'";
+    sql += std::to_string(i);
+    sql += "')";
+  }
+
+  sql += ") AS __mrr_probe(";
+  for (size_t key_part = 0; key_part < m_native_mrr_key_fields.size();
+       ++key_part) {
+    if (key_part > 0) sql += ", ";
+    const std::string col_name = "__k" + std::to_string(key_part);
+    sql += quote_ident(col_name.c_str(), col_name.size());
+  }
+  if (!m_native_mrr_key_fields.empty()) sql += ", ";
+  sql += quote_ident("__probe_idx", std::strlen("__probe_idx"));
+  sql += ") ON ";
+
+  for (size_t key_part = 0; key_part < m_native_mrr_key_fields.size();
+       ++key_part) {
+    if (key_part > 0) sql += " AND ";
+    const std::string probe_col = "__k" + std::to_string(key_part);
+    sql += "__mrr_tbl.";
+    sql += quote_ident(m_native_mrr_key_fields[key_part]->field_name,
+                       std::strlen(m_native_mrr_key_fields[key_part]->field_name));
+    sql += " IS NOT DISTINCT FROM __mrr_probe.";
+    sql += quote_ident(probe_col.c_str(), probe_col.size());
+  }
+
+  std::string pushed_predicate =
+      combine_predicates(m_pushed_cond_sql, m_pushed_idx_cond_sql);
+  if (!pushed_predicate.empty()) {
+    sql += " WHERE ";
+    sql += pushed_predicate;
+  }
+  sql += " ORDER BY __mrr_probe.";
+  sql += quote_ident("__probe_idx", std::strlen("__probe_idx"));
+
+  try {
+    m_native_mrr_result = m_conn->Query(sql);
+    if (!m_native_mrr_result || m_native_mrr_result->HasError()) {
+      const std::string err = m_native_mrr_result
+                                  ? m_native_mrr_result->GetError()
+                                  : "DuckDB query failed";
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), err.c_str());
+      return HA_ERR_GENERIC;
+    }
+    m_native_mrr_chunk.reset();
+    m_native_mrr_chunk_row = 0;
+    m_native_mrr_next_probe = batch_end;
+    return 0;
+  } catch (const std::exception &ex) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), ex.what());
+    return HA_ERR_GENERIC;
+  }
+}
+
+int ha_duckdb::multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
+                                     uint n_ranges, uint mode,
+                                     HANDLER_BUFFER *buf) {
+  reset_native_mrr_state();
+
+  if (!can_use_native_mrr(active_index, mode) || seq == nullptr) {
+    return handler::multi_range_read_init(seq, seq_init_param, n_ranges, mode,
+                                          buf);
+  }
+
+  const KEY *primary_key = duckdb_primary_key_info(table, table_share);
+  if (primary_key == nullptr) {
+    return handler::multi_range_read_init(seq, seq_init_param, n_ranges, mode,
+                                          buf);
+  }
+
+  m_native_mrr_key_fields = collect_primary_key_fields(table, table_share);
+  if (m_native_mrr_key_fields.size() != primary_key->user_defined_key_parts) {
+    return handler::multi_range_read_init(seq, seq_init_param, n_ranges, mode,
+                                          buf);
+  }
+
+  m_native_mrr_funcs = *seq;
+  m_native_mrr_iter = seq->init(seq_init_param, n_ranges, mode);
+  m_native_mrr_mode = mode;
+  m_native_mrr_fields = collect_projection_fields(table);
+
+  KEY_MULTI_RANGE range;
+  while (!seq->next(m_native_mrr_iter, &range)) {
+    if (!native_mrr_range_supported(primary_key, range)) {
+      reset_native_mrr_state();
+      return handler::multi_range_read_init(seq, seq_init_param, n_ranges, mode,
+                                            buf);
+    }
+
+    key_restore(table->record[0], pointer_cast<const uchar *>(range.start_key.key),
+                primary_key, primary_key->key_length);
+    const std::vector<duckdb::Value> key_values =
+        collect_values(table, table->record[0], m_native_mrr_key_fields);
+    if (key_values.size() != m_native_mrr_key_fields.size()) {
+      reset_native_mrr_state();
+      return handler::multi_range_read_init(seq, seq_init_param, n_ranges, mode,
+                                            buf);
+    }
+
+    NativeMrrProbe probe;
+    probe.key_sql_values.reserve(key_values.size());
+    for (const duckdb::Value &value : key_values) {
+      probe.key_sql_values.push_back(value_to_sql(value));
+    }
+    probe.range_ptr = range.ptr;
+    m_native_mrr_probes.push_back(std::move(probe));
+  }
+
+  const size_t default_batch_size = 256;
+  m_native_mrr_batch_size = default_batch_size;
+  if (buf != nullptr && buf->buffer != nullptr && buf->buffer_end > buf->buffer) {
+    const size_t buffer_bytes = buf->buffer_end - buf->buffer;
+    const size_t bytes_per_probe =
+        std::max<size_t>(primary_key->key_length + sizeof(void *), 1);
+    const size_t buffer_limited_batch = buffer_bytes / bytes_per_probe;
+    m_native_mrr_batch_size =
+        std::max<size_t>(1, std::min(default_batch_size, buffer_limited_batch));
+  }
+  m_native_mrr_next_probe = 0;
+  m_native_mrr_active = true;
+  m_native_mrr_fallback = false;
+  if (!(mode & HA_MRR_NO_ASSOCIATION)) {
+    ha_statistic_increment(&System_status_var::ha_multi_range_read_init_count);
+  }
+  return 0;
+}
+
+int ha_duckdb::multi_range_read_next(char **range_info) {
+  if (m_native_mrr_fallback) return handler::multi_range_read_next(range_info);
+  if (!m_native_mrr_active) return HA_ERR_END_OF_FILE;
+
+  while (true) {
+    if (!m_native_mrr_result) {
+      const int batch_result = start_next_native_mrr_batch();
+      if (batch_result == HA_ERR_END_OF_FILE) return HA_ERR_END_OF_FILE;
+      if (batch_result != 0) return batch_result;
+    }
+
+    if (!m_native_mrr_chunk || m_native_mrr_chunk_row >= m_native_mrr_chunk->size()) {
+      m_native_mrr_chunk = m_native_mrr_result->Fetch();
+      m_native_mrr_chunk_row = 0;
+      if (!m_native_mrr_chunk || m_native_mrr_chunk->size() == 0) {
+        m_native_mrr_result.reset();
+        m_native_mrr_chunk.reset();
+        continue;
+      }
+    }
+
+    size_t probe_idx = 0;
+    const duckdb::Value probe_value =
+        m_native_mrr_chunk->GetValue(0, m_native_mrr_chunk_row);
+    if (!parse_probe_index(probe_value, &probe_idx) ||
+        probe_idx >= m_native_mrr_probes.size()) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), "Invalid DuckDB MRR probe id");
+      return HA_ERR_GENERIC;
+    }
+
+    char *probe_ptr = m_native_mrr_probes[probe_idx].range_ptr;
+    if (m_native_mrr_funcs.skip_record != nullptr &&
+        m_native_mrr_funcs.skip_record(m_native_mrr_iter, probe_ptr, nullptr)) {
+      m_native_mrr_chunk_row++;
+      continue;
+    }
+
+    if (copy_chunk_row_to_table(table, *m_native_mrr_chunk, m_native_mrr_chunk_row,
+                                m_native_mrr_fields, 1) != 0) {
+      return HA_ERR_GENERIC;
+    }
+
+    if (range_info != nullptr) {
+      *range_info = probe_ptr;
+    }
+    m_native_mrr_chunk_row++;
+    return 0;
+  }
 }
 
 const Item *ha_duckdb::cond_push(const Item *cond) {
@@ -2608,6 +2936,7 @@ ha_rows ha_duckdb::records_in_range(unsigned int index, key_range *min_key,
 int ha_duckdb::external_lock(THD *, int lock_type) {
   DBUG_TRACE;
   if (lock_type == F_UNLCK) {
+    reset_native_mrr_state();
     m_result.reset();
     m_chunk.reset();
     m_scan_fields.clear();
@@ -2622,6 +2951,7 @@ int ha_duckdb::external_lock(THD *, int lock_type) {
 }
 
 int ha_duckdb::reset() {
+  reset_native_mrr_state();
   m_pushed_cond_sql.clear();
   m_pushed_idx_cond_sql.clear();
   return 0;

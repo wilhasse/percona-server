@@ -37,10 +37,20 @@ CREATE TABLE t_probe (
 
 INSERT INTO t_probe VALUES (1,'one'),(3,'three');
 
-SELECT p.label, d.payload
+SET @save_optimizer_switch = @@SESSION.optimizer_switch;
+SET @@SESSION.optimizer_switch = 'mrr=on,mrr_cost_based=off,batched_key_access=on';
+FLUSH STATUS;
+
+SELECT /*+ BKA(d) */ p.label, d.payload
   FROM t_probe AS p
   STRAIGHT_JOIN t_pk AS d ON d.id = p.id
   ORDER BY p.id;
+
+SELECT (SELECT VARIABLE_VALUE
+          FROM INFORMATION_SCHEMA.SESSION_STATUS
+         WHERE VARIABLE_NAME='Handler_mrr_init') + 0 > 0 AS bka_mrr_used;
+
+SET @@SESSION.optimizer_switch = @save_optimizer_switch;
 
 UPDATE t_pk SET payload='beta2' WHERE id=2;
 DELETE FROM t_pk WHERE id=1;

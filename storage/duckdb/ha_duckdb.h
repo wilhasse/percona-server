@@ -51,7 +51,7 @@ namespace duckdb_se {
 
 class ha_duckdb : public handler {
  public:
- ha_duckdb(handlerton *hton, TABLE_SHARE *table_share);
+  ha_duckdb(handlerton *hton, TABLE_SHARE *table_share);
 
  private:
   int create(const char *name, TABLE *table, HA_CREATE_INFO *info,
@@ -77,6 +77,18 @@ class ha_duckdb : public handler {
   int index_prev(uchar *buf) override;
   int index_first(uchar *buf) override;
   int index_last(uchar *buf) override;
+  ha_rows multi_range_read_info_const(uint keyno, RANGE_SEQ_IF *seq,
+                                      void *seq_init_param, uint n_ranges,
+                                      uint *bufsz, uint *flags,
+                                      bool *force_default_mrr,
+                                      Cost_estimate *cost) override;
+  ha_rows multi_range_read_info(uint keyno, uint n_ranges, uint n_rows,
+                                uint *bufsz, uint *flags,
+                                Cost_estimate *cost) override;
+  int multi_range_read_init(RANGE_SEQ_IF *seq, void *seq_init_param,
+                            uint n_ranges, uint mode,
+                            HANDLER_BUFFER *buf) override;
+  int multi_range_read_next(char **range_info) override;
   const Item *cond_push(const Item *cond) override;
   Item *idx_cond_push(uint keyno, Item *idx_cond) override;
   void cancel_pushed_idx_cond() override;
@@ -125,6 +137,16 @@ class ha_duckdb : public handler {
   int execute_index_scan(const std::string &where_sql, bool descending,
                          uchar *buf);
   int fetch_index_scan_row(uchar *buf);
+  bool can_use_native_mrr(uint keyno, uint flags) const;
+  void reset_native_mrr_state();
+  bool native_mrr_range_supported(const KEY *primary_key,
+                                  const KEY_MULTI_RANGE &range) const;
+  int start_next_native_mrr_batch();
+
+  struct NativeMrrProbe {
+    std::vector<std::string> key_sql_values;
+    char *range_ptr{nullptr};
+  };
 
   THR_LOCK_DATA m_lock;
   std::string m_table_path;
@@ -143,6 +165,19 @@ class ha_duckdb : public handler {
   bool m_index_descending{false};
   std::string m_pushed_cond_sql;
   std::string m_pushed_idx_cond_sql;
+  bool m_native_mrr_active{false};
+  bool m_native_mrr_fallback{true};
+  uint m_native_mrr_mode{0};
+  range_seq_t m_native_mrr_iter{nullptr};
+  RANGE_SEQ_IF m_native_mrr_funcs{};
+  size_t m_native_mrr_batch_size{0};
+  size_t m_native_mrr_next_probe{0};
+  std::vector<Field *> m_native_mrr_key_fields;
+  std::vector<Field *> m_native_mrr_fields;
+  std::vector<NativeMrrProbe> m_native_mrr_probes;
+  std::unique_ptr<duckdb::QueryResult> m_native_mrr_result;
+  std::unique_ptr<duckdb::DataChunk> m_native_mrr_chunk;
+  uint64_t m_native_mrr_chunk_row{0};
 };
 
 }  // namespace duckdb_se
