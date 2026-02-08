@@ -2204,6 +2204,13 @@ int ha_duckdb::rename_table(const char *from, const char *to,
   }
   if (from_table_name == to_table_name) return 0;
 
+  MY_STAT stat_buf;
+  if (my_stat(from_path.c_str(), &stat_buf, MYF(0)) == nullptr) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "DuckDB database file not found");
+    return HA_ERR_GENERIC;
+  }
+
   if (duckdb_instance_pool == nullptr) {
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
              "DuckDB instance pool unavailable");
@@ -2322,6 +2329,14 @@ int ha_duckdb::truncate(dd::Table *) {
     return HA_ERR_WRONG_COMMAND;
   }
   if (!m_conn || table == nullptr) return HA_ERR_GENERIC;
+
+  MY_STAT stat_buf;
+  if (m_table_path.empty() ||
+      my_stat(m_table_path.c_str(), &stat_buf, MYF(0)) == nullptr) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+             "DuckDB database file not found");
+    return HA_ERR_GENERIC;
+  }
 
   DuckdbWriterGuard writer_guard(m_writer_mutex);
   if (!writer_guard.locked()) {
