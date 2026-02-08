@@ -26,6 +26,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "my_base.h"
 #include "sql/handler.h"
@@ -130,9 +131,11 @@ class ha_duckdb : public handler {
   std::unique_ptr<duckdb::QueryResult> m_result;
   std::unique_ptr<duckdb::DataChunk> m_chunk;
   uint64_t m_chunk_row{0};
+  std::vector<Field *> m_scan_fields;
   std::unique_ptr<duckdb::QueryResult> m_index_result;
   std::unique_ptr<duckdb::DataChunk> m_index_chunk;
   uint64_t m_index_chunk_row{0};
+  std::vector<Field *> m_index_fields;
   bool m_index_descending{false};
 };
 

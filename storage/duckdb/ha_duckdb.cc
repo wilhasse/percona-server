@@ -595,6 +595,21 @@ std::vector<Field *> collect_fields(TABLE *table, const MY_BITMAP *bitmap) {
   return fields;
 }
 
+std::string build_select_list(const std::vector<Field *> &fields) {
+  if (fields.empty()) return "*";
+
+  std::string sql;
+  bool first = true;
+  for (const Field *field : fields) {
+    if (field == nullptr) continue;
+    if (!first) sql.append(", ");
+    sql.append(
+        quote_ident(field->field_name, std::strlen(field->field_name)));
+    first = false;
+  }
+  return sql.empty() ? "*" : sql;
+}
+
 std::vector<duckdb::Value> collect_values(TABLE *table, const uchar *record,
                                           const std::vector<Field *> &fields) {
   FieldOffsetGuard guard(table, record);
@@ -691,20 +706,18 @@ std::string build_lexicographic_predicate(const std::vector<Field *> &fields,
 }
 
 int copy_chunk_row_to_table(TABLE *table, const duckdb::DataChunk &chunk,
-                            duckdb::idx_t row_idx) {
+                            duckdb::idx_t row_idx,
+                            const std::vector<Field *> &projected_fields) {
   if (table == nullptr || table->s == nullptr) return HA_ERR_GENERIC;
-  const uint field_count = table->s->fields;
-  if (chunk.ColumnCount() != field_count) {
+  if (chunk.ColumnCount() != projected_fields.size()) {
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), "DuckDB column count mismatch");
     return HA_ERR_GENERIC;
   }
 
-  for (uint i = 0; i < field_count; ++i) {
-    Field *field = table->field[i];
-    if (table->read_set && !bitmap_is_set(table->read_set, field->field_index())) {
-      continue;
-    }
-    const duckdb::Value value = chunk.GetValue(i, row_idx);
+  for (duckdb::idx_t col_idx = 0; col_idx < chunk.ColumnCount(); ++col_idx) {
+    Field *field = projected_fields[col_idx];
+    if (field == nullptr) continue;
+    const duckdb::Value value = chunk.GetValue(col_idx, row_idx);
     if (value.IsNull()) {
       field->set_null();
       continue;
@@ -1641,8 +1654,10 @@ int ha_duckdb::open(const char *, int, unsigned int, const dd::Table *) {
 int ha_duckdb::close() {
   m_result.reset();
   m_chunk.reset();
+  m_scan_fields.clear();
   m_index_result.reset();
   m_index_chunk.reset();
+  m_index_fields.clear();
   m_conn.reset();
   m_db.reset();
   return 0;
@@ -1653,12 +1668,15 @@ int ha_duckdb::rnd_init(bool) {
   m_chunk.reset();
   m_result.reset();
   m_chunk_row = 0;
+  m_scan_fields = collect_fields(table, table->read_set);
 
   if (!m_conn) return HA_ERR_GENERIC;
 
   try {
-    const std::string query =
-        "SELECT * FROM " + qualified_table_name(m_schema_name, m_table_name);
+    std::string query = "SELECT ";
+    query += build_select_list(m_scan_fields);
+    query += " FROM ";
+    query += qualified_table_name(m_schema_name, m_table_name);
     m_result = m_conn->Query(query);
     if (!m_result || m_result->HasError()) {
       const std::string err = m_result ? m_result->GetError() :
@@ -1677,9 +1695,11 @@ int ha_duckdb::rnd_init(bool) {
 int ha_duckdb::rnd_end() {
   m_result.reset();
   m_chunk.reset();
+  m_scan_fields.clear();
   m_chunk_row = 0;
   m_index_result.reset();
   m_index_chunk.reset();
+  m_index_fields.clear();
   m_index_chunk_row = 0;
   return 0;
 }
@@ -1697,7 +1717,8 @@ int ha_duckdb::rnd_next(uchar *) {
         if (!m_chunk || m_chunk->size() == 0) return HA_ERR_END_OF_FILE;
       }
 
-      if (copy_chunk_row_to_table(table, *m_chunk, m_chunk_row) != 0) {
+      if (copy_chunk_row_to_table(table, *m_chunk, m_chunk_row, m_scan_fields) !=
+          0) {
         return HA_ERR_GENERIC;
       }
 
@@ -1718,6 +1739,7 @@ int ha_duckdb::index_init(uint idx, bool) {
   active_index = idx;
   m_index_result.reset();
   m_index_chunk.reset();
+  m_index_fields.clear();
   m_index_chunk_row = 0;
   m_index_descending = false;
   return 0;
@@ -1726,6 +1748,7 @@ int ha_duckdb::index_init(uint idx, bool) {
 int ha_duckdb::index_end() {
   m_index_result.reset();
   m_index_chunk.reset();
+  m_index_fields.clear();
   m_index_chunk_row = 0;
   m_index_descending = false;
   active_index = MAX_KEY;
@@ -1746,7 +1769,8 @@ int ha_duckdb::fetch_index_scan_row(uchar *buf) {
       }
 
       FieldOffsetGuard guard(table, buf);
-      if (copy_chunk_row_to_table(table, *m_index_chunk, m_index_chunk_row) != 0) {
+      if (copy_chunk_row_to_table(table, *m_index_chunk, m_index_chunk_row,
+                                  m_index_fields) != 0) {
         return HA_ERR_GENERIC;
       }
 
@@ -1769,7 +1793,11 @@ int ha_duckdb::execute_index_scan(const std::string &where_sql, bool descending,
     return HA_ERR_WRONG_INDEX;
   }
 
-  std::string sql = "SELECT * FROM ";
+  m_index_fields = collect_fields(table, table->read_set);
+
+  std::string sql = "SELECT ";
+  sql += build_select_list(m_index_fields);
+  sql += " FROM ";
   sql += qualified_table_name(m_schema_name, m_table_name);
   if (!where_sql.empty()) {
     sql += " WHERE ";
@@ -2074,8 +2102,12 @@ int ha_duckdb::rnd_pos(uchar *buf, uchar *pos) {
   key_restore(table->record[0], pos, primary_key, ref_length);
   std::vector<duckdb::Value> where_values =
       collect_values(table, table->record[0], where_fields);
+  const std::vector<Field *> projection_fields =
+      collect_fields(table, table->read_set);
 
-  std::string sql = "SELECT * FROM ";
+  std::string sql = "SELECT ";
+  sql += build_select_list(projection_fields);
+  sql += " FROM ";
   sql += qualified_table_name(m_schema_name, m_table_name);
   sql += " WHERE ";
   sql += build_where_clause(where_fields, where_values);
@@ -2094,7 +2126,9 @@ int ha_duckdb::rnd_pos(uchar *buf, uchar *pos) {
     if (!chunk || chunk->size() == 0) return HA_ERR_RECORD_DELETED;
 
     FieldOffsetGuard guard(table, buf);
-    if (copy_chunk_row_to_table(table, *chunk, 0) != 0) return HA_ERR_GENERIC;
+    if (copy_chunk_row_to_table(table, *chunk, 0, projection_fields) != 0) {
+      return HA_ERR_GENERIC;
+    }
     return 0;
   } catch (const std::exception &ex) {
     my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), ex.what());
@@ -2141,9 +2175,11 @@ int ha_duckdb::external_lock(THD *, int lock_type) {
   if (lock_type == F_UNLCK) {
     m_result.reset();
     m_chunk.reset();
+    m_scan_fields.clear();
     m_chunk_row = 0;
     m_index_result.reset();
     m_index_chunk.reset();
+    m_index_fields.clear();
     m_index_chunk_row = 0;
     m_index_descending = false;
   }

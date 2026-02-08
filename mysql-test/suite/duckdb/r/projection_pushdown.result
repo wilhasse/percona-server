@@ -1,0 +1,32 @@
+CREATE DATABASE duckdb_projection_pushdown;
+USE duckdb_projection_pushdown;
+CREATE TABLE t (
+id INT PRIMARY KEY,
+payload VARCHAR(64),
+metric INT,
+tag VARCHAR(64),
+notes VARCHAR(128)
+) ENGINE=DUCKDB;
+INSERT INTO t VALUES
+(1, 'alpha', 10, 'x', 'n1'),
+(2, 'beta',  20, 'y', 'n2'),
+(3, 'gamma', 30, 'z', 'n3'),
+(4, 'delta', 40, 'w', 'n4');
+SELECT payload FROM t IGNORE INDEX (PRIMARY) WHERE metric >= 20 ORDER BY id;
+payload
+beta
+gamma
+delta
+SELECT payload, notes FROM t FORCE INDEX (PRIMARY) WHERE id BETWEEN 2 AND 4 ORDER BY id;
+payload	notes
+beta	n2
+gamma	n3
+delta	n4
+SELECT notes FROM t FORCE INDEX (PRIMARY) WHERE id = 3;
+notes
+n3
+SELECT metric FROM t FORCE INDEX (PRIMARY) WHERE id > 2 ORDER BY id DESC LIMIT 2;
+metric
+40
+30
+DROP DATABASE duckdb_projection_pushdown;
