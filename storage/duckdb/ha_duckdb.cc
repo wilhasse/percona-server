@@ -67,6 +67,7 @@
 #include "sql/sql_optimizer.h"
 #include "sql/sql_thd_internal_api.h"
 #include "sql/sql_time.h"
+#include "sql/query_options.h"
 #include "sql/rpl_gtid.h"
 #include "sql/tztime.h"
 #include "sql/visible_fields.h"
@@ -782,6 +783,36 @@ std::string build_select_list(const std::vector<Field *> &fields) {
     first = false;
   }
   return sql.empty() ? "*" : sql;
+}
+
+static bool get_limit_pushdown(const TABLE *table, ha_rows *limit_rows) {
+  if (table == nullptr || limit_rows == nullptr) return false;
+
+  THD *thd = current_thd;
+  if (thd == nullptr || thd->lex == nullptr) return false;
+  if (thd->lex->sql_command != SQLCOM_SELECT || thd->lex->is_explain())
+    return false;
+
+  const Table_ref *table_ref = table->pos_in_table_list;
+  if (table_ref == nullptr || table_ref->query_block == nullptr) return false;
+  if (table_ref->is_view_or_derived()) return false;
+
+  const Query_block *query_block = table_ref->query_block;
+  if (query_block->leaf_table_count != 1) return false;
+  if (query_block->is_ordered() || query_block->is_grouped() ||
+      query_block->is_distinct() || query_block->having_cond() != nullptr) {
+    return false;
+  }
+  if (query_block->active_options() & OPTION_FOUND_ROWS) return false;
+  if (query_block->offset_limit != nullptr) return false;
+  if (query_block->select_limit == nullptr) return false;
+  if (!query_block->select_limit->const_item()) return false;
+
+  const longlong val = query_block->select_limit->val_int();
+  if (val <= 0) return false;
+
+  *limit_rows = static_cast<ha_rows>(val);
+  return true;
 }
 
 std::vector<duckdb::Value> collect_values(TABLE *table, const uchar *record,
@@ -2513,6 +2544,11 @@ int ha_duckdb::rnd_init(bool) {
       query += " WHERE ";
       query += m_pushed_cond_sql;
     }
+    ha_rows limit_rows = HA_POS_ERROR;
+    if (get_limit_pushdown(table, &limit_rows)) {
+      query += " LIMIT ";
+      query += std::to_string(static_cast<unsigned long long>(limit_rows));
+    }
     m_result = m_conn->Query(query);
     if (!m_result || m_result->HasError()) {
       const std::string err = m_result ? m_result->GetError() :
@@ -3592,6 +3628,48 @@ int ha_duckdb::info(unsigned int flags) {
   if (ensure_stats_cache()) return 0;
   if (stats.records == 0) stats.records = 10;
   return 0;
+}
+
+int ha_duckdb::records(ha_rows *num_rows) {
+  if (num_rows == nullptr) return HA_ERR_GENERIC;
+  if (m_conn == nullptr) return HA_ERR_GENERIC;
+
+  try {
+    std::string sql = "SELECT COUNT(*) FROM ";
+    sql += qualified_table_name(m_schema_name, m_table_name);
+    auto result = m_conn->Query(sql);
+    if (!result || result->HasError()) {
+      const std::string err =
+          result ? result->GetError() : "DuckDB count query failed";
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), err.c_str());
+      return HA_ERR_GENERIC;
+    }
+
+    auto chunk = result->Fetch();
+    if (!chunk || chunk->size() == 0) {
+      *num_rows = 0;
+      return 0;
+    }
+
+    ha_rows rows = 0;
+    if (!duckdb_value_to_ha_rows(chunk->GetValue(0, 0), &rows)) {
+      my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0),
+               "DuckDB count query returned invalid value");
+      return HA_ERR_GENERIC;
+    }
+
+    *num_rows = rows;
+    stats.records = rows;
+    m_stats_cached_rows = rows;
+    m_stats_cache_valid = true;
+    THD *thd = current_thd;
+    m_stats_cached_query_id =
+        thd != nullptr ? static_cast<longlong>(thd->query_id) : -1;
+    return 0;
+  } catch (const std::exception &ex) {
+    my_error(ER_SECONDARY_ENGINE_PLUGIN, MYF(0), ex.what());
+    return HA_ERR_GENERIC;
+  }
 }
 
 handler::Table_flags ha_duckdb::table_flags() const {

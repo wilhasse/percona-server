@@ -1,0 +1,39 @@
+--source include/have_duckdb_plugin.inc
+
+--disable_query_log
+CALL mtr.add_suppression("DuckDB analytics node should run with read_only=ON");
+CALL mtr.add_suppression("DuckDB binlog applier error");
+CALL mtr.add_suppression("Got timeout reading communication packets");
+CALL mtr.add_suppression("A message intended for a client cannot be sent");
+--let $duckdb_installed=0
+--let $duckdb_plugin_present=`SELECT COUNT(*) FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_NAME='DUCKDB'`
+--if ($duckdb_plugin_present == 0) {
+  --eval INSTALL PLUGIN duckdb SONAME '$DUCKDB_PLUGIN';
+  --let $duckdb_installed=1
+}
+
+SET @save_duckdb_execution_mode = @@GLOBAL.duckdb_execution_mode;
+SET @@GLOBAL.duckdb_execution_mode = 'PRIMARY';
+--enable_query_log
+
+CREATE DATABASE duckdb_limit_count;
+USE duckdb_limit_count;
+
+CREATE TABLE t (
+  id INT PRIMARY KEY,
+  payload VARCHAR(50)
+) ENGINE=DUCKDB;
+
+INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d');
+
+SELECT COUNT(*) FROM (SELECT * FROM t LIMIT 2) AS s;
+SELECT COUNT(*) FROM t;
+
+DROP DATABASE duckdb_limit_count;
+
+--disable_query_log
+SET @@GLOBAL.duckdb_execution_mode = @save_duckdb_execution_mode;
+--if ($duckdb_installed == 1) {
+  UNINSTALL PLUGIN duckdb;
+}
+--enable_query_log

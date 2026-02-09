@@ -116,6 +116,7 @@ class ha_duckdb : public handler {
   int reset() override;
 
   int info(unsigned int) override;
+  int records(ha_rows *num_rows) override;
   double scan_time() override;
   double read_time(uint index, uint ranges, ha_rows rows) override;
   double index_only_read_time(uint keynr, double records) override;
